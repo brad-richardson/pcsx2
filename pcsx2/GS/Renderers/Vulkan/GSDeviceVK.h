@@ -688,6 +688,16 @@ private:
 	/// discarded, so a key is never built on a device configuration it was not recorded on.
 	std::string GetTFXPipelineKeyFingerprint() const;
 
+	// PW1: cumulative TFX pipeline + SPIR-V compile accounting (GS thread only; recording costs
+	// two clock reads per newly created pipeline and nothing in steady state), plus the recorded
+	// set of TFX selectors for pre-warm. Dormant unless the GE1 adapter enables recording.
+	u64 m_tfx_pipelines_created = 0;
+	u64 m_tfx_pipeline_create_ns = 0;
+	u64 m_spv_compiles = 0;
+	u64 m_spv_compile_ns = 0;
+	bool m_selector_record_enabled = false;
+	std::vector<PipelineSelector> m_recorded_selectors;
+
 	VkRenderPass m_utility_color_render_pass_load = VK_NULL_HANDLE;
 	VkRenderPass m_utility_color_render_pass_clear = VK_NULL_HANDLE;
 	VkRenderPass m_utility_color_render_pass_discard = VK_NULL_HANDLE;
@@ -878,6 +888,15 @@ public:
 
 	void EnableExtendedStats(bool enabled) override;
 	std::vector<std::string> GetExtendedStats() const override;
+
+	// PW1: pipeline-cache pre-warm surface for the GE1 adapter. GS thread only.
+	void RecordTFXPipelineCreate(u64 ns);
+	void RecordSPVCompile(u64 ns);
+	bool FlushPipelineCache();
+	void GetAndResetPipeStats(u64* tfx_pipelines, u64* tfx_ns, u64* spv_compiles, u64* spv_ns);
+	void SetSelectorRecordEnabled(bool enabled);
+	u32 TakeRecordedSelectors(PipelineSelector* out, u32 capacity);
+	u32 PrewarmTFXPipelines(const PipelineSelector* sels, u32 count);
 
 	void PushDebugGroup(const char* fmt, ...) override;
 	void PopDebugGroup() override;

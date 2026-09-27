@@ -8,8 +8,13 @@
 #include "common/MemorySettingsInterface.h"
 
 #include <array>
+#include <chrono>
+#include <cstdint>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <fstream>
+#include <string>
 #include <vector>
 
 namespace {
@@ -17,6 +22,43 @@ alignas(16) std::array<u8, 8192> s_priv{};
 std::vector<u32> s_pixels;
 MemorySettingsInterface s_settings;
 bool s_open = false;
+// PW1: pipeline-compile accounting (GE1_PIPE_STATS_CSV), periodic pipeline-cache
+// flush (GE1_PIPE_FLUSH_VSYNCS) and TFX selector pre-warm (GE1_TFX_PREWARM).
+// All default off; the GS thread is the only writer.
+std::FILE* s_stats = nullptr;
+std::uint64_t s_vsyncs = 0;
+std::uint64_t s_flush_every = 0;
+std::string s_prewarm_path;
+constexpr std::uint32_t kSelectorTakeBatch = 1024;
+
+void persist_recorded_selectors()
+{
+    if (s_prewarm_path.empty())
+        return;
+    const std::uint32_t sel_size = GSGetTFXSelectorSize();
+    if (sel_size == 0)
+        return;
+    std::FILE* f = std::fopen(s_prewarm_path.c_str(), "ab");
+    if (!f)
+    {
+        Console.Error("PW1: cannot append TFX selectors to '%s'", s_prewarm_path.c_str());
+        return;
+    }
+    std::vector<u8> buf(static_cast<std::size_t>(sel_size) * kSelectorTakeBatch);
+    for (;;)
+    {
+        const std::uint32_t n = GSTakeRecordedTFXSelectors(buf.data(), kSelectorTakeBatch);
+        if (n == 0)
+            break;
+        if (std::fwrite(buf.data(), sel_size, n, f) != n)
+        {
+            Console.Error("PW1: short write appending TFX selectors to '%s'", s_prewarm_path.c_str());
+            break;
+        }
+    }
+    std::fflush(f);
+    std::fclose(f);
+}
 constexpr u32 kOffsets[20] = {
     0x0000, 0x0010, 0x0020, 0x0030, 0x0040, 0x0050, 0x0060,
     0x0070, 0x0080, 0x0090, 0x00a0, 0x00b0, 0x00c0, 0x00d0,
@@ -83,14 +125,86 @@ extern "C" GE1_API int ge1_gs_open(int blending_level)
 #endif
     std::fill(s_priv.begin(), s_priv.end(), 0);
     s_open = GSopen(config, GSRendererType::VK, s_priv.data(), GSVSyncMode::Disabled, false);
+    if (s_open)
+    {
+        // PW1 knobs, all default off. Errors here are non-fatal: the knobs are
+        // diagnostics and pre-warm, never required for correct rendering.
+        if (const char* csv = std::getenv("GE1_PIPE_STATS_CSV"); csv && *csv)
+        {
+            s_stats = std::fopen(csv, "w");
+            if (s_stats)
+            {
+                std::fprintf(s_stats, "vsync,new_tfx,tfx_us,new_spv,spv_us,flush_us\n");
+                std::fflush(s_stats);
+            }
+            else
+            {
+                Console.Error("PW1: cannot open GE1_PIPE_STATS_CSV '%s'", csv);
+            }
+        }
+        if (const char* every = std::getenv("GE1_PIPE_FLUSH_VSYNCS"); every && *every)
+            s_flush_every = std::strtoull(every, nullptr, 10);
+        if (const char* prewarm = std::getenv("GE1_TFX_PREWARM"); prewarm && *prewarm)
+        {
+            s_prewarm_path = prewarm;
+            if (s_flush_every == 0)
+                s_flush_every = 600;
+            GSSetTFXSelectorRecord(true);
+            const std::uint32_t sel_size = GSGetTFXSelectorSize();
+            std::ifstream in(prewarm, std::ios::binary | std::ios::ate);
+            if (sel_size > 0 && in)
+            {
+                const std::size_t bytes = static_cast<std::size_t>(in.tellg());
+                if (bytes > 0 && bytes <= 4u * 1024u * 1024u && (bytes % sel_size) == 0)
+                {
+                    const std::uint32_t count = static_cast<std::uint32_t>(bytes / sel_size);
+                    std::vector<u8> blob(bytes);
+                    in.seekg(0);
+                    in.read(reinterpret_cast<char*>(blob.data()), static_cast<std::streamsize>(bytes));
+                    if (in)
+                    {
+                        const auto t0 = std::chrono::steady_clock::now();
+                        const std::uint32_t created =
+                            GSPrewarmTFXPipelines(blob.data(), count > 65536 ? 65536 : count);
+                        const std::uint64_t us = static_cast<std::uint64_t>(
+                            std::chrono::duration_cast<std::chrono::microseconds>(
+                                std::chrono::steady_clock::now() - t0).count());
+                        Console.WriteLn("PW1: prewarmed %u/%u TFX pipelines in %llu us from '%s'", created,
+                            count, static_cast<unsigned long long>(us), prewarm);
+                        if (s_stats)
+                        {
+                            std::fprintf(s_stats, "# prewarm selectors=%u created=%u us=%llu\n", count, created,
+                                static_cast<unsigned long long>(us));
+                            std::fflush(s_stats);
+                        }
+                    }
+                }
+                else if (bytes > 0)
+                {
+                    Console.Error("PW1: ignoring malformed selector file '%s' (%zu bytes)", prewarm, bytes);
+                }
+            }
+        }
+    }
     return s_open ? 1 : 0;
 }
 
 extern "C" GE1_API void ge1_gs_close(void)
 {
     if (s_open)
+    {
+        persist_recorded_selectors();
         GSclose();
+    }
+    if (s_stats)
+    {
+        std::fclose(s_stats);
+        s_stats = nullptr;
+    }
     s_open = false;
+    s_vsyncs = 0;
+    s_flush_every = 0;
+    s_prewarm_path.clear();
     s_pixels.clear();
 }
 
@@ -142,6 +256,26 @@ extern "C" GE1_API int ge1_gs_vsync(uint32_t field, uint64_t csr, uint64_t smode
     std::memcpy(s_priv.data() + 0x0010, &smode1, 8);
     std::memcpy(s_priv.data() + 0x0060, &syncv, 8);
     GSvsync(field, true);
+    s_vsyncs++;
+    std::uint64_t flush_us = 0;
+    if (s_flush_every > 0 && (s_vsyncs % s_flush_every) == 0)
+    {
+        const auto t0 = std::chrono::steady_clock::now();
+        GSFlushPipelineCache();
+        persist_recorded_selectors();
+        flush_us = static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(
+            std::chrono::steady_clock::now() - t0).count());
+    }
+    if (s_stats)
+    {
+        std::uint64_t new_tfx = 0, tfx_ns = 0, new_spv = 0, spv_ns = 0;
+        GSGetAndResetPipelineStats(&new_tfx, &tfx_ns, &new_spv, &spv_ns);
+        std::fprintf(s_stats, "%llu,%llu,%llu,%llu,%llu,%llu\n", static_cast<unsigned long long>(s_vsyncs),
+            static_cast<unsigned long long>(new_tfx), static_cast<unsigned long long>(tfx_ns / 1000),
+            static_cast<unsigned long long>(new_spv), static_cast<unsigned long long>(spv_ns / 1000),
+            static_cast<unsigned long long>(flush_us));
+        std::fflush(s_stats);
+    }
     return 1;
 }
 
@@ -194,4 +328,13 @@ extern "C" GE1_API void ge1_gs_release_ahb(void* buffer)
 extern "C" GE1_API float ge1_gs_gpu_ms(void)
 {
     return s_open ? GSGetAndResetAccumulatedGPUTime() : -1.0f;
+}
+
+extern "C" GE1_API int ge1_gs_flush_caches(void)
+{
+    if (!s_open)
+        return 0;
+    GSFlushPipelineCache();
+    persist_recorded_selectors();
+    return 1;
 }
