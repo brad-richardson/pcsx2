@@ -125,7 +125,10 @@ if(USE_SNDIO)
   target_compile_definitions(cubeb PRIVATE USE_SNDIO)
 endif()
 
-if(APPLE)
+# GI1: skip AudioUnit on iOS/tvOS (ARMSX2 shape): the device globals in
+# cubeb_audiounit.cpp need CoreAudio's AudioHardware API, which the embedded
+# SDKs lack. The iOS GS path never initializes audio.
+if(APPLE AND NOT CMAKE_SYSTEM_NAME STREQUAL "iOS" AND NOT CMAKE_SYSTEM_NAME STREQUAL "tvOS")
 check_include_files(AudioUnit/AudioUnit.h USE_AUDIOUNIT)
 if(USE_AUDIOUNIT)
   target_sources(cubeb PRIVATE

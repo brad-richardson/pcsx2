@@ -326,9 +326,13 @@ set(pcsx2DEV9Sources
 	DEV9/sockets.cpp
 	DEV9/DEV9.cpp
 	DEV9/flash.cpp
-	DEV9/pcap_io.cpp
 	DEV9/net.cpp
 	)
+# GI1: libpcap is unavailable on iOS; the real pcap_io.cpp must not compile
+# there (ARMSX2 shape). DEV9 never runs on the iOS GS path.
+if(NOT IOS)
+	list(APPEND pcsx2DEV9Sources DEV9/pcap_io.cpp)
+endif()
 
 # DEV9 headers
 set(pcsx2DEV9Headers
@@ -523,6 +527,11 @@ set(pcsx2GSSources
 	GS/Renderers/HW/GSTextureReplacements.cpp
 	GS/Renderers/SW/GSTextureCacheSW.cpp
 	)
+# GI1: video capture needs ffmpeg headers (absent on iOS); the ios-platform
+# entry adds GSCaptureStub.cpp instead (IsCapturing() always false).
+if(IOS)
+	list(REMOVE_ITEM pcsx2GSSources GS/GSCapture.cpp)
+endif()
 
 # GS headers
 set(pcsx2GSHeaders
@@ -1134,7 +1143,10 @@ endif()
 target_sources(PCSX2 PRIVATE ${pcsx2USBSources} ${pcsx2USBHeaders})
 
 if(APPLE OR BSD)
-	if(APPLE)
+	# GI1: disc sources use IOKit, absent on iOS (ARMSX2 shape: no disc
+	# support; ios-platform adds GI1iOSStubs.cpp for the IOCtlSrc names).
+	if(IOS)
+	elseif(APPLE)
 		target_sources(PCSX2 PRIVATE
 			${pcsx2OSXSources})
 	else()
@@ -1162,6 +1174,7 @@ target_link_libraries(PCSX2_FLAGS INTERFACE
 	ZLIB::ZLIB
 	LZ4::LZ4
 	SoundTouch::SoundTouch
+	JPEG::JPEG
 	PNG::PNG
 	LZMA::LZMA
 	Zstd::Zstd
@@ -1197,7 +1210,8 @@ if(WIN32)
 		dwmapi.lib
 		OneCore.lib
 	)
-else()
+elseif(NOT IOS)
+	# GI1: no system libpcap on iOS (ARMSX2 shape).
 	target_link_libraries(PCSX2_FLAGS INTERFACE
 		PCAP::PCAP
 	)

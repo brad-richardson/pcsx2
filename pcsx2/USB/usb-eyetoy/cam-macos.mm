@@ -212,10 +212,18 @@ namespace usb_eyetoy
 
 			@autoreleasepool
 			{
+#if TARGET_OS_IOS
+				// GI1: ExternalUnknown is unavailable on iOS (ARMSX2 shape).
+				AVCaptureDeviceDiscoverySession* discoverySession = [AVCaptureDeviceDiscoverySession
+					discoverySessionWithDeviceTypes:@[ AVCaptureDeviceTypeBuiltInWideAngleCamera ]
+					                      mediaType:AVMediaTypeVideo
+					                       position:AVCaptureDevicePositionUnspecified];
+#else
 				AVCaptureDeviceDiscoverySession* discoverySession = [AVCaptureDeviceDiscoverySession
 					discoverySessionWithDeviceTypes:@[ AVCaptureDeviceTypeBuiltInWideAngleCamera, AVCaptureDeviceTypeExternalUnknown ]
 					                      mediaType:AVMediaTypeVideo
 					                       position:AVCaptureDevicePositionUnspecified];
+#endif
 				NSArray<AVCaptureDevice*>* devices = discoverySession.devices;
 				if (devices.count == 0)
 					Console.Warning("Camera: You have no video capture hardware");

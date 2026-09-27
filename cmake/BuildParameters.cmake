@@ -116,7 +116,11 @@ elseif("${CMAKE_SYSTEM_PROCESSOR}" STREQUAL "arm64" OR "${CMAKE_SYSTEM_PROCESSOR
        "${CMAKE_OSX_ARCHITECTURES}" STREQUAL "arm64")
 	message(STATUS "Building for Apple Silicon (ARM64).")
 	set(ARCH_ARM64 TRUE)
-	if(APPLE)
+	if(IOS)
+		# GI1: A12 baseline (ARMSX2 prior art: an M1 baseline lets clang fold
+		# hash/CRC chains into eor3, which SIGILLs on A12).
+		add_compile_options("-mcpu=apple-a12")
+	elseif(APPLE)
 		# Min spec is an M1
 		add_compile_options("-march=armv8.4-a" "-mcpu=apple-m1")
 	else()
@@ -316,7 +320,7 @@ endif()
 # MacOS-specific things
 #-------------------------------------------------------------------------------
 
-if(NOT CMAKE_GENERATOR MATCHES "Xcode")
+if(NOT CMAKE_GENERATOR MATCHES "Xcode" AND NOT IOS)
 	# Assume Xcode builds aren't being used for distribution
 	# Helpful because Xcode builds don't build multiple metallibs for different macOS versions
 	# Also helpful because Xcode's interactive shader debugger requires apps be built for the latest macOS

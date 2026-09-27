@@ -24,6 +24,11 @@ if(WIN32)
 		src/connection_win.cpp
 		src/discord_register_win.cpp
 	)
+elseif(APPLE AND IOS)
+	# GI1: no AppKit registration on iOS (ARMSX2 shape).
+	target_sources(discord-rpc PRIVATE
+		src/connection_unix.cpp
+	)
 elseif(APPLE)
 	target_sources(discord-rpc PRIVATE
 		src/connection_unix.cpp

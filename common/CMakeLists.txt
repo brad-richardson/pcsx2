@@ -150,6 +150,20 @@ if(WIN32)
 		winmm
 		pathcch
 	)
+elseif(APPLE AND IOS)
+	# GI1: iOS has no AppKit/CocoaTools or IOKit; UIKit instead (ARMSX2 shape).
+	target_sources(common PRIVATE
+		Darwin/DarwinThreads.cpp
+		Darwin/DarwinMisc.cpp
+		Darwin/DarwinMisc.h
+		Linux/LnxHostSys.cpp
+	)
+	target_compile_options(common PRIVATE -fobjc-arc)
+	target_link_options(common PRIVATE -fobjc-link-runtime)
+	target_link_libraries(common PRIVATE
+		"-framework Foundation"
+		"-framework UIKit"
+	)
 elseif(APPLE)
 	target_sources(common PRIVATE
 		CocoaTools.mm
@@ -197,8 +211,9 @@ if (USE_GCC AND CMAKE_INTERPROCEDURAL_OPTIMIZATION)
 	set_source_files_properties(FastJmp.cpp PROPERTIES COMPILE_FLAGS -fno-lto)
 endif()
 
-if(NOT WIN32)
-	# libcurl-based HTTPDownloader
+if(NOT WIN32 AND NOT IOS)
+	# libcurl-based HTTPDownloader (unavailable on iOS; nothing on the GS
+	# path constructs one, and the static link drops the unreferenced factory)
 	target_sources(common PRIVATE
 		HTTPDownloaderCurl.cpp
 		HTTPDownloaderCurl.h

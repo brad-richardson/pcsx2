@@ -21,7 +21,12 @@
 #include <sys/ioctl.h>
 #include <string.h>
 
-#if defined(__FreeBSD__) || (__APPLE__)
+// GI1: TargetConditionals.h is Apple-only; on non-Apple POSIX, TARGET_OS_IPHONE
+// is undefined (= 0), so only iOS is excluded below (ARMSX2 shape).
+#ifdef __APPLE__
+#include <TargetConditionals.h>
+#endif
+#if (defined(__FreeBSD__) || (__APPLE__)) && !TARGET_OS_IPHONE
 #include <sys/types.h>
 #include <net/if_dl.h>
 #include <sys/param.h>
@@ -268,6 +273,13 @@ std::optional<MAC_Address> AdapterUtils::GetAdapterMAC(const Adapter* adapter)
 
 	return std::nullopt;
 }
+#elif defined(__APPLE__) && TARGET_OS_IPHONE
+// GI1: iOS sandboxes hide link-layer addresses (ARMSX2 shape).
+std::optional<MAC_Address> AdapterUtils::GetAdapterMAC(const Adapter* adapter)
+{
+	(void)adapter;
+	return std::nullopt;
+}
 #else
 std::optional<MAC_Address> AdapterUtils::GetAdapterMAC(const Adapter* adapter)
 {
@@ -436,7 +448,7 @@ std::vector<IP_Address> AdapterUtils::GetGateways(const Adapter* adapter)
 	}
 	return collection;
 }
-#elif defined(__FreeBSD__) || defined(__APPLE__)
+#elif (defined(__FreeBSD__) || defined(__APPLE__)) && !TARGET_OS_IPHONE
 std::vector<IP_Address> AdapterUtils::GetGateways(const Adapter* adapter)
 {
 	if (adapter == nullptr)
@@ -518,8 +530,9 @@ std::vector<IP_Address> AdapterUtils::GetGateways(const Adapter* adapter)
 	return collection;
 }
 #else
-std::vector<IP_Address> AdapterUtils::GetGateways(Adapter* adapter)
+std::vector<IP_Address> AdapterUtils::GetGateways(const Adapter* adapter)
 {
+	(void)adapter;
 	Console.Error("DEV9: Unsupported OS, can't find Gateway");
 	return {};
 }

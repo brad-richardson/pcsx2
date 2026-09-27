@@ -25,8 +25,12 @@
 #include <mach/task.h>
 #include <mach/thread_state.h>
 #include <mutex>
+#include <TargetConditionals.h>
+#include <unistd.h>
+#if !TARGET_OS_IPHONE
 #include <ApplicationServices/ApplicationServices.h>
 #include <IOKit/pwr_mgt/IOPMLib.h>
+#endif
 
 // Darwin (OSX) is a bit different from Linux when requesting properties of
 // the OS because of its BSD/Mach heritage. Helpfully, most of this code
@@ -136,6 +140,28 @@ std::string GetOSVersionString()
 	return type + " " + release + " " + arch;
 }
 
+#if TARGET_OS_IPHONE
+// GI1: no IOKit power assertions or mouse cursor on iOS; the app manages
+// idle sleep itself, and there is no cursor to warp or track.
+bool Common::InhibitScreensaver(bool inhibit)
+{
+	(void)inhibit;
+	return true;
+}
+void Common::SetMousePosition(int x, int y)
+{
+	(void)x;
+	(void)y;
+}
+bool Common::AttachMousePositionCb(std::function<void(int, int)> cb)
+{
+	(void)cb;
+	return false;
+}
+void Common::DetachMousePositionCb()
+{
+}
+#else
 static IOPMAssertionID s_pm_assertion;
 
 bool Common::InhibitScreensaver(bool inhibit)
@@ -214,6 +240,7 @@ void Common::DetachMousePositionCb()
 	mouseRunLoopSource = nullptr;
 	mouseEventTap = nullptr;
 }
+#endif // !TARGET_OS_IPHONE
 
 void Threading::Sleep(int ms)
 {
@@ -324,15 +351,25 @@ static thread_local int s_code_write_depth = 0;
 
 void HostSys::BeginCodeWrite()
 {
+#if TARGET_OS_IPHONE
+	// GI1: no JIT on the iOS GS path (no entitlement); the counter still
+	// nests so a stray call fails loudly at MapCode, not here.
+	s_code_write_depth++;
+#else
 	if ((s_code_write_depth++) == 0)
 		pthread_jit_write_protect_np(0);
+#endif
 }
 
 void HostSys::EndCodeWrite()
 {
 	pxAssert(s_code_write_depth > 0);
+#if TARGET_OS_IPHONE
+	s_code_write_depth--;
+#else
 	if ((--s_code_write_depth) == 0)
 		pthread_jit_write_protect_np(1);
+#endif
 }
 
 [[maybe_unused]] static bool IsStoreInstruction(const void* ptr)

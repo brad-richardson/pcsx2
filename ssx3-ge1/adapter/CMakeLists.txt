@@ -1,4 +1,10 @@
-add_library(ge1_gs SHARED ge1_gs.cpp ge1_host.cpp)
+# GI1: static archive on iOS (the app links it directly; no dlopen), shared
+# library elsewhere (Mac replay, Android).
+if(IOS)
+  add_library(ge1_gs STATIC ge1_gs.cpp ge1_host.cpp)
+else()
+  add_library(ge1_gs SHARED ge1_gs.cpp ge1_host.cpp)
+endif()
 if(EXISTS "${CMAKE_SOURCE_DIR}/pcsx2/GS.h")
   set(GE1_PCSX2_ROOT "${CMAKE_SOURCE_DIR}")
 else()
@@ -11,13 +17,15 @@ if(ANDROID)
 endif()
 target_compile_options(ge1_gs PRIVATE -fvisibility=hidden)
 set_target_properties(ge1_gs PROPERTIES CXX_VISIBILITY_PRESET hidden VISIBILITY_INLINES_HIDDEN YES)
-if(APPLE)
+if(APPLE AND NOT IOS)
   target_link_options(ge1_gs PRIVATE "-Wl,-exported_symbols_list,${CMAKE_CURRENT_SOURCE_DIR}/exports.txt")
   target_link_options(ge1_gs PRIVATE "-Wl,-map,${CMAKE_BINARY_DIR}/ge1-link.map")
 endif()
 
-add_executable(ge1_replay ge1_replay.cpp)
-target_link_libraries(ge1_replay PRIVATE ge1_gs)
+if(NOT IOS)
+  add_executable(ge1_replay ge1_replay.cpp)
+  target_link_libraries(ge1_replay PRIVATE ge1_gs)
+endif()
 
 # GI1: macOS metallibs for GE1_RENDERER=metal replays. Same sources and
 # std/target pairs as the desktop generateMetallib() in pcsx2/CMakeLists.txt.

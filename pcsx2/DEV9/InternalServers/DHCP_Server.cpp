@@ -8,13 +8,19 @@
 #include <fstream>
 #include <netinet/in.h>
 #include <arpa/inet.h>
+#ifdef __APPLE__
+#include <TargetConditionals.h>
+#endif
 
 #if defined(__FreeBSD__) || (__APPLE__)
 #include <sys/param.h>
 #include <sys/sysctl.h>
 #include <sys/socket.h>
 #include <net/if.h>
+#if !defined(__APPLE__) || !TARGET_OS_IPHONE
+// GI1: net/route.h is absent from the iOS SDK (unused here regardless).
 #include <net/route.h>
+#endif
 #endif
 #endif
 

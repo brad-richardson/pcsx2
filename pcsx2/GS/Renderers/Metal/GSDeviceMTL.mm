@@ -862,6 +862,11 @@ bool GSDeviceMTL::HasSurface()  const { return static_cast<bool>(m_layer);}
 
 void GSDeviceMTL::AttachSurfaceOnMainThread()
 {
+#if TARGET_OS_IPHONE
+	// GI1: the iOS GS path is surfaceless-only (IOSurface blit sink); a window
+	// surface is never attached.
+	pxFailRel("AttachSurfaceOnMainThread is unsupported on iOS");
+#else
 	pxAssert([NSThread isMainThread]);
 	m_layer = MRCRetain([CAMetalLayer layer]);
 	[m_layer setDrawableSize:CGSizeMake(m_window_info.surface_width, m_window_info.surface_height)];
@@ -869,15 +874,21 @@ void GSDeviceMTL::AttachSurfaceOnMainThread()
 	m_view = MRCRetain((__bridge NSView*)m_window_info.window_handle);
 	[m_view setWantsLayer:YES];
 	[m_view setLayer:m_layer];
+#endif
 }
 
 void GSDeviceMTL::DetachSurfaceOnMainThread()
 {
 	pxAssert([NSThread isMainThread]);
+#if TARGET_OS_IPHONE
+	m_view = nullptr;
+	m_layer = nullptr;
+#else
 	[m_view setLayer:nullptr];
 	[m_view setWantsLayer:NO];
 	m_view = nullptr;
 	m_layer = nullptr;
+#endif
 }
 
 // Metal is fun and won't let you use newBufferWithBytes for private buffers
@@ -1045,7 +1056,9 @@ bool GSDeviceMTL::Create(GSVSyncMode vsync_mode, bool allow_present_throttle)
 
 		// Metal does not support mailbox.
 		m_vsync_mode = (m_vsync_mode == GSVSyncMode::Mailbox) ? GSVSyncMode::FIFO : m_vsync_mode;
+#if !TARGET_OS_IPHONE
 		[m_layer setDisplaySyncEnabled:m_vsync_mode == GSVSyncMode::FIFO];
+#endif
 	}
 	else
 	{
@@ -1509,8 +1522,10 @@ void GSDeviceMTL::EndPresent()
 				{
 					[[MTLCaptureManager sharedCaptureManager] stopCapture];
 					Console.WriteLn("Metal Trace Capture to /tmp/PCSX2MTLCapture.gputrace finished");
+#if !TARGET_OS_IPHONE
 					[[NSWorkspace sharedWorkspace] selectFile:path
 					                 inFileViewerRootedAtPath:@"/tmp/"];
+#endif
 				}
 			}
 			else if (s_capture_next)
@@ -1554,7 +1569,9 @@ void GSDeviceMTL::SetVSyncMode(GSVSyncMode mode, bool allow_present_throttle)
 		return;
 
 	m_vsync_mode = (mode == GSVSyncMode::Mailbox) ? GSVSyncMode::FIFO : mode;
+#if !TARGET_OS_IPHONE
 	[m_layer setDisplaySyncEnabled:m_vsync_mode == GSVSyncMode::FIFO];
+#endif
 }
 
 bool GSDeviceMTL::SetGPUTimingEnabled(bool enabled)
@@ -2146,9 +2163,19 @@ void GSDeviceMTL::MRESetSampler(SamplerSelector sel)
 
 static void textureBarrier(id<MTLRenderCommandEncoder> enc)
 {
+#if TARGET_OS_IPHONE
+	// GI1: MTLBarrierScopeRenderTargets is unavailable on iOS; the Textures
+	// scope is the iOS spelling (ARMSX2 uses it on device and no barrier on
+	// the Simulator; we keep the barrier on the Simulator too so the smoke
+	// renders the same path — revisit if the Simulator misbehaves).
+	[enc memoryBarrierWithScope:MTLBarrierScopeTextures
+	                afterStages:MTLRenderStageFragment
+	               beforeStages:MTLRenderStageFragment];
+#else
 	[enc memoryBarrierWithScope:MTLBarrierScopeRenderTargets
 	                afterStages:MTLRenderStageFragment
 	               beforeStages:MTLRenderStageFragment];
+#endif
 }
 
 void GSDeviceMTL::MRESetTexture(GSTexture* tex, int pos)
