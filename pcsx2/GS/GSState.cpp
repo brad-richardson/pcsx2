@@ -6,7 +6,6 @@
 #include "GS/GSGL.h"
 #include "GS/GSPerfMon.h"
 #include "GS/GSUtil.h"
-#include "GS/GSGp2Census.h" // GP2 TEMPORARY census
 
 #include "common/Console.h"
 #include "common/BitUtils.h"
@@ -1439,7 +1438,6 @@ void GSState::GIFPackedRegHandlerUV_Hack(const GIFPackedReg* RESTRICT r)
 template <u32 prim, u32 adc, bool auto_flush>
 void GSState::GIFPackedRegHandlerXYZF2(const GIFPackedReg* RESTRICT r)
 {
-	if (gp2KickLog()) { gp2CensusArm(); gp2Census().xyzf2[prim][adc]++; } // GP2 TEMPORARY census
 	const bool skip = adc || r->XYZF2.Skip();
 
 	if (!skip || GSUtil::GetPrimClass(m_prev_env.PRIM.PRIM) != GSUtil::GetPrimClass(m_env.PRIM.PRIM) || (m_dirty_gs_regs & (1 << DIRTY_REG_XYOFFSET)))
@@ -1459,7 +1457,6 @@ void GSState::GIFPackedRegHandlerXYZF2(const GIFPackedReg* RESTRICT r)
 template <u32 prim, u32 adc, bool auto_flush>
 void GSState::GIFPackedRegHandlerXYZ2(const GIFPackedReg* RESTRICT r)
 {
-	if (gp2KickLog()) { gp2CensusArm(); gp2Census().xyz2[prim][adc]++; } // GP2 TEMPORARY census
 	const bool skip = adc || r->XYZ2.Skip();
 
 	if (!skip || GSUtil::GetPrimClass(m_prev_env.PRIM.PRIM) != GSUtil::GetPrimClass(m_env.PRIM.PRIM) || (m_dirty_gs_regs & (1 << DIRTY_REG_XYOFFSET)))
@@ -1492,8 +1489,6 @@ template <u32 prim, bool auto_flush>
 void GSState::GIFPackedRegHandlerSTQRGBAXYZF2(const GIFPackedReg* RESTRICT r, u32 size)
 {
 	pxAssert(size > 0 && size % 3 == 0);
-
-	if (gp2KickLog()) { gp2CensusArm(); gp2Census().f2Calls[prim]++; gp2Census().f2Kicks[prim] += size / 3; } // GP2 TEMPORARY census
 
 	CheckFlushes();
 
@@ -1528,8 +1523,6 @@ template <u32 prim, bool auto_flush>
 void GSState::GIFPackedRegHandlerSTQRGBAXYZ2(const GIFPackedReg* RESTRICT r, u32 size)
 {
 	pxAssert(size > 0 && size % 3 == 0);
-
-	if (gp2KickLog()) { gp2CensusArm(); gp2Census().x2Calls[prim]++; gp2Census().x2Kicks[prim] += size / 3; } // GP2 TEMPORARY census
 
 	CheckFlushes();
 
@@ -1639,7 +1632,6 @@ void GSState::GIFRegHandlerUV_Hack(const GIFReg* RESTRICT r)
 template <u32 prim, u32 adc, bool auto_flush>
 void GSState::GIFRegHandlerXYZF2(const GIFReg* RESTRICT r)
 {
-	if (gp2KickLog()) { gp2CensusArm(); gp2Census().rxyzf2[prim][adc]++; } // GP2 TEMPORARY census
 	if (!adc || GSUtil::GetPrimClass(m_prev_env.PRIM.PRIM) != GSUtil::GetPrimClass(m_env.PRIM.PRIM) || (m_dirty_gs_regs & (1 << DIRTY_REG_XYOFFSET)))
 		CheckFlushes();
 
@@ -1655,7 +1647,6 @@ void GSState::GIFRegHandlerXYZF2(const GIFReg* RESTRICT r)
 template <u32 prim, u32 adc, bool auto_flush>
 void GSState::GIFRegHandlerXYZ2(const GIFReg* RESTRICT r)
 {
-	if (gp2KickLog()) { gp2CensusArm(); gp2Census().rxyz2[prim][adc]++; } // GP2 TEMPORARY census
 	if (!adc || GSUtil::GetPrimClass(m_prev_env.PRIM.PRIM) != GSUtil::GetPrimClass(m_env.PRIM.PRIM) || (m_dirty_gs_regs & (1 << DIRTY_REG_XYOFFSET)))
 		CheckFlushes();
 
@@ -3405,7 +3396,6 @@ void GSState::Transfer(const u8* mem, u32 size)
 
 							mem += sizeof(GIFPackedReg);
 							size--;
-							if (gp2KickLog()) { gp2CensusArm(); gp2Census().prologueRegs++; } // GP2 TEMPORARY census
 						} while (path.StepReg() && size > 0 && path.reg != 0);
 					}
 
@@ -3421,7 +3411,6 @@ void GSState::Transfer(const u8* mem, u32 size)
 						{
 							case GIFPath::TYPE_UNKNOWN:
 							{
-								if (gp2KickLog()) { gp2CensusArm(); gp2Census().typeCalls[0]++; gp2Census().typeRegs[0] += total; } // GP2 TEMPORARY census
 								u32 reg = 0;
 
 								do
@@ -3435,7 +3424,6 @@ void GSState::Transfer(const u8* mem, u32 size)
 							}
 							break;
 							case GIFPath::TYPE_ADONLY: // very common
-								if (gp2KickLog()) { gp2CensusArm(); gp2Census().typeCalls[1]++; gp2Census().typeRegs[1] += total; } // GP2 TEMPORARY census
 								do
 								{
 									(this->*m_fpGIFRegHandlers[((GIFPackedReg*)mem)->A_D.ADDR & 0x7F])(&((GIFPackedReg*)mem)->r);
@@ -3445,14 +3433,12 @@ void GSState::Transfer(const u8* mem, u32 size)
 
 								break;
 							case GIFPath::TYPE_STQRGBAXYZF2: // majority of the vertices are formatted like this
-								if (gp2KickLog()) { gp2CensusArm(); gp2Census().typeCalls[2]++; gp2Census().typeRegs[2] += total; } // GP2 TEMPORARY census
 								(this->*m_fpGIFPackedRegHandlersC[GIF_REG_STQRGBAXYZF2])((GIFPackedReg*)mem, total);
 
 								mem += total * sizeof(GIFPackedReg);
 
 								break;
 							case GIFPath::TYPE_STQRGBAXYZ2:
-								if (gp2KickLog()) { gp2CensusArm(); gp2Census().typeCalls[3]++; gp2Census().typeRegs[3] += total; } // GP2 TEMPORARY census
 								(this->*m_fpGIFPackedRegHandlersC[GIF_REG_STQRGBAXYZ2])((GIFPackedReg*)mem, total);
 
 								mem += total * sizeof(GIFPackedReg);
@@ -3472,17 +3458,14 @@ void GSState::Transfer(const u8* mem, u32 size)
 
 							mem += sizeof(GIFPackedReg);
 							size--;
-							if (gp2KickLog()) { gp2CensusArm(); gp2Census().fallbackRegs++; } // GP2 TEMPORARY census
 						} while (path.StepReg() && size > 0);
 					}
 
 					break;
 				case GIF_FLG_REGLIST:
-				{
 					// TODO: do it similar to packed operation
 
 					size *= 2;
-					const u32 gp2_rl0 = size; // GP2 TEMPORARY census
 
 					do
 					{
@@ -3495,9 +3478,7 @@ void GSState::Transfer(const u8* mem, u32 size)
 					if (size & 1)
 						mem += sizeof(GIFReg);
 
-					if (gp2KickLog()) { gp2CensusArm(); gp2Census().reglistCalls++; gp2Census().reglistRegs += (gp2_rl0 - size) / 2; } // GP2 TEMPORARY census
 					size /= 2;
-				}
 
 					break;
 				case GIF_FLG_IMAGE2:

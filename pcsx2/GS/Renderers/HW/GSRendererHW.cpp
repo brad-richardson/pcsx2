@@ -6,7 +6,6 @@
 #include "GS/GSGL.h"
 #include "GS/GSPerfMon.h"
 #include "GS/GSUtil.h"
-#include "GS/GSGp2Census.h" // GP2 TEMPORARY census
 #include "Host.h"
 #include "common/Console.h"
 #include "common/BitUtils.h"
@@ -2787,8 +2786,6 @@ void GSRendererHW::Draw()
 	m_cached_ctx.TEST = context->TEST;
 	m_cached_ctx.FRAME = context->FRAME;
 	m_cached_ctx.ZBUF = context->ZBUF;
-
-	if (gp2KickLog()) { gp2CensusArm(); gp2Census().draws[m_vt.m_primclass & 7]++; gp2Census().drawIdx[m_vt.m_primclass & 7] += idx_buff.tail; } // GP2 TEMPORARY census
 
 	if (IsBadFrame())
 	{
