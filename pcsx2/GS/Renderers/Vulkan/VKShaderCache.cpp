@@ -21,6 +21,7 @@
 #include "fmt/format.h"
 #include "shaderc/shaderc.h"
 
+#include <chrono>
 #include <cstring>
 #include <memory>
 
@@ -714,9 +715,16 @@ VkShaderModule VKShaderCache::GetComputeShader(std::string_view shader_code)
 std::optional<VKShaderCache::SPIRVCodeVector> VKShaderCache::CompileAndAddShaderSPV(
 	const CacheIndexKey& key, std::string_view shader_code)
 {
+	const auto compile_start = std::chrono::steady_clock::now();
 	std::optional<SPIRVCodeVector> spv = CompileShaderToSPV(key.shader_type, shader_code, GSConfig.UseDebugDevice);
+	const u64 compile_ns = static_cast<u64>(
+		std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - compile_start).count());
 	if (!spv.has_value())
 		return {};
+
+	// PW1: account the shaderc compile (cache misses only) on the VK device.
+	if (GSDeviceVK* dev = GSDeviceVK::GetInstance())
+		dev->RecordSPVCompile(compile_ns);
 
 	if (!m_blob_file || std::fseek(m_blob_file, 0, SEEK_END) != 0)
 		return spv;

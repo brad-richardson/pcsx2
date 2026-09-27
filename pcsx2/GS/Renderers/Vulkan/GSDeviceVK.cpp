@@ -25,6 +25,7 @@
 #include "imgui.h"
 
 #include <bit>
+#include <chrono>
 #include <limits>
 #include <mutex>
 #include <sstream>
@@ -5305,7 +5306,10 @@ VkPipeline GSDeviceVK::CreateTFXPipeline(const PipelineSelector& p)
 	if (m_features.framebuffer_fetch && p.IsRTFeedbackLoop())
 		gpb.AddBlendFlags(VK_PIPELINE_COLOR_BLEND_STATE_CREATE_RASTERIZATION_ORDER_ATTACHMENT_ACCESS_BIT_EXT);
 
+	const auto create_start = std::chrono::steady_clock::now();
 	VkPipeline pipeline = gpb.Create(m_device, g_vulkan_shader_cache->GetPipelineCache(true));
+	RecordTFXPipelineCreate(
+		static_cast<u64>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - create_start).count()));
 	if (pipeline)
 	{
 		Vulkan::SetObjectName(
@@ -5323,7 +5327,73 @@ VkPipeline GSDeviceVK::GetTFXPipeline(const PipelineSelector& p)
 
 	VkPipeline pipeline = CreateTFXPipeline(p);
 	m_tfx_pipelines.emplace(p, pipeline);
+	if (m_selector_record_enabled)
+		m_recorded_selectors.push_back(p);
 	return pipeline;
+}
+
+void GSDeviceVK::RecordTFXPipelineCreate(u64 ns)
+{
+	m_tfx_pipelines_created++;
+	m_tfx_pipeline_create_ns += ns;
+}
+
+void GSDeviceVK::RecordSPVCompile(u64 ns)
+{
+	m_spv_compiles++;
+	m_spv_compile_ns += ns;
+}
+
+bool GSDeviceVK::FlushPipelineCache()
+{
+	return g_vulkan_shader_cache ? g_vulkan_shader_cache->FlushPipelineCache() : false;
+}
+
+void GSDeviceVK::GetAndResetPipeStats(u64* tfx_pipelines, u64* tfx_ns, u64* spv_compiles, u64* spv_ns)
+{
+	if (tfx_pipelines)
+		*tfx_pipelines = m_tfx_pipelines_created;
+	if (tfx_ns)
+		*tfx_ns = m_tfx_pipeline_create_ns;
+	if (spv_compiles)
+		*spv_compiles = m_spv_compiles;
+	if (spv_ns)
+		*spv_ns = m_spv_compile_ns;
+	m_tfx_pipelines_created = 0;
+	m_tfx_pipeline_create_ns = 0;
+	m_spv_compiles = 0;
+	m_spv_compile_ns = 0;
+}
+
+void GSDeviceVK::SetSelectorRecordEnabled(bool enabled)
+{
+	m_selector_record_enabled = enabled;
+}
+
+u32 GSDeviceVK::TakeRecordedSelectors(PipelineSelector* out, u32 capacity)
+{
+	if (!out || capacity == 0)
+		return 0;
+	const u32 count = static_cast<u32>(std::min<size_t>(m_recorded_selectors.size(), capacity));
+	std::memcpy(out, m_recorded_selectors.data(), count * sizeof(PipelineSelector));
+	m_recorded_selectors.erase(m_recorded_selectors.begin(), m_recorded_selectors.begin() + count);
+	return count;
+}
+
+u32 GSDeviceVK::PrewarmTFXPipelines(const PipelineSelector* sels, u32 count)
+{
+	if (!sels)
+		return 0;
+	u32 created = 0;
+	for (u32 i = 0; i < count; i++)
+	{
+		if (m_tfx_pipelines.find(sels[i]) == m_tfx_pipelines.end())
+		{
+			if (GetTFXPipeline(sels[i]) != VK_NULL_HANDLE)
+				created++;
+		}
+	}
+	return created;
 }
 
 bool GSDeviceVK::BindDrawPipeline(const PipelineSelector& p)

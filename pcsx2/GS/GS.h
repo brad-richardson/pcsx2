@@ -93,6 +93,13 @@ void GSSetVSyncMode(GSVSyncMode mode, bool allow_present_throttle);
 void GSResetStats();
 // GE1 offline replay timing hook; keeps the adapter on the GS.h surface.
 float GSGetAndResetAccumulatedGPUTime();
+// PW1: pipeline-cache pre-warm. All no-op (zeros) unless the VK device is up; GS thread only.
+void GSFlushPipelineCache();
+void GSGetAndResetPipelineStats(u64* tfx_pipelines, u64* tfx_ns, u64* spv_compiles, u64* spv_ns);
+u32 GSGetTFXSelectorSize();
+void GSSetTFXSelectorRecord(bool enabled);
+u32 GSTakeRecordedTFXSelectors(void* out, u32 capacity);
+u32 GSPrewarmTFXPipelines(const void* selectors, u32 count);
 
 GSRendererType GSGetCurrentRenderer();
 bool GSIsHardwareRenderer();
