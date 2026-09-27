@@ -163,9 +163,12 @@ extern "C" GE1_API int ge1_gs_open(int blending_level)
                     in.read(reinterpret_cast<char*>(blob.data()), static_cast<std::streamsize>(bytes));
                     if (in)
                     {
+                        // Don't re-record what prewarm creates: the file already holds them.
+                        GSSetTFXSelectorRecord(false);
                         const auto t0 = std::chrono::steady_clock::now();
                         const std::uint32_t created =
                             GSPrewarmTFXPipelines(blob.data(), count > 65536 ? 65536 : count);
+                        GSSetTFXSelectorRecord(true);
                         const std::uint64_t us = static_cast<std::uint64_t>(
                             std::chrono::duration_cast<std::chrono::microseconds>(
                                 std::chrono::steady_clock::now() - t0).count());
