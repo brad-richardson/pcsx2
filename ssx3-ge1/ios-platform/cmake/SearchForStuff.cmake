@@ -48,6 +48,9 @@ set(FT_DISABLE_BZIP2 ON CACHE BOOL "" FORCE)
 set(FT_DISABLE_ZLIB ON CACHE BOOL "" FORCE)
 set(FT_DISABLE_PNG ON CACHE BOOL "" FORCE)
 set(FT_DISABLE_HARFBUZZ ON CACHE BOOL "" FORCE)
+# GI1: the SDK has the HVF header but no linkable hvf library; Apple HVF
+# variable fonts are not needed for the GS fonts.
+set(FT_DISABLE_HVF ON CACHE BOOL "" FORCE)
 add_subdirectory("${GE1_IOS_DEPS}/freetype" "${CMAKE_BINARY_DIR}/3rdparty/freetype" EXCLUDE_FROM_ALL)
 if(NOT TARGET Freetype::Freetype)
 	add_library(Freetype::Freetype ALIAS freetype)

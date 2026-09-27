@@ -26,6 +26,22 @@ bool Common::PlaySoundAsync(const char* path)
 	return false;
 }
 
+// Discord game registration is desktop-only (custom URL schemes / Steam AppID
+// files); the client calls it from Discord_Initialize, which nothing on the
+// iOS GS path reaches, but the rpc object pulls the references regardless.
+extern "C" {
+void Discord_Register(const char* applicationId, const char* command)
+{
+	(void)applicationId;
+	(void)command;
+}
+void Discord_RegisterSteamGame(const char* applicationId, const char* steamId)
+{
+	(void)applicationId;
+	(void)steamId;
+}
+}
+
 std::vector<std::string> GetOpticalDriveList()
 {
 	return {};
