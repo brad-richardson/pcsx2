@@ -1045,6 +1045,10 @@ struct Pcsx2Config
 		GSBilinearDirtyMode UserHacks_BilinearHack = GSBilinearDirtyMode::Automatic;
 		TriFiltering TriFilter = DEFAULT_TRILINEAR_FILTERING_MODE;
 		s8 OverrideTextureBarriers = -1;
+		// GE4: Adreno workaround. Non-overlapping sw-blend draws read dst through a
+		// single feedback-loop barrier chunk, which returns garbage on Adreno 830
+		// (menu font static). Prefer the hw blend-mix path for mixable equations.
+		bool AdrenoPreferBlendMix = false;
 		GSDepthFeedbackMode DepthFeedbackMode = GSDepthFeedbackMode::Auto;
 		/// GS multi-threading: a front thread parses GIF data while a back thread draws. The setting,
 		/// as the user or the game database asked for it; stored as the integer "GSBackThreadMode",
