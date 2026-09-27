@@ -100,11 +100,16 @@ extern "C" GE1_API int ge1_gs_open(int blending_level)
 
     auto config = EmuConfig.GS;
     // GI1: renderer select. GE1_RENDERER=metal opens the native Metal backend
-    // (Mac/iOS); anything else keeps the Vulkan default.
+    // (Mac/iOS); anything else keeps the Vulkan default — except where
+    // Vulkan isn't compiled in (iOS), which defaults to Metal.
+#if defined(__APPLE__) && !defined(ENABLE_VULKAN)
+    GSRendererType renderer = GSRendererType::Metal;
+#else
     GSRendererType renderer = GSRendererType::VK;
+#endif
 #ifdef __APPLE__
-    if (const char* want = std::getenv("GE1_RENDERER"); want && std::strcmp(want, "metal") == 0)
-        renderer = GSRendererType::Metal;
+    if (const char* want = std::getenv("GE1_RENDERER"); want && *want)
+        renderer = (std::strcmp(want, "metal") == 0) ? GSRendererType::Metal : GSRendererType::VK;
 #endif
     config.Renderer = renderer;
     config.UpscaleMultiplier = 1.0f;
