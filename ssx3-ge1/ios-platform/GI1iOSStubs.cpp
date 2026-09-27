@@ -6,6 +6,7 @@
 //  - Common::PlaySoundAsync: lives in CocoaTools.mm (AppKit, macOS-only);
 //    the achievement chime treats false as "no sound played".
 #include "CDVD/CDVDdiscReader.h"
+#include "DEV9/net.h"
 
 #include "common/HostSys.h"
 #include "common/HTTPDownloader.h"
@@ -118,4 +119,73 @@ u32 IOCtlSrc::GetLayerBreakAddress() const
 void IOCtlSrc::SetSpindleSpeed(bool restore_defaults) const
 {
 	(void)restore_defaults;
+}
+
+// PCAPAdapter stubs (pcap_io.cpp excluded; libpcap absent from the iOS SDK).
+// Declared locally to ARMSX2-AndroidPcapStubs shape because pcap_io.h pulls
+// <pcap.h>; member order mirrors the header for an identical vtable.
+class PCAPAdapter : public NetAdapter
+{
+private:
+	void* hpcap = nullptr;
+	bool switched;
+	bool blocking;
+	PacketReader::IP::IP_Address ps2IP{};
+	PacketReader::MAC_Address hostMAC;
+
+public:
+	PCAPAdapter();
+	bool blocks() override;
+	bool isInitialised() override;
+	bool recv(NetPacket* pkt) override;
+	bool send(NetPacket* pkt) override;
+	void reloadSettings() override;
+	~PCAPAdapter() override;
+	static std::vector<AdapterEntry> GetAdapters();
+	static AdapterOptions GetAdapterOptions();
+
+private:
+	bool InitPCAP(const std::string& adapter, bool promiscuous);
+};
+
+PCAPAdapter::PCAPAdapter()
+{
+}
+PCAPAdapter::~PCAPAdapter()
+{
+}
+bool PCAPAdapter::blocks()
+{
+	return false;
+}
+bool PCAPAdapter::isInitialised()
+{
+	return false;
+}
+bool PCAPAdapter::recv(NetPacket* pkt)
+{
+	(void)pkt;
+	return false;
+}
+bool PCAPAdapter::send(NetPacket* pkt)
+{
+	(void)pkt;
+	return false;
+}
+void PCAPAdapter::reloadSettings()
+{
+}
+std::vector<AdapterEntry> PCAPAdapter::GetAdapters()
+{
+	return {};
+}
+AdapterOptions PCAPAdapter::GetAdapterOptions()
+{
+	return AdapterOptions::None;
+}
+bool PCAPAdapter::InitPCAP(const std::string& adapter, bool promiscuous)
+{
+	(void)adapter;
+	(void)promiscuous;
+	return false;
 }
