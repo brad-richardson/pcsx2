@@ -30,11 +30,10 @@ std::optional<std::string> CocoaTools::GetResourcePath()
 	@autoreleasepool {
 		if (NSBundle* bundle = [NSBundle mainBundle])
 		{
-			NSString* rsrc = [bundle resourcePath];
-			NSString* root = [bundle bundlePath];
-			if ([rsrc isEqualToString:root])
-				rsrc = [rsrc stringByAppendingString:@"/resources"];
-			return [rsrc UTF8String];
+			// Flat bundle: resourcePath == bundlePath on iOS. (A "resources"
+			// subdir would break bundle signing, so resources live at top
+			// level: fonts/, default.metallib.)
+			return [[bundle resourcePath] UTF8String];
 		}
 		return std::nullopt;
 	}
