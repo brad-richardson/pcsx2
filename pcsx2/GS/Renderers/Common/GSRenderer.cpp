@@ -16,6 +16,9 @@
 #ifdef __ANDROID__
 #include "GS/Renderers/Vulkan/GSDeviceVK.h"
 #endif
+#ifdef __APPLE__
+#include "GS/Renderers/Metal/GSMetalCPPAccessible.h"
+#endif
 #include "GSDumpReplayer.h"
 #ifdef ENABLE_VULKAN
 #include "GS/Renderers/Vulkan/VKLibretro.h"
@@ -1702,6 +1705,33 @@ bool GSRenderer::ExportSnapshotToAHB(AHardwareBuffer* buffer, u32 width, u32 hei
 	g_gs_device->StretchRect(current, src_uv, rt, GSVector4(rc), ShaderConvert::TRANSPARENCY_FILTER, Biln);
 	const bool ok = static_cast<GSDeviceVK*>(g_gs_device.get())->CopySnapshotToAHB(rt, buffer, width, height,
 		(width - draw_width) / 2, (height - draw_height) / 2, fence_counter);
+	g_gs_device->Recycle(rt);
+	return ok;
+}
+#endif
+
+#ifdef __APPLE__
+bool GSRenderer::ExportSnapshotToIOSurface(void* iosurface, u32 width, u32 height, GSExportIOSurfaceDoneFn done, void* ctx)
+{
+	GSTexture* const current = g_gs_device->GetCurrent();
+	if (!iosurface || !current || !width || !height || !done)
+		return false;
+	const GSVector4i src_rect(CalculateDrawSrcRect(current, m_real_size));
+	const GSVector4 src_uv(GSVector4(src_rect) / GSVector4(current->GetSize()).xyxy());
+	const bool progressive = (GetVideoMode() == GSVideoMode::SDTV_480P);
+	const GSVector4 draw_rect = CalculateDrawDstRect(width, height, src_rect, current->GetSize(),
+		GSDisplayAlignment::LeftOrTop, false, progressive);
+	const u32 draw_width = static_cast<u32>(draw_rect.z - draw_rect.x);
+	const u32 draw_height = static_cast<u32>(draw_rect.w - draw_rect.y);
+	if (!draw_width || !draw_height || draw_width > width || draw_height > height)
+		return false;
+	GSTexture* rt = g_gs_device->CreateRenderTarget(draw_width, draw_height, GSTexture::Format::Color, false);
+	if (!rt)
+		return false;
+	const GSVector4i rc(0, 0, draw_width, draw_height);
+	g_gs_device->StretchRect(current, src_uv, rt, GSVector4(rc), ShaderConvert::TRANSPARENCY_FILTER, Biln);
+	const bool ok = MT_CopySnapshotToIOSurface(g_gs_device.get(), rt, iosurface, width, height,
+		(width - draw_width) / 2, (height - draw_height) / 2, done, ctx);
 	g_gs_device->Recycle(rt);
 	return ok;
 }

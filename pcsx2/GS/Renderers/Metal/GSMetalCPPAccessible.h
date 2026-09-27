@@ -13,7 +13,12 @@
 #ifdef __APPLE__
 
 class GSDevice;
+class GSTexture;
 GSDevice* MakeGSDeviceMTL();
 std::vector<GSAdapterInfo> GetMetalAdapterList();
+// GI1: C++ bridge to GSDeviceMTL's IOSurface export (GSDeviceMTL.h is ObjC++-only).
+bool MT_CopySnapshotToIOSurface(GSDevice* dev, GSTexture* source, void* iosurface, u32 width, u32 height,
+	u32 pad_x, u32 pad_y, GSExportIOSurfaceDoneFn done, void* ctx);
+void MT_ReleaseExportIOSurface(GSDevice* dev, void* iosurface);
 
 #endif

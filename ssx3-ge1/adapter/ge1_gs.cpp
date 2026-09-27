@@ -343,6 +343,29 @@ extern "C" GE1_API void ge1_gs_release_ahb(void* buffer)
 #endif
 }
 
+extern "C" GE1_API int ge1_gs_export_iosurface(void* iosurface, uint32_t width, uint32_t height,
+                                               ge1_gs_export_done_fn done, void* ctx)
+{
+#ifdef __APPLE__
+    if (!s_open || !done)
+        return 0;
+    return GSExportSnapshotToIOSurface(iosurface, width, height,
+        reinterpret_cast<GSExportIOSurfaceDoneFn>(done), ctx);
+#else
+    (void)iosurface; (void)width; (void)height; (void)done; (void)ctx;
+    return 0;
+#endif
+}
+
+extern "C" GE1_API void ge1_gs_release_iosurface(void* iosurface)
+{
+#ifdef __APPLE__
+    if (s_open) GSReleaseExportIOSurface(iosurface);
+#else
+    (void)iosurface;
+#endif
+}
+
 extern "C" GE1_API float ge1_gs_gpu_ms(void)
 {
     return s_open ? GSGetAndResetAccumulatedGPUTime() : -1.0f;
