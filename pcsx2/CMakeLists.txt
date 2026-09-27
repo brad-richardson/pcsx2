@@ -1269,6 +1269,8 @@ if (APPLE)
 	find_library(QUARTZCORE_LIBRARY QuartzCore)
 	find_library(AVFOUNDATION_LIBRARY AVFoundation)
 	find_library(COREMEDIA_LIBRARY CoreMedia)
+	find_library(IOSURFACE_LIBRARY IOSurface)
+	find_library(COREVIDEO_LIBRARY CoreVideo)
 	target_link_libraries(PCSX2_FLAGS INTERFACE
 		${APPKIT_LIBRARY}
 		${IOKIT_LIBRARY}
@@ -1276,6 +1278,8 @@ if (APPLE)
 		${QUARTZCORE_LIBRARY}
 		${AVFOUNDATION_LIBRARY}
 		${COREMEDIA_LIBRARY}
+		${IOSURFACE_LIBRARY}
+		${COREVIDEO_LIBRARY}
 	)
 endif()
 

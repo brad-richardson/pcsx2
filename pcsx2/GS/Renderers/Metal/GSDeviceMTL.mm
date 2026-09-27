@@ -11,6 +11,8 @@
 
 #include "common/Console.h"
 #include "common/HostSys.h"
+#import <CoreVideo/CVPixelBuffer.h>
+#import <IOSurface/IOSurfaceRef.h>
 
 #include "cpuinfo.h"
 #include "imgui.h"
@@ -400,6 +402,108 @@ void GSDeviceMTL::EndRenderPass()
 		memset(&m_current_render, 0, offsetof(MainRenderEncoder, depth_sel));
 		m_current_render.depth_sel = DepthStencilSelector::NoDepth();
 	}
+}
+
+static void applyAttribute(MTLVertexDescriptor* desc, NSUInteger idx, MTLVertexFormat fmt, NSUInteger offset,
+	NSUInteger buffer_index);
+
+// GI1: render the composed RGBA source into a BGRA IOSurface-backed target
+// with the plain COPY shader (the target format performs the channel swap),
+// then resolve the caller's done() exactly once from the command buffer's
+// completion handler. Queues on the shared command queue behind all prior
+// work, so no explicit fence is needed.
+bool GSDeviceMTL::CopySnapshotToIOSurface(GSTexture* source, void* iosurface, u32 width, u32 height,
+	u32 pad_x, u32 pad_y, GSExportIOSurfaceDoneFn done, void* ctx)
+{ @autoreleasepool {
+	// done() fires only on the queued path (exactly once, from the completion
+	// handler); every failure returns false with no callback.
+	auto fail = [](const char* why) {
+		std::fprintf(stderr, "GI1 IOSurface export: %s\n", why);
+		return false;
+	};
+	if (!source || !iosurface || !done || !m_dev.dev)
+		return fail("invalid source, surface, or device");
+	IOSurfaceRef surface = static_cast<IOSurfaceRef>(iosurface);
+	if (IOSurfaceGetWidth(surface) != width || IOSurfaceGetHeight(surface) != height ||
+		IOSurfaceGetPixelFormat(surface) != kCVPixelFormatType_32BGRA)
+		return fail("IOSurface dimensions or 32BGRA format mismatch");
+	if (pad_x + static_cast<u32>(source->GetWidth()) > width ||
+		pad_y + static_cast<u32>(source->GetHeight()) > height)
+		return fail("source does not fit the surface");
+	auto found = m_export_surfaces.find(iosurface);
+	if (found == m_export_surfaces.end())
+	{
+		MTLTextureDescriptor* desc = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm
+		                                                                                 width:width
+		                                                                                height:height
+		                                                                             mipmapped:NO];
+		desc.usage = MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead;
+		id<MTLTexture> tex = [m_dev.dev newTextureWithDescriptor:desc iosurface:surface plane:0];
+		if (!tex)
+			return fail("newTextureWithDescriptor:iosurface: failed");
+		IOSurfaceExport entry;
+		entry.width = width;
+		entry.height = height;
+		entry.texture = MRCTransfer(tex);
+		entry.wrapper = std::make_unique<GSTextureMTL>(this, entry.texture, nil, GSTexture::Usage::RenderTarget,
+			GSTexture::Format::Color);
+		entry.wrapper->SetSize(GSVector2i(static_cast<int>(width), static_cast<int>(height)));
+		found = m_export_surfaces.emplace(iosurface, std::move(entry)).first;
+	}
+	IOSurfaceExport& entry = found->second;
+	if (entry.width != width || entry.height != height)
+		return fail("cached IOSurface dimensions changed");
+	if (!m_iosurface_copy_pipeline)
+	{
+		auto pdesc = [[MTLRenderPipelineDescriptor new] autorelease];
+		pdesc.colorAttachments[0].pixelFormat = MTLPixelFormatBGRA8Unorm;
+		applyAttribute(pdesc.vertexDescriptor, 0, MTLVertexFormatFloat2, offsetof(ConvertShaderVertex, pos), 0);
+		applyAttribute(pdesc.vertexDescriptor, 1, MTLVertexFormatFloat2, offsetof(ConvertShaderVertex, texpos), 0);
+		pdesc.vertexDescriptor.layouts[0].stride = sizeof(ConvertShaderVertex);
+		m_iosurface_copy_pipeline =
+			MakePipeline(pdesc, LoadShader(@"vs_convert"), LoadShader(@"ps_copy"), @"GI1 IOSurface COPY");
+		if (!m_iosurface_copy_pipeline)
+			return fail("COPY pipeline creation failed");
+	}
+	FlushClears(source);
+	EndRenderPass();
+	// Opaque-black clear every export: pad regions (if any) are display-black.
+	entry.wrapper->SetClearColor(0xFF000000);
+	BeginStretchRect(@"GI1 IOSurface export", entry.wrapper.get(), MTLLoadActionLoad);
+	MRESetPipeline(m_iosurface_copy_pipeline);
+	MRESetTexture(source, GSMTLTextureIndexNonHW);
+	MRESetSampler(SamplerSelector::Point());
+	const u32 sw = static_cast<u32>(source->GetWidth()), sh = static_cast<u32>(source->GetHeight());
+	DrawStretchRect(GSVector4(0.0f, 0.0f, 1.0f, 1.0f),
+		GSVector4(static_cast<float>(pad_x), static_cast<float>(pad_y), static_cast<float>(pad_x + sw),
+			static_cast<float>(pad_y + sh)),
+		GSVector2(static_cast<float>(width), static_cast<float>(height)));
+	id<MTLCommandBuffer> cmdbuf = GetRenderCmdBuf();
+	[cmdbuf addCompletedHandler:^(id<MTLCommandBuffer> buf) {
+		done(ctx, buf.status == MTLCommandBufferStatusCompleted);
+	}];
+	FlushEncoders();
+	return true;
+}}
+
+void GSDeviceMTL::ReleaseExportIOSurface(void* iosurface)
+{
+	m_export_surfaces.erase(iosurface);
+}
+
+bool MT_CopySnapshotToIOSurface(GSDevice* dev, GSTexture* source, void* iosurface, u32 width, u32 height,
+	u32 pad_x, u32 pad_y, GSExportIOSurfaceDoneFn done, void* ctx)
+{
+	if (!dev || dev->GetRenderAPI() != RenderAPI::Metal)
+		return false;
+	return static_cast<GSDeviceMTL*>(dev)->CopySnapshotToIOSurface(source, iosurface, width, height, pad_x, pad_y,
+		done, ctx);
+}
+
+void MT_ReleaseExportIOSurface(GSDevice* dev, void* iosurface)
+{
+	if (dev && dev->GetRenderAPI() == RenderAPI::Metal)
+		static_cast<GSDeviceMTL*>(dev)->ReleaseExportIOSurface(iosurface);
 }
 
 static GSVector4 GetRTLoadInfo(GSTextureMTL* tex, MTLLoadAction* load_action)

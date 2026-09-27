@@ -57,6 +57,9 @@ public:
 #ifdef __ANDROID__
 	bool ExportSnapshotToAHB(struct AHardwareBuffer* buffer, u32 width, u32 height, u64* fence_counter);
 #endif
+#ifdef __APPLE__
+	bool ExportSnapshotToIOSurface(void* iosurface, u32 width, u32 height, GSExportIOSurfaceDoneFn done, void* ctx);
+#endif
 
 	void QueueSnapshot(const std::string& path, const u32 gsdump_frames);
 	void StopGSDump();

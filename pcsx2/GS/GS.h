@@ -130,6 +130,16 @@ int GSExportSnapshotToAHB(AHardwareBuffer* buffer, u32 width, u32 height, u64* f
 void GSWaitExportFence(u64 fence_counter);
 void GSReleaseExportAHB(AHardwareBuffer* buffer);
 #endif
+#ifdef __APPLE__
+// GI1 iOS platform seam: GPU copy of the composed GS image into an
+// IOSurface-backed sink (BGRA). 1=export queued (done(ctx, ok) then fires
+// exactly once from the command buffer's completion handler, on an arbitrary
+// Metal thread; the surface must stay alive until then), 0=no composed frame
+// yet (no callback), -1=export failed (no callback).
+typedef void (*GSExportIOSurfaceDoneFn)(void* ctx, int ok);
+int GSExportSnapshotToIOSurface(void* iosurface, u32 width, u32 height, GSExportIOSurfaceDoneFn done, void* ctx);
+void GSReleaseExportIOSurface(void* iosurface);
+#endif
 void GSJoinSnapshotThreads();
 
 namespace Host

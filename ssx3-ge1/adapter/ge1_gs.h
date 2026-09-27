@@ -20,6 +20,10 @@ GE1_API int ge1_gs_packet(uint8_t path, const uint8_t* bytes, uint32_t byte_coun
 GE1_API int ge1_gs_vsync(uint32_t field, uint64_t csr, uint64_t smode1, uint64_t syncv);
 GE1_API int ge1_gs_read_fifo(uint8_t* bytes, uint32_t qwords);
 GE1_API int ge1_gs_snapshot(uint32_t* width, uint32_t* height, const uint32_t** rgba);
+typedef void (*ge1_gs_export_done_fn)(void* ctx, int ok);
+GE1_API int ge1_gs_export_iosurface(void* iosurface, uint32_t width, uint32_t height,
+                                    ge1_gs_export_done_fn done, void* ctx);
+GE1_API void ge1_gs_release_iosurface(void* iosurface);
 GE1_API int ge1_gs_export_ahb(void* buffer, uint32_t width, uint32_t height, uint64_t* fence_counter);
 GE1_API void ge1_gs_wait_export(uint64_t fence_counter);
 GE1_API void ge1_gs_release_ahb(void* buffer);
