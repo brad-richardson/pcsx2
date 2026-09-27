@@ -74,6 +74,11 @@ GSRendererType GSGetCurrentRenderer()
 	return GSCurrentRenderer;
 }
 
+float GSGetAndResetAccumulatedGPUTime()
+{
+	return g_gs_device ? g_gs_device->GetAndResetAccumulatedGPUTime() : -1.0f;
+}
+
 bool GSIsHardwareRenderer()
 {
 	// Null gets flagged as hw.
@@ -1274,6 +1279,27 @@ bool GSSaveSnapshotToMemory(u32 window_width, u32 window_height, bool apply_aspe
 		width, height, pixels);
 }
 
+#ifdef __ANDROID__
+int GSExportSnapshotToAHB(AHardwareBuffer* buffer, u32 width, u32 height, u64* fence_counter)
+{
+	if (!g_gs_renderer || !g_gs_device || !g_gs_device->GetCurrent() || !fence_counter)
+		return 0;
+	return g_gs_renderer->ExportSnapshotToAHB(buffer, width, height, fence_counter) ? 1 : -1;
+}
+
+void GSWaitExportFence(u64 fence_counter)
+{
+	if (fence_counter && g_gs_device && GSCurrentRenderer == GSRendererType::VK)
+		static_cast<GSDeviceVK*>(g_gs_device.get())->WaitForFenceCounter(fence_counter);
+}
+
+void GSReleaseExportAHB(AHardwareBuffer* buffer)
+{
+	if (g_gs_device && GSCurrentRenderer == GSRendererType::VK)
+		static_cast<GSDeviceVK*>(g_gs_device.get())->ReleaseExportAHB(buffer);
+}
+#endif
+
 #ifdef _WIN32
 
 void* GSAllocateWrappedMemory(size_t size, size_t repeat)
@@ -1341,6 +1367,9 @@ void GSFreeWrappedMemory(void* ptr, size_t size, size_t repeat)
 
 #include <sys/mman.h>
 #include <sys/stat.h>
+#if defined(__ANDROID__)
+#include <sys/syscall.h>
+#endif
 #include <fcntl.h>
 #include <unistd.h>
 
