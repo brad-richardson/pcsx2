@@ -7033,7 +7033,18 @@ void GSRendererHW::EmulateBlending(int rt_alpha_min, int rt_alpha_max, DATEOptio
 			// Enable sw blending for free blending (non recursive, accumulation).
 			sw_blending |= free_blend;
 			// Do not run BLEND MIX if sw blending is already present, it's less accurate.
-			blend_mix &= !sw_blending;
+			// GE4: Adreno drivers return garbage for the single-chunk feedback dst read
+			// of non-overlapping draws. Divert mixable equations to hw blend-mix (no dst
+			// read, no barrier) instead of pure sw blend. Excludes non-recursive (already
+			// barrier-free), depth feedback, and PABE, which interact with the mix path.
+			{
+				const bool ge4_divert_to_mix = GSConfig.AdrenoPreferBlendMix && blend_mix && no_prim_overlap &&
+			                                     !blend_non_recursive && !m_conf.ps.IsFeedbackLoopDepth() && !PABE;
+				if (ge4_divert_to_mix)
+					sw_blending = false;
+				else
+					blend_mix &= !sw_blending;
+			}
 			sw_blending |= blend_mix;
 			[[fallthrough]];
 		case AccBlendLevel::Minimum:

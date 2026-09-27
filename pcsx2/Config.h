@@ -897,6 +897,10 @@ struct Pcsx2Config
 		GSBilinearDirtyMode UserHacks_BilinearHack = GSBilinearDirtyMode::Automatic;
 		TriFiltering TriFilter = DEFAULT_TRILINEAR_FILTERING_MODE;
 		s8 OverrideTextureBarriers = -1;
+		// GE4: Adreno workaround. Non-overlapping sw-blend draws read dst through a
+		// single feedback-loop barrier chunk, which returns garbage on Adreno 830
+		// (menu font static). Prefer the hw blend-mix path for mixable equations.
+		bool AdrenoPreferBlendMix = false;
 		GSDepthFeedbackMode DepthFeedbackMode = GSDepthFeedbackMode::Auto;
 
 		u8 CAS_Sharpness = 50;
