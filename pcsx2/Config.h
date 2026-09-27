@@ -901,6 +901,9 @@ struct Pcsx2Config
 		// single feedback-loop barrier chunk, which returns garbage on Adreno 830
 		// (menu font static). Prefer the hw blend-mix path for mixable equations.
 		bool AdrenoPreferBlendMix = false;
+		// GP2: ARMSX2 fast packed-vertex parse for STQRGBAXYZF2 (aarch64 TBL;
+		// bit-exact). Adapter env GE1_VERTEX_KICK=1.
+		bool VertexKickFastParse = false;
 		GSDepthFeedbackMode DepthFeedbackMode = GSDepthFeedbackMode::Auto;
 
 		u8 CAS_Sharpness = 50;

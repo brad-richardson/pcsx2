@@ -113,6 +113,9 @@ extern "C" GE1_API int ge1_gs_open(int blending_level)
     // GE4: Adreno sw-blend workaround (menu font static). Env-gated, default off.
     if (const char* bmix = std::getenv("GE1_ADRENO_BLEND_MIX"); bmix && std::strcmp(bmix, "1") == 0)
         config.AdrenoPreferBlendMix = true;
+    // GP2: ARMSX2 fast packed-vertex parse (STQRGBAXYZF2). Env-gated, default off.
+    if (const char* vk = std::getenv("GE1_VERTEX_KICK"); vk && std::strcmp(vk, "1") == 0)
+        config.VertexKickFastParse = true;
 #ifdef __ANDROID__
     // Odin/Adreno default: preserve destination reads through texture barriers
     // while avoiding the broken framebuffer-fetch path. The safe probe stays

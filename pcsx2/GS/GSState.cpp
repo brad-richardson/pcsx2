@@ -6,6 +6,7 @@
 #include "GS/GSGL.h"
 #include "GS/GSPerfMon.h"
 #include "GS/GSUtil.h"
+#include "GS/GSVertexKickParse.h"
 
 #include "common/Console.h"
 #include "common/BitUtils.h"
@@ -1494,26 +1495,53 @@ void GSState::GIFPackedRegHandlerSTQRGBAXYZF2(const GIFPackedReg* RESTRICT r, u3
 
 	const GIFPackedReg* RESTRICT r_end = r + size;
 
-	while (r < r_end)
+	// GP2: ARMSX2 fast parse (GE1_VERTEX_KICK=1), default off. The legacy loop is
+	// verbatim; the fast loop parses through the bit-exact kernel and kicks
+	// identically.
+	if (GSConfig.VertexKickFastParse)
 	{
-		const GSVector4i st = GSVector4i::loadl(&r[0].U64[0]);
-		GSVector4i q = GSVector4i::loadl(&r[0].U64[1]);
-		const GSVector4i rgba = (GSVector4i::load<false>(&r[1]) & GSVector4i::x000000ff()).ps32().pu16();
+#ifdef ARCH_ARM64
+		const GSVertexKernels::PackedParseConsts gp2_k = GSVertexKernels::MakePackedParseConsts();
+#endif
+		while (r < r_end)
+		{
+			GSVector4i m0, m1;
+#ifdef ARCH_ARM64
+			GSVertexKernels::ParsePackedSTQRGBAXYZF2_Fast(r, m_v.UV, gp2_k, m0, m1);
+#else
+			GSVertexKernels::ParsePackedSTQRGBAXYZF2_Fast(r, m_v.UV, m0, m1);
+#endif
+			m_v.m[0] = m0; // TODO: only store the last one
+			m_v.m[1] = m1; // TODO: only store the last one
 
-		q = q.blend8(GSVector4i::cast(GSVector4(FLT_MIN)), q == GSVector4i::zero()); // see GIFPackedRegHandlerSTQ
+			VertexKick<prim, auto_flush>(r[2].XYZF2.Skip());
 
-		m_v.m[0] = st.upl64(rgba.upl32(q)); // TODO: only store the last one
+			r += 3;
+		}
+	}
+	else
+	{
+		while (r < r_end)
+		{
+			const GSVector4i st = GSVector4i::loadl(&r[0].U64[0]);
+			GSVector4i q = GSVector4i::loadl(&r[0].U64[1]);
+			const GSVector4i rgba = (GSVector4i::load<false>(&r[1]) & GSVector4i::x000000ff()).ps32().pu16();
 
-		GSVector4i xy = GSVector4i::loadl(&r[2].U64[0]);
-		GSVector4i zf = GSVector4i::loadl(&r[2].U64[1]);
-		xy = xy.upl16(xy.srl<4>()).upl32(GSVector4i::load((int)m_v.UV));
-		zf = zf.srl32<4>() & GSVector4i::x00ffffff().upl32(GSVector4i::x000000ff());
+			q = q.blend8(GSVector4i::cast(GSVector4(FLT_MIN)), q == GSVector4i::zero()); // see GIFPackedRegHandlerSTQ
 
-		m_v.m[1] = xy.upl32(zf); // TODO: only store the last one
+			m_v.m[0] = st.upl64(rgba.upl32(q)); // TODO: only store the last one
 
-		VertexKick<prim, auto_flush>(r[2].XYZF2.Skip());
+			GSVector4i xy = GSVector4i::loadl(&r[2].U64[0]);
+			GSVector4i zf = GSVector4i::loadl(&r[2].U64[1]);
+			xy = xy.upl16(xy.srl<4>()).upl32(GSVector4i::load((int)m_v.UV));
+			zf = zf.srl32<4>() & GSVector4i::x00ffffff().upl32(GSVector4i::x000000ff());
 
-		r += 3;
+			m_v.m[1] = xy.upl32(zf); // TODO: only store the last one
+
+			VertexKick<prim, auto_flush>(r[2].XYZF2.Skip());
+
+			r += 3;
+		}
 	}
 
 	m_q = r[-3].STQ.Q; // remember the last one, STQ outputs this to the temp Q each time
