@@ -1,0 +1,9 @@
+_ge1_gs_open
+_ge1_gs_close
+_ge1_gs_reset
+_ge1_gs_priv_write
+_ge1_gs_packet
+_ge1_gs_vsync
+_ge1_gs_read_fifo
+_ge1_gs_snapshot
+_ge1_gs_gpu_ms

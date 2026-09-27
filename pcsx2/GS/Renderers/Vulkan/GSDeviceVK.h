@@ -21,9 +21,13 @@
 #include <mutex>
 #include <string>
 #include <thread>
+#include <unordered_map>
 #include <vector>
 
 class VKSwapChain;
+#ifdef __ANDROID__
+struct AHardwareBuffer;
+#endif
 
 class GSDeviceVK final : public GSDevice
 {
@@ -133,8 +137,16 @@ public:
 	void WaitForFenceCounter(u64 fence_counter);
 
 	void WaitForGPUIdle();
+#ifdef __ANDROID__
+	bool CopySnapshotToAHB(GSTexture* src, AHardwareBuffer* buffer, u32 width, u32 height, u32 pad_x, u32 pad_y, u64* fence_counter);
+	void ReleaseExportAHB(AHardwareBuffer* buffer);
+#endif
 
 private:
+#ifdef __ANDROID__
+	struct ExportImage { VkImage image = VK_NULL_HANDLE; VkDeviceMemory memory = VK_NULL_HANDLE; u32 width = 0; u32 height = 0; };
+	std::unordered_map<AHardwareBuffer*, ExportImage> m_export_images;
+#endif
 	// Helper method to create a Vulkan instance.
 	static VkInstance CreateVulkanInstance(const WindowInfo& wi, OptionalExtensions* oe, bool enable_debug_utils,
 		bool enable_validation_layer);
