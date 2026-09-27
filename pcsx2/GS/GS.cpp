@@ -1149,6 +1149,9 @@ void GSFreeWrappedMemory(void* ptr, size_t size, size_t repeat)
 #if defined(__ANDROID__)
 #include <sys/syscall.h>
 #endif
+#if defined(__APPLE__)
+#include <TargetConditionals.h>
+#endif
 #include <fcntl.h>
 #include <unistd.h>
 
@@ -1163,6 +1166,20 @@ void* GSAllocateWrappedMemory(size_t size, size_t repeat)
 	// bionic API 28 has no shm_open; memfd provides the same anonymous
 	// file-backed mapping for the repeated GS local-memory view.
 	s_shm_fd = static_cast<int>(syscall(__NR_memfd_create, "GS.mem", 0));
+#elif defined(__APPLE__) && TARGET_OS_IPHONE
+	// GI1: the app sandbox denies shm_open (EPERM); an unlinked mkstemp file
+	// in the container tmp dir provides the same anonymous file-backed
+	// mapping. Same branch on the Simulator (uniform behavior).
+	{
+		char tmp_path[1024];
+		const char* tmpdir = getenv("TMPDIR");
+		if (!tmpdir || !*tmpdir)
+			tmpdir = "/tmp";
+		snprintf(tmp_path, sizeof(tmp_path), "%s/GS.memXXXXXX", tmpdir);
+		s_shm_fd = mkstemp(tmp_path);
+		if (s_shm_fd != -1)
+			unlink(tmp_path); // file is deleted but descriptor is still open
+	}
 #else
 	s_shm_fd = shm_open(file_name, O_RDWR | O_CREAT | O_EXCL, 0600);
 	if (s_shm_fd != -1)

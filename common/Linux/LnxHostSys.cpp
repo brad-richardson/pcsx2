@@ -15,6 +15,12 @@
 #include <mutex>
 #include <sys/mman.h>
 #include <unistd.h>
+#ifdef __APPLE__
+#include <TargetConditionals.h>
+#if TARGET_OS_IPHONE
+#include <libkern/OSCacheControl.h>
+#endif
+#endif
 #ifndef __APPLE__
 #include <ucontext.h>
 #endif
@@ -210,7 +216,14 @@ bool SharedMemoryMappingArea::Unmap(void* map_base, size_t map_size, bool is_fil
 
 void HostSys::FlushInstructionCache(void* address, u32 size)
 {
+#if defined(__APPLE__) && TARGET_OS_IPHONE
+	// GI1: __builtin___clear_cache emits a __clear_cache libcall that the
+	// device libSystem does not export (the Simulator's does). sys_icache_invalidate
+	// is the darwin cache-flush API; unreachable on iOS anyway (no JIT).
+	sys_icache_invalidate(address, size);
+#else
 	__builtin___clear_cache(reinterpret_cast<char*>(address), reinterpret_cast<char*>(address) + size);
+#endif
 }
 
 #endif
