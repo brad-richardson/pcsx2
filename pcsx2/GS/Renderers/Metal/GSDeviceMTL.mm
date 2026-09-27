@@ -1444,10 +1444,16 @@ bool GSDeviceMTL::Create(GSVSyncMode vsync_mode, bool allow_present_throttle)
 		if (!AcquireWindow(true))
 			return false;
 
+#if TARGET_OS_IPHONE
+		// GI1: surfaceless-only on iOS (IOSurface blit sink): no layer, and no
+		// hop to the main thread — Create runs on the GS worker while the main
+		// thread waits for it, so dispatch_sync(main) would deadlock.
+#else
 		OnMainThread([this]
 		{
 			AttachSurfaceOnMainThread();
 		});
+#endif
 
 		// Metal does not support mailbox.
 		m_vsync_mode = (m_vsync_mode == GSVSyncMode::Mailbox) ? GSVSyncMode::FIFO : m_vsync_mode;
@@ -1460,7 +1466,13 @@ bool GSDeviceMTL::Create(GSVSyncMode vsync_mode, bool allow_present_throttle)
 		return false;
 	}
 
+#if TARGET_OS_IPHONE
+	// GI1: no layer surfaceless; the present/imgui pipelines using this format
+	// are never executed (BeginPresent early-outs for Surfaceless).
+	MTLPixelFormat layer_px_fmt = MTLPixelFormatBGRA8Unorm;
+#else
 	MTLPixelFormat layer_px_fmt = [m_layer pixelFormat];
+#endif
 
 	m_features.broken_point_sampler = false;
 	m_features.vs_expand = !GSConfig.DisableVertexShaderExpand;
@@ -1480,6 +1492,12 @@ bool GSDeviceMTL::Create(GSVSyncMode vsync_mode, bool allow_present_throttle)
 	m_features.dxt_textures = true;
 	m_features.bptc_textures = true;
 	m_features.framebuffer_fetch = m_dev.features.framebuffer_fetch && !GSConfig.DisableFramebufferFetch;
+#if TARGET_OS_SIMULATOR
+	// GI1: the Simulator's Metal device reports Apple-family fetch support but
+	// rejects fetch pipelines ("reading from a rendertarget is not supported").
+	// Real devices keep fetch.
+	m_features.framebuffer_fetch = false;
+#endif
 	// Apple's programmable blending reads the tile in rasterization order, so overlapping
 	// primitives in one draw already observe each other and a full barrier adds nothing.
 	m_features.framebuffer_fetch_orders_overlap = m_features.framebuffer_fetch;

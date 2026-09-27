@@ -125,6 +125,10 @@ extern "C" GE1_API int ge1_gs_open(int blending_level)
     // GE4: Adreno sw-blend workaround (menu font static). Env-gated, default off.
     if (const char* bmix = std::getenv("GE1_ADRENO_BLEND_MIX"); bmix && std::strcmp(bmix, "1") == 0)
         config.AdrenoPreferBlendMix = true;
+    // GI1: diagnostic fetch disable (matches the Simulator, which forces fetch
+    // off because sim Metal rejects fetch pipelines). Default off.
+    if (const char* nofetch = std::getenv("GE1_DISABLE_FETCH"); nofetch && std::strcmp(nofetch, "1") == 0)
+        config.DisableFramebufferFetch = true;
 #ifdef __ANDROID__
     // Odin/Adreno default: preserve destination reads through texture barriers
     // while avoiding the broken framebuffer-fetch path. The safe probe stays
