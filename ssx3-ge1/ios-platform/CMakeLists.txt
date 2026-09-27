@@ -58,6 +58,7 @@ add_subdirectory("${GE1_PCSX2_ROOT}/pcsx2" "${CMAKE_BINARY_DIR}/pcsx2")
 # and the Cocoa achievement chime, all excluded on iOS.
 target_sources(PCSX2 PRIVATE
   "${CMAKE_CURRENT_SOURCE_DIR}/GSCaptureStub.cpp"
-  "${CMAKE_CURRENT_SOURCE_DIR}/GI1iOSStubs.cpp")
+  "${CMAKE_CURRENT_SOURCE_DIR}/GI1iOSStubs.cpp"
+  "${CMAKE_CURRENT_SOURCE_DIR}/GI1CocoaTools.mm")
 
 add_subdirectory("${CMAKE_CURRENT_SOURCE_DIR}/../adapter" "${CMAKE_BINARY_DIR}/ge1-adapter")
