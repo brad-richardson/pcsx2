@@ -99,7 +99,14 @@ extern "C" GE1_API int ge1_gs_open(int blending_level)
     Host::Internal::SetBaseSettingsLayer(&s_settings);
 
     auto config = EmuConfig.GS;
-    config.Renderer = GSRendererType::VK;
+    // GI1: renderer select. GE1_RENDERER=metal opens the native Metal backend
+    // (Mac/iOS); anything else keeps the Vulkan default.
+    GSRendererType renderer = GSRendererType::VK;
+#ifdef __APPLE__
+    if (const char* want = std::getenv("GE1_RENDERER"); want && std::strcmp(want, "metal") == 0)
+        renderer = GSRendererType::Metal;
+#endif
+    config.Renderer = renderer;
     config.UpscaleMultiplier = 1.0f;
     config.AccurateBlendingUnit = static_cast<AccBlendLevel>(blending_level);
     config.HWDownloadMode = GSHardwareDownloadMode::Enabled;
@@ -127,7 +134,7 @@ extern "C" GE1_API int ge1_gs_open(int blending_level)
     }
 #endif
     std::fill(s_priv.begin(), s_priv.end(), 0);
-    s_open = GSopen(config, GSRendererType::VK, s_priv.data(), GSVSyncMode::Disabled, false);
+    s_open = GSopen(config, renderer, s_priv.data(), GSVSyncMode::Disabled, false);
     if (s_open)
     {
         // PW1 knobs, all default off. Errors here are non-fatal: the knobs are

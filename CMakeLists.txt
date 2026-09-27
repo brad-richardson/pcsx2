@@ -129,3 +129,10 @@ endif()
 if(ARCH_ARM64)
 	message(STATUS "ARM64 build: EE, IOP, and VU0/VU1 recompilers are all available.")
 endif()
+
+# GI1/GE1: offline GS extraction adapter + replayer (ssx3-ge1). Mirrors GE1's
+# one-line vendor edit. The Android platform build adds the adapter itself.
+option(GE1_BUILD_ADAPTER "Build the ssx3-ge1 adapter library and ge1_replay" ON)
+if(GE1_BUILD_ADAPTER AND NOT ANDROID)
+	add_subdirectory(ssx3-ge1/adapter "${CMAKE_BINARY_DIR}/ge1-adapter")
+endif()

@@ -18,3 +18,39 @@ endif()
 
 add_executable(ge1_replay ge1_replay.cpp)
 target_link_libraries(ge1_replay PRIVATE ge1_gs)
+
+# GI1: macOS metallibs for GE1_RENDERER=metal replays. Same sources and
+# std/target pairs as the desktop generateMetallib() in pcsx2/CMakeLists.txt.
+# At replay time, point GE1_GS_RESOURCES_DIR at a directory containing these
+# metallibs plus the usual bin/resources content (fonts at minimum).
+if(APPLE AND NOT CMAKE_SYSTEM_NAME STREQUAL "iOS")
+  set(GE1_METAL_SHADERS
+    cas.metal convert.metal present.metal merge.metal misc.metal interlace.metal tfx.metal fxaa.metal)
+  function(ge1_metallib std triple outputName)
+    set(outs)
+    foreach(shader IN LISTS GE1_METAL_SHADERS)
+      set(shaderOut ${CMAKE_CURRENT_BINARY_DIR}/metallibs/${outputName}/${shader}.air)
+      list(APPEND outs ${shaderOut})
+      get_filename_component(shaderDir ${shaderOut} DIRECTORY)
+      add_custom_command(OUTPUT ${shaderOut}
+        COMMAND ${CMAKE_COMMAND} -E make_directory ${shaderDir}
+        COMMAND xcrun metal -ffast-math
+          $<$<NOT:$<CONFIG:Release,MinSizeRel>>:-gline-tables-only>
+          $<$<NOT:$<CONFIG:Release,MinSizeRel>>:-MO>
+          -std=${std} -target ${triple} -o ${shaderOut} -c ${GE1_PCSX2_ROOT}/pcsx2/GS/Renderers/Metal/${shader}
+        DEPENDS ${GE1_PCSX2_ROOT}/pcsx2/GS/Renderers/Metal/${shader}
+          ${GE1_PCSX2_ROOT}/pcsx2/GS/Renderers/Metal/GSMTLSharedHeader.h
+          ${GE1_PCSX2_ROOT}/pcsx2/GS/Renderers/Metal/GSMTLShaderCommon.h)
+    endforeach()
+    set(metallib ${CMAKE_CURRENT_BINARY_DIR}/metallibs/${outputName}.metallib)
+    add_custom_command(OUTPUT ${metallib}
+      COMMAND xcrun metallib -o ${metallib} ${outs}
+      DEPENDS ${outs})
+    list(APPEND GE1_METALLIBS ${metallib})
+    set(GE1_METALLIBS ${GE1_METALLIBS} PARENT_SCOPE)
+  endfunction()
+  ge1_metallib(macos-metal2.0 air64-apple-macos10.13 default)
+  ge1_metallib(macos-metal2.3 air64-apple-macos11.0 Metal23)
+  add_custom_target(ge1_metallibs ALL DEPENDS ${GE1_METALLIBS})
+  add_dependencies(ge1_replay ge1_metallibs)
+endif()
