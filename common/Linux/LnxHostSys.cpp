@@ -14,6 +14,9 @@
 #include <fcntl.h>
 #include <mutex>
 #include <sys/mman.h>
+#if defined(__ANDROID__)
+#include <sys/syscall.h>
+#endif
 #include <unistd.h>
 #ifdef __APPLE__
 #include <TargetConditionals.h>
@@ -69,7 +72,13 @@ std::string HostSys::GetFileMappingName(const char* prefix)
 
 void* HostSys::CreateSharedMemory(const char* name, size_t size)
 {
+#if defined(__ANDROID__)
+	// bionic has no shm_open before API 30. memfd_create's syscall is
+	// available at the GE1 speed replay's API 28 floor.
+	const int fd = static_cast<int>(syscall(__NR_memfd_create, name, 0));
+#else
 	const int fd = shm_open(name, O_CREAT | O_EXCL | O_RDWR, 0600);
+#endif
 	if (fd < 0)
 	{
 		std::fprintf(stderr, "shm_open failed: %d\n", errno);
@@ -77,7 +86,9 @@ void* HostSys::CreateSharedMemory(const char* name, size_t size)
 	}
 
 	// we're not going to be opening this mapping in other processes, so remove the file
+#if !defined(__ANDROID__)
 	shm_unlink(name);
+#endif
 
 	// ensure it's the correct size
 	if (ftruncate(fd, static_cast<off_t>(size)) < 0)

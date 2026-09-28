@@ -328,9 +328,11 @@ set(pcsx2DEV9Sources
 	DEV9/flash.cpp
 	DEV9/net.cpp
 	)
-# GI1: libpcap is unavailable on iOS; the real pcap_io.cpp must not compile
-# there (ARMSX2 shape). DEV9 never runs on the iOS GS path.
-if(NOT IOS)
+if(ANDROID)
+	list(APPEND pcsx2DEV9Sources Android/AndroidPcapStubs.cpp)
+elseif(NOT IOS)
+	# GI1: libpcap is unavailable on iOS; the real pcap_io.cpp must not compile
+	# there (ARMSX2 shape). DEV9 never runs on the iOS GS path.
 	list(APPEND pcsx2DEV9Sources DEV9/pcap_io.cpp)
 endif()
 
@@ -1068,6 +1070,14 @@ set(pcsx2arm64Headers
 	arm64/AsmHelpers.h
 )
 
+if(ANDROID)
+	# GE1 offline replay never captures video; use a no-op platform shim
+	# to avoid FFmpeg in the adb-shell speed binary.
+	list(REMOVE_ITEM pcsx2GSSources GS/GSCapture.cpp)
+	list(APPEND pcsx2GSSources "${CMAKE_SOURCE_DIR}/../adapter/ge1_capture_stub.cpp")
+	list(APPEND pcsx2GSSources Android/AndroidStubs.cpp)
+endif()
+
 # These ones benefit a lot from LTO
 set(pcsx2LTOSources
 	${pcsx2Sources}
@@ -1176,6 +1186,7 @@ target_link_libraries(PCSX2_FLAGS INTERFACE
 	SoundTouch::SoundTouch
 	JPEG::JPEG
 	PNG::PNG
+	JPEG::JPEG
 	LZMA::LZMA
 	Zstd::Zstd
 	demanglegnu
@@ -1210,7 +1221,7 @@ if(WIN32)
 		dwmapi.lib
 		OneCore.lib
 	)
-elseif(NOT IOS)
+elseif(NOT ANDROID AND NOT IOS)
 	# GI1: no system libpcap on iOS (ARMSX2 shape).
 	target_link_libraries(PCSX2_FLAGS INTERFACE
 		PCAP::PCAP

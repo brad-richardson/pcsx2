@@ -179,6 +179,14 @@ elseif(APPLE)
 		"-framework Foundation"
 		"-framework IOKit"
 	)
+elseif(ANDROID)
+	target_sources(common PRIVATE
+		Linux/LnxHostSys.cpp
+		Linux/LnxThreads.cpp
+		Linux/LnxMisc.cpp
+		HTTPDownloaderAndroid.cpp
+		HTTPDownloaderAndroid.h
+	)
 else()
 	target_sources(common PRIVATE
 		Linux/LnxHostSys.cpp
@@ -211,9 +219,10 @@ if (USE_GCC AND CMAKE_INTERPROCEDURAL_OPTIMIZATION)
 	set_source_files_properties(FastJmp.cpp PROPERTIES COMPILE_FLAGS -fno-lto)
 endif()
 
-if(NOT WIN32 AND NOT IOS)
-	# libcurl-based HTTPDownloader (unavailable on iOS; nothing on the GS
-	# path constructs one, and the static link drops the unreferenced factory)
+# libcurl-based HTTPDownloader: unavailable on iOS (nothing on the GS path
+# constructs one, and the static link drops the unreferenced factory), and
+# Android uses HTTPDownloaderAndroid instead.
+if(NOT WIN32 AND NOT ANDROID AND NOT IOS)
 	target_sources(common PRIVATE
 		HTTPDownloaderCurl.cpp
 		HTTPDownloaderCurl.h

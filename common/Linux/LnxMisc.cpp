@@ -13,14 +13,16 @@
 
 #include "fmt/format.h"
 
+#if !defined(__ANDROID__)
 #include <dbus/dbus.h>
+#include <X11/Xlib.h>
+#include <X11/extensions/XInput2.h>
+#endif
 #include <spawn.h>
 #include <sys/sysinfo.h>
 #include <sys/time.h>
 #include <sys/wait.h>
 #include <unistd.h>
-#include <X11/Xlib.h>
-#include <X11/extensions/XInput2.h>
 
 #include <cstdlib>
 #include <cstring>
@@ -140,6 +142,7 @@ std::string GetOSVersionString()
 #endif
 }
 
+#if !defined(__ANDROID__)
 static bool SetScreensaverInhibitDBus(const bool inhibit_requested, const char* program_name, const char* reason)
 {
 	static dbus_uint32_t s_cookie;
@@ -328,10 +331,16 @@ void Common::DetachMousePositionCb()
 		mouseThread.join();
 	}
 }
+#else
+bool Common::InhibitScreensaver(bool) { return false; }
+void Common::SetMousePosition(int, int) {}
+bool Common::AttachMousePositionCb(std::function<void(int, int)>) { return false; }
+void Common::DetachMousePositionCb() {}
+#endif
 
 bool Common::PlaySoundAsync(const char* path)
 {
-#ifdef __linux__
+#if defined(__linux__) && !defined(__ANDROID__)
 	// This is... pretty awful. But I can't think of a better way without linking to e.g. gstreamer.
 	const char* cmdname = "aplay";
 	const char* argv[] = {cmdname, path, nullptr};
