@@ -79,6 +79,13 @@ float GSGetAndResetAccumulatedGPUTime()
 	return g_gs_device ? g_gs_device->GetAndResetAccumulatedGPUTime() : -1.0f;
 }
 
+float GSGetAndResetBackThreadMs()
+{
+	if (!g_gs_renderer || !g_gs_renderer->IsBackThreadRunning())
+		return -1.0f;
+	return g_gs_renderer->TakeBackThreadBusyMs();
+}
+
 #ifdef ENABLE_VULKAN
 static GSDeviceVK* GetVKDeviceForPW1()
 {

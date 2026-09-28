@@ -28,6 +28,9 @@ GE1_API int ge1_gs_export_ahb(void* buffer, uint32_t width, uint32_t height, uin
 GE1_API void ge1_gs_wait_export(uint64_t fence_counter);
 GE1_API void ge1_gs_release_ahb(void* buffer);
 GE1_API float ge1_gs_gpu_ms(void);
+// PT2: accumulated GS back-thread drain busy ms since the last call (reset on
+// read, like gpu_ms); <0 when no back thread is engaged. Optional symbol.
+GE1_API float ge1_gs_back_ms(void);
 // PW1: flush the Vulkan pipeline cache and persist newly recorded TFX selectors now.
 // For a future app pause/stop hook; the periodic ge1_gs_vsync path covers force-stop.
 GE1_API int ge1_gs_flush_caches(void);

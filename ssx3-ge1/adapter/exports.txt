@@ -7,6 +7,7 @@ _ge1_gs_vsync
 _ge1_gs_read_fifo
 _ge1_gs_snapshot
 _ge1_gs_gpu_ms
+_ge1_gs_back_ms
 _ge1_gs_flush_caches
 _ge1_gs_export_iosurface
 _ge1_gs_release_iosurface

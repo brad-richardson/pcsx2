@@ -407,6 +407,11 @@ extern "C" GE1_API float ge1_gs_gpu_ms(void)
     return s_open ? GSGetAndResetAccumulatedGPUTime() : -1.0f;
 }
 
+extern "C" GE1_API float ge1_gs_back_ms(void)
+{
+    return s_open ? GSGetAndResetBackThreadMs() : -1.0f;
+}
+
 extern "C" GE1_API int ge1_gs_flush_caches(void)
 {
     if (!s_open)

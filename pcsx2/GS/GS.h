@@ -128,6 +128,9 @@ void GSUpdateDisplayWindow();
 void GSSetVSyncMode(GSVSyncMode mode, bool allow_present_throttle);
 // GE1 offline replay timing hook; keeps the adapter on the GS.h surface.
 float GSGetAndResetAccumulatedGPUTime();
+// PT2: back-thread drain busy ms since the last call (reset on read); <0 when
+// no back thread is engaged (Off/InlineRecords modes, GL fallback, closed).
+float GSGetAndResetBackThreadMs();
 // PW1: pipeline-cache pre-warm. All no-op (zeros) unless the VK device is up; GS thread only.
 void GSFlushPipelineCache();
 void GSGetAndResetPipelineStats(u64* tfx_pipelines, u64* tfx_ns, u64* spv_compiles, u64* spv_ns);
