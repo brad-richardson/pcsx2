@@ -39,6 +39,15 @@ public:
 	GSBackQueue::Channel* GetBackChannel() { return m_chan; }
 	bool IsBackThreadRunning() const { return m_chan->consumer_running; }
 
+	// PT2: reset-on-read back-thread drain busy time (BackThreadLoop
+	// accumulates one timestamped span per drain batch; idle waits excluded).
+	// Called on the GS thread; the exchange is thread-safe against the writer.
+	float TakeBackThreadBusyMs()
+	{
+		const u64 ns = m_back_thread_busy_ns.exchange(0, std::memory_order_relaxed);
+		return static_cast<float>(ns) / 1000000.0f;
+	}
+
 	// GP6: external sync points (settings apply, screenshot-to-memory) that
 	// touch renderer/device state from the MTGS thread must drain queued records
 	// first — the back thread may otherwise be mid-draw on the same GSDevice.
@@ -585,6 +594,8 @@ public:
 	bool m_back_lockstep = false;
 	std::thread m_back_thread;
 	std::atomic<bool> m_back_thread_exit{false};
+	// PT2: accumulated BackThreadLoop drain-batch busy ns (TakeBackThreadBusyMs resets).
+	std::atomic<u64> m_back_thread_busy_ns{0};
 
 	void StartBackThread();
 	void StopBackThread();

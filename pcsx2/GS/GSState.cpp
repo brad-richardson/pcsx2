@@ -15,6 +15,7 @@
 
 #include <algorithm>
 #include <cfloat>
+#include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <fstream>
@@ -733,11 +734,19 @@ void GSState::BackThreadLoop()
 		if (m_back_thread_exit.load(std::memory_order_acquire))
 			break;
 
+		// PT2: timestamp the drain batch (the idle WaitForWorkWithSpin above
+		// is excluded); TakeBackThreadBusyMs resets the accumulator.
+		const auto batch_start = std::chrono::steady_clock::now();
 		while (GSBackQueue::RecordSlot* slot = m_chan->ring.Peek())
 		{
 			ExecRecordSlot(*slot);
 			m_chan->ring.Pop();
 		}
+		m_back_thread_busy_ns.fetch_add(
+			static_cast<u64>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+				std::chrono::steady_clock::now() - batch_start)
+			                     .count()),
+			std::memory_order_relaxed);
 	}
 }
 
