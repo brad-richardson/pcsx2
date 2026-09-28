@@ -679,6 +679,10 @@ public:
 	VkDependencyFlags GetFeedbackBarrierDependencyFlags() const;
 	void SendHWDraw(const GSHWDrawConfig& config, GSTextureVK* draw_rt, GSTextureVK* draw_ds,
 		bool one_barrier, bool full_barrier);
+	void GE7SendSplitDraw(const GSHWDrawConfig& config, GSTextureVK* draw_rt, GSTextureVK* draw_ds,
+		const GSVector2i& rtsize);
+	void GE7SendBreakDraw(const GSHWDrawConfig& config, GSTextureVK* draw_rt, GSTextureVK* draw_ds,
+		bool one_barrier, bool full_barrier, VkRenderPass refresh_rp);
 
 	//////////////////////////////////////////////////////////////////////////
 	// Vulkan State

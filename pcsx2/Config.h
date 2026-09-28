@@ -929,6 +929,17 @@ struct Pcsx2Config
 		/// not persisted, and not compared — set by OpenGSRenderer on GSConfig
 		/// only, and read by the renderer's constructor.
 		GSBackThreadMode BackThreadModeResolved = GSBackThreadMode::Off;
+		// GE7: exact destination reads on Adreno. Copy road (no in-pass reads,
+		// which return garbage on Adreno 830) plus splitting overlapping sw-blend
+		// draws into non-overlapping batches with a fresh RT copy between them
+		// (mirrors the D3D11 multidraw_fb_copy servicing). Adapter env
+		// GE1_ADRENO_DSTREAD=split, default off.
+		bool AdrenoDstReadSplit = false;
+		// GE7: keep the barrier road's decisions (sw blending everywhere) but order
+		// each dst-read draw/group through a tile store/load pass break (real
+		// memory) instead of the in-pass barrier the Adreno driver mis-executes.
+		// Adapter env GE1_ADRENO_DSTREAD=passbreak, default off.
+		bool AdrenoDstReadBreak = false;
 		GSDepthFeedbackMode DepthFeedbackMode = GSDepthFeedbackMode::Auto;
 
 		u8 CAS_Sharpness = 50;
