@@ -5,6 +5,7 @@
 #include "VU.h"
 #include "VUmicro.h"
 #include "common/FPControl.h"
+#include "arm64/microVU_Persist-arm64.h"
 #include "ps2_vu1cap.h"
 #include <algorithm>
 #include <array>
@@ -346,6 +347,15 @@ int main(int argc, char** argv)
     std::printf("checked=%llu passes=%d value_mismatch_jobs=%llu mode=%s\n",
       (unsigned long long)total_jobs, passes, (unsigned long long)value_diffs.jobs,
       speed ? "speed" : "report");
+    {
+        const auto st = mVUPersist::GetStats(1);
+        std::printf("mvu_blocks vu1_compiles=%llu chunks=%llu dropped=%llu blocks=%llu fixups=%llu hydrated_progs=%llu hydrated_blocks=%llu rejects=%llu\n",
+          (unsigned long long)mVUPersist::GetBlockCompileCount(1),
+          (unsigned long long)st.chunksRecorded, (unsigned long long)st.chunksDropped,
+          (unsigned long long)st.blocksRecorded, (unsigned long long)st.fixupsRecorded,
+          (unsigned long long)st.programsHydrated, (unsigned long long)st.blocksHydrated,
+          (unsigned long long)st.hydrationRejects);
+    }
     cleanup();
     return 0;
 }
