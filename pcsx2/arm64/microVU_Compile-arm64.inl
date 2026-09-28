@@ -939,6 +939,7 @@ __fi void mVUinitFirstPass(mV, uptr pState, u8* thisPtr)
 	// Register this block (manager copy + host entry) with the VU program-cache
 	// recorder so the emitted code can be persisted and reloaded across runs.
 	mVUPersist::OnBlockCompiled(mVU, mVUpBlock, thisPtr, mVUstartPC * 4);
+	om1::BlockCompiled(mVU.index, mVUpBlock, thisPtr, mVUstartPC * 4); // OM1
 	mVUregs.needExactMatch = (mVUpBlock->pState.blockType) ? 7 : 0;
 	mVU.needFlagFinalize = false; // compile-scoped; see microVU-arm64.h
 	mVUregs.blockType = 0;
@@ -1007,6 +1008,11 @@ void mVUdebugPrintBlocks(mV, bool isEndPC) {}
 
 void* mVUcompile(microVU& mVU, u32 startPC, uptr pState)
 {
+	if (om1::CodegenForbidden()) // OM1 offline consumer: never compile
+	{
+		std::fprintf(stderr, "[om1] FATAL: mVUcompile in no-codegen mode (pc=%x)\n", startPC);
+		std::abort();
+	}
 	microFlagCycles mFC;
 	// armAsm is managed by mVUexecute/mVUcompileJIT — must be active here.
 	pxAssert(armAsm);
