@@ -136,6 +136,21 @@ extern "C" GE1_API int ge1_gs_open(int blending_level)
     // fused min/max + two-pass kernel). Env-gated, default off.
     if (const char* vk = std::getenv("GE1_VERTEX_KICK"); vk && std::strcmp(vk, "2") == 0)
         config.VertexKickFused = true;
+    // GP6: GS front/back split. off (default) = single-threaded, no record
+    // round-trip; inline = records executed on the calling thread (identity
+    // rung); lockstep = back thread + drain per record (bisect rung);
+    // pipelined = two-object split, true overlap.
+    if (const char* bt = std::getenv("GE1_BACKTHREAD"); bt && *bt)
+    {
+        if (std::strcmp(bt, "inline") == 0)
+            config.BackThreadMode = GSBackThreadMode::InlineRecords;
+        else if (std::strcmp(bt, "lockstep") == 0)
+            config.BackThreadMode = GSBackThreadMode::Lockstep;
+        else if (std::strcmp(bt, "pipelined") == 0)
+            config.BackThreadMode = GSBackThreadMode::Pipelined;
+        else
+            config.BackThreadMode = GSBackThreadMode::Off;
+    }
 #ifdef __ANDROID__
     // Odin/Adreno default: preserve destination reads through texture barriers
     // while avoiding the broken framebuffer-fetch path. The safe probe stays

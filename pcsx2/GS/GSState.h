@@ -13,6 +13,7 @@
 #include "GS/Renderers/Common/GSDevice.h"
 #include "GS/GSVector.h"
 #include "GS/GSVertexKickFused.h"
+#include "GS/GSBackQueue.h"
 #include "GSAlignedClass.h"
 
 class GSDumpBase;
@@ -21,10 +22,27 @@ class GSState : public GSAlignedClass<32>
 {
 	// GP3: GSVertexTrace::Update consumes the fused-FMM accumulator.
 	friend class GSVertexTrace;
+	// GP6: the front parser object delegates protected queries/seams to the
+	// back renderer through a GSState*.
+	friend class GSFrontState;
 
 public:
-	GSState();
+	// GP6: shared_chan aims this object at another GSState's channel — the
+	// front parser object of the two-object split passes the back object's
+	// channel so its records land in the consumed ring. Default (nullptr) uses
+	// this object's own channel storage, exactly as before.
+	GSState(GSBackQueue::Channel* shared_chan = nullptr, bool is_front_parser = false);
 	virtual ~GSState();
+
+	// GP6: channel/back-thread visibility for the front-object lifecycle in
+	// GS.cpp (create the front only when the back thread actually engaged).
+	GSBackQueue::Channel* GetBackChannel() { return m_chan; }
+	bool IsBackThreadRunning() const { return m_chan->consumer_running; }
+
+	// GP6: external sync points (settings apply, screenshot-to-memory) that
+	// touch renderer/device state from the MTGS thread must drain queued records
+	// first — the back thread may otherwise be mid-draw on the same GSDevice.
+	void DrainBackQueue();
 
 	static constexpr int GetSaveStateSize(int version);
 
@@ -129,6 +147,12 @@ private:
 
 	} m_tr;
 
+	// GP6: executor-owned HOST->LOCAL write cursor (advanced by wi() across
+	// transfer slices; mirrored back into m_tr.x/y inline for savestate
+	// coherence).
+	int m_exec_tr_x = 0;
+	int m_exec_tr_y = 0;
+
 protected:
 	static constexpr int INVALID_ALPHA_MINMAX = 500;
 	static constexpr int MAX_DRAW_BUFFERS = 3;
@@ -139,41 +163,28 @@ protected:
 	int  m_used_buffers_idx = 0;
 	int m_current_buffer_idx = 0;
 	bool m_recent_buffer_switch = false;
-	u32 m_max_vertex_count;
 
-	struct GSVertexBuff
-	{
-		GSVertex* buff;
-		GSVertex* buff_copy; // same size buffer to copy/modify the original buffer
-		u32 head, tail, next; // head: first vertex, tail: last vertex + 1, next: last indexed + 1
-		u32 xy_tail;
-		GSVector4i xy[4];
-		GSVector4i xyhead;
-		// GP3 fused vertex-trace bounds (GE1_VERTEX_KICK=2, aarch64 only):
-		// FindMinMax min/max accumulated at index emission over this buffer's
-		// referenced vertices. fmm_watermark is the first vertex position not
-		// yet folded in (clamped on rewinds/compaction so re-referenced
-		// positions re-accumulate); fmm_valid means the accumulator covers every
-		// emitted index of the pending draw. Reset lazily at the first emission
-		// of a draw (itail == n). Zero-initialized by ResetDrawBuffers' memset.
-		GSVertexKernels::FmmAcc fmm_acc;
-		u32 fmm_watermark;
-		bool fmm_valid;
-	};
+	// GP6: definitions hoisted to GSBackQueue.h (DRAW record payload types).
+	// Adds maxcount (per-buffer capacity; replaces m_max_vertex_count) to the
+	// GP3 shape; kick_ring is omitted (see GSBackQueue.h).
+	using GSVertexBuff = GSBackQueue::VertexBuff;
+	using GSIndexBuff = GSBackQueue::IndexBuff;
 
 	GSVertexBuff m_vertex_buffers[MAX_DRAW_BUFFERS];
-	GSVertexBuff* m_vertex;
-
-	struct GSIndexBuff
-	{
-		u16* buff;
-		u32 tail;
-	};
+	GSVertexBuff* m_vertex = nullptr;
 
 	GSIndexBuff m_index_buffers[MAX_DRAW_BUFFERS];
 
 	GSIndexBuff* m_index;
 
+	// Draw-time staging snapshot of the live vertex/index arrays, for the draws
+	// that must read the vertices while the backend also writes them. Contents are
+	// write-then-consume: fully overwritten before every use, so they are never
+	// preserved across a reallocation. Their capacity is deliberately NOT tied to
+	// m_vertex/m_index — on the pipelined split m_vertex points at pooled node
+	// arrays grown by the *front* object, which can be far larger than anything
+	// this object ever allocated — so EnsureDrawStaging sizes them at the point of
+	// use, from what is actually about to be staged, and only ever upwards.
 	GSVertexBuff m_draw_vertex = {};
 
 	struct
@@ -181,6 +192,13 @@ protected:
 		u16* buff;
 		u32 tail;
 	} m_draw_index = {};
+
+	// Allocated element counts of the two staging arrays above (0 = not allocated;
+	// they stay unallocated in sessions that never stage a draw).
+	u32 m_draw_vertex_alloc = 0;
+	u32 m_draw_index_alloc = 0;
+
+	void EnsureDrawStaging(u32 vertex_count, u32 index_count);
 
 	struct GSDrawBufferEnv
 	{
@@ -256,6 +274,10 @@ protected:
 	bool IsCoverageAlpha();
 	bool IsCoverageAlphaFixedOne();
 	virtual bool IsCoverageAlphaSupported();
+	// GP6: ALPHA-as-parameter form of GSRendererHW::IsRTWritten, so the split
+	// front can evaluate the kick-time query with its live blending regs while
+	// the cached ctx / alpha min-max stay the back's last-executed-draw state.
+	virtual bool IsRTWrittenLive(const GIFRegALPHA& ALPHA);
 	void CalcAlphaMinMax(const int tex_min, const int tex_max);
 	void CorrectATEAlphaMinMax(const u32 atst, const int aref);
 
@@ -346,9 +368,12 @@ public:
 	GSVector4i m_r = {};
 	GSVector4i m_r_no_scissor = {};
 
-	static u64 s_n;
-	static u64 s_last_transfer_draw_n;
-	static u64 s_transfer_n;
+	// GP6: per-object (was static). The front parser assigns draw_serials from
+	// its counter; the back executor installs the record's serial before the
+	// draw tail, so TC timestamps and heuristics read the executing draw's.
+	u64 s_n = 0;
+	u64 s_last_transfer_draw_n = 0;
+	u64 s_transfer_n = 0;
 
 	GSPerfMon m_perfmon_frame; // Track stats across a frame.
 	GSPerfMon m_perfmon_draw;  // Track stats across a draw.
@@ -428,74 +453,11 @@ public:
 	std::vector<size_t> m_drawlist;
 	std::vector<GSVector4i> m_drawlist_bbox;
 
-	struct GSPCRTCRegs
-	{
-		struct PCRTCDisplay
-		{
-			bool enabled;
-			int FBP;
-			int FBW;
-			int PSM;
-			int DBY;
-			int DBX;
-			GSRegDISPFB prevFramebufferReg;
-			GSVector2i prevDisplayOffset;
-			GSVector2i displayOffset;
-			GSVector4i displayRect;
-			GSVector2i magnification;
-			GSVector2i prevFramebufferOffsets;
-			GSVector2i framebufferOffsets;
-			GSVector4i framebufferRect;
-
-			__fi int Block() const { return FBP << 5; }
-		};
-
-		int videomode = 0;
-		int interlaced = 0;
-		int FFMD = 0;
-		bool PCRTCSameSrc = false;
-		bool toggling_field = false;
-		PCRTCDisplay PCRTCDisplays[2] = {};
-
-		bool IsAnalogue();
-
-		// Calculates which display is closest to matching zero offsets in either direction.
-		GSVector2i NearestToZeroOffset();
-
-		void SetVideoMode(GSVideoMode videoModeIn);
-
-		// Enable each of the displays.
-		void EnableDisplays(GSRegPMODE pmode, GSRegSMODE2 smode2, bool smodetoggle);
-
-		void CheckSameSource();
-		
-		bool FrameWrap();
-
-		// If the start point of both frames match, we can do a single read
-		bool FrameRectMatch();
-
-		GSVector2i GetResolution();
-
-		GSVector4i GetFramebufferRect(int display);
-
-		int GetFramebufferBitDepth();
-
-		GSVector2i GetFramebufferSize(int display);
-
-		// Sets up the rectangles for both the framebuffer read and the displays for the merge circuit.
-		void SetRects(int display, GSRegDISPLAY displayReg, GSRegDISPFB framebufferReg);
-
-		// Calculate framebuffer read offsets, should be considered if only one circuit is enabled, or difference is more than 1 line.
-		// Only considered if "Anti-blur" is enabled.
-		void CalculateFramebufferOffset(bool scanmask, GSRegDISPFB framebuffer0Reg, GSRegDISPFB framebuffer1Reg);
-
-		// Used in software mode to align the buffer when reading. Offset is accounted for (block aligned) by GetOutput.
-		void RemoveFramebufferOffset(int display);
-
-		// If the two displays are offset from each other, move them to the correct offsets.
-		// If using screen offsets, calculate the positions here.
-		void CalculateDisplayOffset(bool scanmask);
-	} PCRTCDisplays;
+	// GP6: PCRTC digest state hoisted to GSBackQueue.h (PCRTC_SYNC record
+	// payload). Same layout and methods as the old nested struct; the member
+	// name is unchanged so call sites read on.
+	using GSPCRTCRegs = GSBackQueue::GSPCRTCRegs;
+	GSPCRTCRegs PCRTCDisplays;
 
 public:
 	/// Returns the appropriate directory for draw dumping.
@@ -541,6 +503,120 @@ public:
 
 	virtual void Move();
 
+	// GP6: the front/back seam. The front builds a self-contained record, the
+	// Exec*Record executor consumes it — inline in InlineRecords mode, on the
+	// back thread in Lockstep/Pipelined. The executor owns the HOST->LOCAL
+	// write cursor across transfer slices.
+	void ExecTransferRecord(const GSBackQueue::TransferRecord& rec);
+	void SubmitMove();
+	void ExecMoveRecord(const GSBackQueue::MoveRecord& rec);
+	void SubmitClutLoad(const GIFRegTEX0& TEX0, const GIFRegTEXCLUT& TEXCLUT);
+	void ExecClutLoadRecord(const GSBackQueue::ClutLoadRecord& rec);
+	void ExecDrawRecord(const GSBackQueue::DrawRecord& rec);
+	void DrawRecordTail(u64 draw_serial);
+	void SubmitPcrtcSync();
+	void ExecPcrtcSyncRecord(const GSBackQueue::PcrtcSyncRecord& rec);
+
+	// GP6: sampled from GSConfig.BackThreadModeResolved at construction (the option is
+	// restart-required, so it can't change under a live GSState). Off = the
+	// front-side seam functions skip the record round-trip entirely and call the
+	// executor tails against live state; any other mode builds records.
+	bool m_back_records = false;
+
+	// GP6: the front<->back channel (record ring + wake semaphore + pool
+	// arenas/free rings, GSBackQueue.h). Single-object modes use this object's
+	// own storage; the two-object pipelined split points the front parser
+	// object's m_chan at the back object's channel. The destructor frees
+	// m_chan_storage's pooled arrays — only ever this object's own storage, so
+	// a front pointing elsewhere frees nothing it doesn't own.
+	GSBackQueue::Channel m_chan_storage;
+	GSBackQueue::Channel* m_chan = &m_chan_storage;
+
+	// GP6: the object owning local memory, the CLUT palette, and the
+	// texture cache for this session. Single-object modes: this. On the front
+	// parser object it points at the back renderer, so the drained seams
+	// (readbacks, savestates) reach the authoritative m_mem/TC while every
+	// register decision stays front-side. Only ever dereferenced after a drain.
+	GSState* m_mem_target = this;
+
+	// GP6: set on the back renderer when a front parser object exists.
+	// The draw executor then aims m_draw_env/PRIM/m_context around the tail
+	// itself (on a single object FlushDraw owns that aiming, and the front's
+	// carry-over rebuild depends on FlushDraw's restore happening after).
+	bool m_split_back = false;
+
+	// GP6: the inverse of m_mem_target: the object holding the authoritative parse
+	// state (env, vertex, transfer cursor). On the back renderer under the split
+	// it points at the front; everywhere else it is this. Used where the back
+	// needs the state a savestate would record — the GS dump's initial freeze.
+	GSState* m_parse_target = this;
+
+	// GP6: draw-node pool. Acquire is front-side (free ring first, then arena
+	// growth up to the ring capacity, then backpressure); Release is the consume
+	// site (inline modes: FlushPrim right after the executor returns; pipelined:
+	// the back thread after DrawRecordTail).
+	GSBackQueue::DrawNode* AcquireDrawNode();
+	void ReleaseDrawNode(GSBackQueue::DrawNode* node);
+
+	// GP6: transfer payload pool (record modes only; mode 0 keeps
+	// GSTransferBuffer's own allocation untouched). m_tr.buff aliases the
+	// current node's 4MB buffer; RotateTransferPayload runs at transfer Init and
+	// swaps to a fresh node once records reference the current one.
+	// AdoptTransferBuffer (run by the staging object at construction) hands
+	// m_tr's original buffer to the channel as node 0 (the dtor nulls m_tr.buff
+	// before the arena walk so it isn't freed twice).
+	GSBackQueue::PayloadNode* m_tr_payload_node = nullptr;
+	bool m_tr_payload_referenced = false;
+	void AdoptTransferBuffer();
+	GSBackQueue::PayloadNode* AcquirePayloadNode();
+	void RotateTransferPayload();
+	void ExecReleasePayloadRecord(const GSBackQueue::ReleasePayloadRecord& rec);
+
+	// GP6: the back thread (Lockstep, and Pipelined on a single object until
+	// the front-object split engages — the two-object split runs truly
+	// pipelined). Lockstep = drain after every push, which is what makes
+	// executing against the shared single-object state safe. VSYNC records are
+	// NOT queued: present runs on the MTGS thread after a drain, so the back
+	// thread never touches the GSDevice on present paths (and for SW, at all).
+	// Queued modes engage only for Vulkan and SW renderers — a GL device is
+	// context-bound to the MTGS thread and HW draws would issue GL calls from
+	// the wrong thread.
+	bool m_back_queued = false;
+	bool m_back_lockstep = false;
+	std::thread m_back_thread;
+	std::atomic<bool> m_back_thread_exit{false};
+
+	void StartBackThread();
+	void StopBackThread();
+	void BackThreadLoop();
+	void ExecRecordSlot(const GSBackQueue::RecordSlot& slot);
+	virtual void ExecVsyncRecord(const GSBackQueue::VsyncRecord& rec);
+
+	template <typename T>
+	void PushRecord(GSBackQueue::RecordType type, const T& rec)
+	{
+		for (;;)
+		{
+			GSBackQueue::RecordSlot* slot = m_chan->ring.BeginPush();
+			if (slot)
+			{
+				slot->type = type;
+				std::memcpy(slot->As<T>(), &rec, sizeof(T));
+				m_chan->ring.CommitPush();
+				m_chan->sema.NotifyOfWork();
+				break;
+			}
+			std::this_thread::yield(); // ring full — backpressure
+		}
+
+		// Spin-then-sleep: records usually execute in microseconds, so the spin
+		// catches nearly every drain without the futex round-trip. Lockstep is
+		// still per-record synchronization and inherently slow — it's the
+		// bisect rung, not a shipping mode.
+		if (m_back_lockstep)
+			m_chan->sema.WaitForEmptyWithSpin();
+	}
+
 	GSVector4i GetTEX0Rect(const GSDrawingContext& prev_ctx);
 	void CheckWriteOverlap(bool req_write, bool req_read);
 	void Write(const u8* mem, int len);
@@ -579,6 +655,44 @@ public:
 	void RewriteVerticesIfLargeSTImpl(const GSVector4& large_val, bool check_clamp_mode);
 	void RewriteVerticesIfLargeST(const GSVector4& large_val, bool check_clamp_mode);
 };
+
+// GP6: the front parser object of the two-object pipelined split. Owns all parse
+// state (env, vertex kick, draw buffering, transfer staging, CLUT decision) and
+// emits records into the back renderer's channel; the back object executes them
+// on the back thread, installing record state into its own members. The front
+// never draws, and reaches the authoritative local memory / texture cache only
+// through m_mem_target after a drain. Created by GS.cpp only when the back
+// thread engaged under GSBackThreadMode::Pipelined.
+class GSFrontState final : public GSState
+{
+public:
+	GSFrontState(GSState* back);
+	~GSFrontState() override;
+
+	void Draw() override;
+
+	// Kick-time coverage-alpha query. Mixed live/stale semantics (see the
+	// implementation); needs last-flushed-draw state that only exists after
+	// that draw EXECUTED, so it drains the back queue — memoized per
+	// (draw epoch, live ALPHA) so at most one drain per AA1 draw.
+	bool IsCoverageAlphaSupported() override;
+
+	// Once per frame, after the (drained) vsync executed on the back object:
+	// re-mirror present-side state the back mutated (Merge's scanmask
+	// decrement) so next frame's front digestion sees what a single object
+	// would have.
+	void MirrorPostVsyncState();
+
+private:
+	GSState* m_back;
+
+	// IsCoverageAlphaSupported memo (see above).
+	u64 m_cov_epoch = ~0ULL;
+	u64 m_cov_alpha = 0;
+	bool m_cov_answer = false;
+};
+
+extern std::unique_ptr<GSFrontState> g_gs_front;
 
 // We put this in the header because of Multi-ISA.
 inline void GSState::ExpandDIMX(GSVector4i* dimx, const GIFRegDIMX DIMX)

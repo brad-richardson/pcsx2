@@ -584,6 +584,25 @@ void GSRenderer::EndPresentFrame()
 	ImGuiManager::NewFrame();
 }
 
+void GSRenderer::SubmitVsync(u32 field, bool registers_written)
+{
+	GSBackQueue::VsyncRecord rec;
+	rec.field = field;
+	rec.registers_written = registers_written;
+	rec.idle_frame = IsIdleFrame(); // front-computable: compares serials against the last frame's
+
+	// VSYNC is never queued: present runs on the MTGS thread behind a drain, so
+	// the back thread stays off the GSDevice on present paths entirely (which
+	// is also what keeps SW + GL-present devices legal in queued modes).
+	DrainBackQueue();
+	ExecVsyncRecord(rec);
+}
+
+void GSRenderer::ExecVsyncRecord(const GSBackQueue::VsyncRecord& rec)
+{
+	VSync(rec.field, rec.registers_written, rec.idle_frame);
+}
+
 void GSRenderer::VSync(u32 field, bool registers_written, bool idle_frame)
 {
 	if (GSConfig.ShouldDump(s_n, g_perfmon.GetFrame()))
@@ -735,10 +754,14 @@ void GSRenderer::VSync(u32 field, bool registers_written, bool idle_frame)
 			if (GSConfig.UserHacks_ReadTCOnClose)
 				ReadbackTextureCache();
 
+			// The dump replays from this state forward, so it has to be the state a
+			// savestate would record here: parse registers from the front object under
+			// the split, local memory from the back. m_parse_target->Freeze() is the
+			// same call GSfreeze makes, and it drains before serializing.
 			freezeData fd = {0, nullptr};
-			Freeze(&fd, true);
+			m_parse_target->Freeze(&fd, true);
 			fd.data = new u8[fd.size];
-			Freeze(&fd, false);
+			m_parse_target->Freeze(&fd, false);
 
 			// keep the screenshot relatively small so we don't bloat the dump
 			static constexpr u32 DUMP_SCREENSHOT_WIDTH = 640;
@@ -1067,6 +1090,11 @@ bool GSRenderer::IsIdleFrame() const
 bool GSRenderer::SaveSnapshotToMemory(u32 window_width, u32 window_height, bool apply_aspect, bool crop_borders,
 	u32* width, u32* height, std::vector<u32>* pixels)
 {
+	// GP6: mid-frame screenshot issues device calls (CreateRenderTarget /
+	// StretchRect) on the MTGS thread; the back thread may be mid-draw on the
+	// same device. The vsync-path callers are already post-drain (no-op there).
+	DrainBackQueue();
+
 	GSTexture* const current = g_gs_device->GetCurrent();
 	if (!current)
 	{
@@ -1153,6 +1181,12 @@ bool GSRenderer::SaveSnapshotToMemory(u32 window_width, u32 window_height, bool 
 #ifdef __ANDROID__
 bool GSRenderer::ExportSnapshotToAHB(AHardwareBuffer* buffer, u32 width, u32 height, u64* fence_counter)
 {
+	// GP6: same hazard as SaveSnapshotToMemory — device calls on the calling
+	// thread while the back thread may be mid-draw. Post-vsync callers are
+	// already drained (no-op there); the drain only matters if export is ever
+	// mid-frame.
+	DrainBackQueue();
+
 	GSTexture* const current = g_gs_device->GetCurrent();
 	if (!buffer || !current || !width || !height)
 		return false;
@@ -1180,6 +1214,9 @@ bool GSRenderer::ExportSnapshotToAHB(AHardwareBuffer* buffer, u32 width, u32 hei
 #ifdef __APPLE__
 bool GSRenderer::ExportSnapshotToIOSurface(void* iosurface, u32 width, u32 height, GSExportIOSurfaceDoneFn done, void* ctx)
 {
+	// GP6: same hazard as the AHB export above.
+	DrainBackQueue();
+
 	GSTexture* const current = g_gs_device->GetCurrent();
 	if (!iosurface || !current || !width || !height || !done)
 		return false;

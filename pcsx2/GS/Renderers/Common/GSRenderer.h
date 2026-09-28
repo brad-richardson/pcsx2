@@ -42,6 +42,10 @@ public:
 	virtual void UpdateRenderFixes();
 
 	virtual void VSync(u32 field, bool registers_written, bool idle_frame);
+	// GP6: vsync entry under the split — drains, then runs VSync inline on the
+	// MTGS thread (VSYNC is never queued).
+	void SubmitVsync(u32 field, bool registers_written);
+	void ExecVsyncRecord(const GSBackQueue::VsyncRecord& rec) override;
 	virtual bool CanUpscale() { return false; }
 	virtual float GetUpscaleMultiplier() { return 1.0f; }
 	virtual float GetTextureScaleFactor() { return 1.0f; }

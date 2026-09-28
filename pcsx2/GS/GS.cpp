@@ -12,6 +12,7 @@
 #include "GS/GSLzma.h"
 #include "GS/GSPerfMon.h"
 #include "GS/GSUtil.h"
+#include "GS/Renderers/Common/GSBackThreadPolicy.h"
 #include "GS/MultiISA.h"
 #include "GS/GSPerfMon.h"
 #include "Host.h"
@@ -281,12 +282,54 @@ static void GSClampUpscaleMultiplier(Pcsx2Config::GSOptions& config)
 	config.UpscaleMultiplier = static_cast<float>(max_upscale_multiplier);
 }
 
+// GP6: what the requested front/back split resolves to for the renderer about
+// to open. Re-derived every time a renderer opens (it depends on the device and
+// the download mode) and never written back into settings. Must run before the
+// renderer is constructed, because the renderer's constructor starts the back
+// thread.
+static void GSResolveBackThreadMode(Pcsx2Config::GSOptions& config, GSRendererType renderer)
+{
+	GSBackThreadInputs in;
+	in.requested = config.BackThreadMode;
+	in.hardware_renderer = (renderer != GSRendererType::SW && renderer != GSRendererType::Null);
+	in.vulkan = g_gs_device && g_gs_device->GetRenderAPI() == RenderAPI::Vulkan;
+	in.download_mode = config.HWDownloadMode;
+
+	const GSBackThreadDecision decision = GSDecideBackThreadMode(in);
+	config.BackThreadModeResolved = decision.mode;
+
+	// A request for the split that does not get it is worth a warning.
+	if (decision.mode != config.BackThreadMode)
+	{
+		Console.Warning("GS: back thread %s, not pipelined (%s).", GSBackThreadModeName(decision.mode),
+			GSBackThreadReasonText(decision.reason));
+	}
+	else
+	{
+		Console.WriteLn("GS: back thread %s (%s).", GSBackThreadModeName(decision.mode),
+			GSBackThreadReasonText(decision.reason));
+	}
+}
+
+// GP6: the front parser object of the two-object split (GSState.h).
+// Non-null only when GSBackThreadMode::Pipelined engaged; all GIF-parse entry
+// points below route to it, while draw/present/TC stay on g_gs_renderer.
+std::unique_ptr<GSFrontState> g_gs_front;
+
+// The object GIF data, parse-side resets, readbacks, and savestates route to.
+static __fi GSState* GSParseTarget()
+{
+	return g_gs_front ? static_cast<GSState*>(g_gs_front.get()) : static_cast<GSState*>(g_gs_renderer.get());
+}
+
 static bool OpenGSRenderer(GSRendererType renderer, u8* basemem)
 {
 	// Must be done first, initialization routines in GSState use GSIsHardwareRenderer().
 	GSCurrentRenderer = renderer;
 
 	GSVertexSW::InitStatic();
+
+	GSResolveBackThreadMode(GSConfig, renderer);
 
 	if (renderer == GSRendererType::Null)
 	{
@@ -305,6 +348,33 @@ static bool OpenGSRenderer(GSRendererType renderer, u8* basemem)
 	g_gs_renderer->SetRegsMem(basemem);
 	g_gs_renderer->ResetPCRTC();
 	g_gs_renderer->UpdateRenderFixes();
+
+	// GP6: instantiate the front parser only when the back thread really
+	// engaged. GSResolveBackThreadMode has already turned a pipelined request into
+	// Off where it cannot pipeline (a non-Vulkan HW device, Unsynchronized
+	// downloads); the check below is what remains of the original refusal.
+	if (GSConfig.BackThreadModeResolved == GSBackThreadMode::Pipelined && g_gs_renderer->IsBackThreadRunning())
+	{
+		// Unsynchronized takes GS local memory directly from the EE thread, with
+		// no lock and no drain, so a queued back thread leaves it arbitrarily
+		// far behind what the EE expects. (Resolve already refuses this; this
+		// is belt-and-braces at the object-construction point.)
+		const bool ee_thread_reads_live_memory =
+			GSConfig.HWDownloadMode == GSHardwareDownloadMode::Unsynchronized;
+
+		if (ee_thread_reads_live_memory && GSConfig.UseHardwareRenderer())
+		{
+			Console.Warning("GS: pipelined mode is unsupported with EE-thread reads of live GS memory — running lockstep.");
+		}
+		else
+		{
+			g_gs_front = std::make_unique<GSFrontState>(g_gs_renderer.get());
+			g_gs_front->SetRegsMem(basemem);
+			g_gs_front->ResetPCRTC();
+			Console.WriteLn("GS: front parser object active (two-object split, pipelined).");
+		}
+	}
+
 	g_perfmon.Reset();
 	return true;
 }
@@ -313,6 +383,10 @@ static void CloseGSRenderer()
 {
 	GSTextureReplacements::Shutdown();
 
+	// The front must go first: its destructor drains the shared channel, and
+	// the back object owns that channel and the pooled arrays.
+	g_gs_front.reset();
+
 	if (g_gs_renderer)
 	{
 		g_gs_renderer->Destroy();
@@ -320,12 +394,31 @@ static void CloseGSRenderer()
 	}
 }
 
+// GP6: the back thread executes draws against g_gs_device, so mutating that
+// device from the MTGS thread — swapchain resize, window recreate, vsync change —
+// races it. Drain first. The front only parses on this thread, so one drain up
+// front quiesces the back thread for the whole call. No-op when the back thread
+// is off (the default), and g_gs_renderer can legitimately be null while
+// g_gs_device exists: the device is created first.
+static void DrainBackQueueBeforeDeviceMutation()
+{
+	if (g_gs_renderer)
+		g_gs_renderer->DrainBackQueue();
+}
+
 bool GSreopen(bool recreate_device, bool recreate_renderer, GSRendererType new_renderer,
 	std::optional<const Pcsx2Config::GSOptions*> old_config)
 {
 	Console.WriteLn("Reopening GS with %s device", recreate_device ? "new" : "existing");
 
-	g_gs_renderer->Flush(GSState::GSFlushReason::GSREOPEN);
+	GSParseTarget()->Flush(GSState::GSFlushReason::GSREOPEN);
+
+	// The Flush above only flushes FRONT parse state — it queues the resulting
+	// draw, it does not execute it. Everything below then hands the back thread's
+	// textures to the shredder: the device-loss arm purges the texture cache and
+	// the device pool outright, and the readback arm reads the texture cache. So
+	// drain between the two.
+	DrainBackQueueBeforeDeviceMutation();
 
 	if (recreate_device && !recreate_renderer)
 	{
@@ -355,7 +448,7 @@ bool GSreopen(bool recreate_device, bool recreate_renderer, GSRendererType new_r
 	std::unique_ptr<u8[]> fd_data;
 	if (recreate_renderer)
 	{
-		if (g_gs_renderer->Freeze(&fd, true) != 0)
+		if (GSParseTarget()->Freeze(&fd, true) != 0)
 		{
 			Console.Error("(GSreopen) Failed to get GS freeze size");
 			return false;
@@ -363,7 +456,7 @@ bool GSreopen(bool recreate_device, bool recreate_renderer, GSRendererType new_r
 
 		fd_data = std::make_unique<u8[]>(fd.size);
 		fd.data = fd_data.get();
-		if (g_gs_renderer->Freeze(&fd, false) != 0)
+		if (GSParseTarget()->Freeze(&fd, false) != 0)
 		{
 			Console.Error("(GSreopen) Failed to freeze GS");
 			return false;
@@ -408,7 +501,7 @@ bool GSreopen(bool recreate_device, bool recreate_renderer, GSRendererType new_r
 			return false;
 		}
 
-		if (g_gs_renderer->Defrost(&fd) != 0)
+		if (GSParseTarget()->Defrost(&fd) != 0)
 		{
 			Console.Error("(GSreopen) Failed to defrost");
 			return false;
@@ -461,6 +554,11 @@ void GSclose()
 
 void GSreset(bool hardware_reset)
 {
+	// Front first: its Reset flushes pending buffered draws into records; the
+	// back's Reset then drains (executing them, like serial pre-reset draws)
+	// before resetting memory/TC.
+	if (g_gs_front)
+		g_gs_front->Reset(hardware_reset);
 	g_gs_renderer->Reset(hardware_reset);
 
 	// Restart video capture if it's been started.
@@ -477,72 +575,79 @@ void GSreset(bool hardware_reset)
 
 void GSgifSoftReset(u32 mask)
 {
-	g_gs_renderer->SoftReset(mask);
+	GSParseTarget()->SoftReset(mask);
 }
 
 void GSwriteCSR(u32 csr)
 {
-	g_gs_renderer->WriteCSR(csr);
+	GSParseTarget()->WriteCSR(csr);
 }
 
 void GSInitAndReadFIFO(u8* mem, u32 size)
 {
 	GL_PERF("Init and read FIFO %u qwc", size);
-	g_gs_renderer->InitReadFIFO(mem, size);
-	g_gs_renderer->ReadFIFO(mem, size);
+	GSParseTarget()->InitReadFIFO(mem, size);
+	GSParseTarget()->ReadFIFO(mem, size);
 }
 
 void GSReadLocalMemoryUnsync(u8* mem, u32 qwc, u64 BITBLITBUF, u64 TRXPOS, u64 TRXREG)
 {
-	g_gs_renderer->ReadLocalMemoryUnsync(mem, qwc, GIFRegBITBLTBUF{BITBLITBUF}, GIFRegTRXPOS{TRXPOS}, GIFRegTRXREG{TRXREG});
+	GSParseTarget()->ReadLocalMemoryUnsync(mem, qwc, GIFRegBITBLTBUF{BITBLITBUF}, GIFRegTRXPOS{TRXPOS}, GIFRegTRXREG{TRXREG});
 }
 
 void GSgifTransfer(const u8* mem, u32 size)
 {
-	g_gs_renderer->Transfer<3>(mem, size);
+	GSParseTarget()->Transfer<3>(mem, size);
 }
 
 void GSgifTransfer1(u8* mem, u32 addr)
 {
-	g_gs_renderer->Transfer<0>(const_cast<u8*>(mem) + addr, (0x4000 - addr) / 16);
+	GSParseTarget()->Transfer<0>(const_cast<u8*>(mem) + addr, (0x4000 - addr) / 16);
 }
 
 void GSgifTransfer2(u8* mem, u32 size)
 {
-	g_gs_renderer->Transfer<1>(const_cast<u8*>(mem), size);
+	GSParseTarget()->Transfer<1>(const_cast<u8*>(mem), size);
 }
 
 void GSgifTransfer3(u8* mem, u32 size)
 {
-	g_gs_renderer->Transfer<2>(const_cast<u8*>(mem), size);
+	GSParseTarget()->Transfer<2>(const_cast<u8*>(mem), size);
 }
 
 void GSvsync(u32 field, bool registers_written)
 {
 	// Update this here because we need to check if the pending draw affects the current frame, so our regs need to be updated.
-	g_gs_renderer->PCRTCDisplays.SetVideoMode(g_gs_renderer->GetVideoMode());
-	g_gs_renderer->PCRTCDisplays.EnableDisplays(g_gs_renderer->m_regs->PMODE, g_gs_renderer->m_regs->SMODE2, g_gs_renderer->isReallyInterlaced());
-	g_gs_renderer->PCRTCDisplays.SetRects(0, g_gs_renderer->m_regs->DISP[0].DISPLAY, g_gs_renderer->m_regs->DISP[0].DISPFB);
-	g_gs_renderer->PCRTCDisplays.SetRects(1, g_gs_renderer->m_regs->DISP[1].DISPLAY, g_gs_renderer->m_regs->DISP[1].DISPFB);
-	g_gs_renderer->PCRTCDisplays.CheckSameSource();
-	g_gs_renderer->PCRTCDisplays.CalculateDisplayOffset(g_gs_renderer->m_scanmask_used);
-	g_gs_renderer->PCRTCDisplays.CalculateFramebufferOffset(g_gs_renderer->m_scanmask_used, g_gs_renderer->m_regs->DISP[0].DISPFB, g_gs_renderer->m_regs->DISP[1].DISPFB);
+	GSState* const front = GSParseTarget();
+	front->PCRTCDisplays.SetVideoMode(front->GetVideoMode());
+	front->PCRTCDisplays.EnableDisplays(front->m_regs->PMODE, front->m_regs->SMODE2, front->isReallyInterlaced());
+	front->PCRTCDisplays.SetRects(0, front->m_regs->DISP[0].DISPLAY, front->m_regs->DISP[0].DISPFB);
+	front->PCRTCDisplays.SetRects(1, front->m_regs->DISP[1].DISPLAY, front->m_regs->DISP[1].DISPFB);
+	front->PCRTCDisplays.CheckSameSource();
+	front->PCRTCDisplays.CalculateDisplayOffset(front->m_scanmask_used);
+	front->PCRTCDisplays.CalculateFramebufferOffset(front->m_scanmask_used, front->m_regs->DISP[0].DISPFB, front->m_regs->DISP[1].DISPFB);
+
+	// The PCRTC record must precede the vsync-flushed draw records — those draws
+	// see the fresh display state, mid-frame draws saw the previous frame's.
+	front->SubmitPcrtcSync();
 
 	// Do not move the flush into the VSync() method. It's here because EE transfers
 	// get cleared in HW VSync, and may be needed for a buffered draw (FFX FMVs).
-	g_gs_renderer->Flush(GSState::VSYNC);
-	g_gs_renderer->VSync(field, registers_written, g_gs_renderer->IsIdleFrame());
+	front->Flush(GSState::VSYNC);
+	g_gs_renderer->SubmitVsync(field, registers_written);
+	if (g_gs_front)
+		g_gs_front->MirrorPostVsyncState();
 }
 
 int GSfreeze(FreezeAction mode, freezeData* data)
 {
 	if (mode == FreezeAction::Save)
 	{
-		return g_gs_renderer->Freeze(data, false);
+		return GSParseTarget()->Freeze(data, false);
 	}
 	else if (mode == FreezeAction::Size)
 	{
-		return g_gs_renderer->Freeze(data, true);
+		return GSParseTarget()->Freeze(data, true);
 	}
 	else // if (mode == FreezeAction::Load)
 	{
@@ -556,7 +661,7 @@ int GSfreeze(FreezeAction mode, freezeData* data)
 		if (GSCapture::IsCapturing())
 			GSCapture::Flush();
 
-		return g_gs_renderer->Defrost(data);
+		return GSParseTarget()->Defrost(data);
 	}
 }
 
@@ -918,8 +1023,17 @@ void GSUpdateConfig(const Pcsx2Config::GSOptions& new_config)
 {
 	Pcsx2Config::GSOptions old_config(std::move(GSConfig));
 	GSConfig = new_config;
+	// The resolved back-thread mode belongs to the open renderer. A changed request reopens it
+	// below (BackThreadMode is a restart option), which resolves again.
+	GSConfig.BackThreadModeResolved = old_config.BackThreadModeResolved;
 	if (!g_gs_renderer)
 		return;
+
+	// GP6: everything below mutates renderer/device state the back thread may
+	// be reading mid-draw (settings, ImGui font textures, TC purges). The front
+	// only parses on this (MTGS) thread, so a single drain up front quiesces the
+	// back thread for the whole apply.
+	g_gs_renderer->DrainBackQueue();
 
 	// Handle OSD scale changes by pushing a window resize through.
 	if (new_config.OsdScale != old_config.OsdScale)

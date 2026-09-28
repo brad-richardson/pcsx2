@@ -477,6 +477,21 @@ enum class GSDepthFeedbackMode : u8
 	DepthAsRT = 3,
 };
 
+// GP6 (ARMSX2 GSBackQueue port): GS front/back split. Off = the
+// single-threaded path with no record round-trip; InlineRecords = build +
+// execute every record on the calling thread (a validation / bisect rung);
+// Lockstep = back thread runs but the front drains after every record (a
+// bisect rung); Pipelined = a front parser object parses while the back
+// thread draws. GSBackThreadPolicy.h decides what a request resolves to.
+// Sampled from the GE1_BACKTHREAD env var by the adapter, never persisted.
+enum class GSBackThreadMode : u8
+{
+	Off           = 0,
+	InlineRecords = 1,
+	Lockstep      = 2,
+	Pipelined     = 3,
+};
+
 enum class AchievementOverlayPosition : u8
 {
 	TopLeft,
@@ -908,6 +923,12 @@ struct Pcsx2Config
 		// fused min/max + two-pass kernel) for STQRGBAXYZF2 strips/fans.
 		// Adapter env GE1_VERTEX_KICK=2. Includes the fast parse internally.
 		bool VertexKickFused = false;
+		/// GP6: the requested front/back split mode (adapter env GE1_BACKTHREAD).
+		GSBackThreadMode BackThreadMode = GSBackThreadMode::Off;
+		/// GP6: what BackThreadMode resolved to for the open renderer. Derived,
+		/// not persisted, and not compared — set by OpenGSRenderer on GSConfig
+		/// only, and read by the renderer's constructor.
+		GSBackThreadMode BackThreadModeResolved = GSBackThreadMode::Off;
 		GSDepthFeedbackMode DepthFeedbackMode = GSDepthFeedbackMode::Auto;
 
 		u8 CAS_Sharpness = 50;

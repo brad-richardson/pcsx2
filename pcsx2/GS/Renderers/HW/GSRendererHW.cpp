@@ -54,11 +54,14 @@ void GSRendererHW::Destroy()
 
 void GSRendererHW::PurgeTextureCache(bool sources, bool targets, bool hash_cache)
 {
+	// Queued draw records reach the TC; retire them before mutating it.
+	DrainBackQueue();
 	g_texture_cache->RemoveAll(sources, targets, hash_cache);
 }
 
 void GSRendererHW::ReadbackTextureCache()
 {
+	DrainBackQueue();
 	g_texture_cache->ReadbackAll();
 }
 
@@ -222,7 +225,7 @@ void GSRendererHW::Lines2Sprites()
 
 	// each sprite converted to quad needs twice the space
 
-	while (m_vertex->tail * 2 > m_max_vertex_count)
+	while (m_vertex->tail * 2 > m_vertex->maxcount)
 	{
 		GrowVertexBuffer();
 	}
@@ -2152,13 +2155,21 @@ bool GSRendererHW::NeedsBlending()
 
 bool GSRendererHW::IsRTWritten()
 {
+	return IsRTWrittenLive(m_context->ALPHA);
+}
+
+// GP6: ALPHA is a parameter so the split front object can evaluate the
+// kick-time coverage-alpha query with ITS live blending regs while the cached
+// ctx / alpha min-max stay this (the back) object's last-executed-draw state —
+// exactly the mixed live/stale read a single object performs.
+bool GSRendererHW::IsRTWrittenLive(const GIFRegALPHA& ALPHA)
+{
 	const GIFRegTEST TEST = m_cached_ctx.TEST;
 	const bool only_z_written = (TEST.ATE && TEST.ATST == ATST_NEVER && TEST.AFAIL == AFAIL_ZB_ONLY);
 	if (only_z_written)
 		return false;
 
 	const u32 written_bits = (~m_cached_ctx.FRAME.FBMSK & GSLocalMemory::m_psm[m_cached_ctx.FRAME.PSM].fmsk);
-	const GIFRegALPHA ALPHA = m_context->ALPHA;
 	return (
 	        // A not masked
 	        (written_bits & 0xFF000000u) != 0) ||
@@ -5410,7 +5421,7 @@ void GSRendererHW::HandleFlatShadedVertices()
 		return;
 
 	// De-index the vertices using the copy buffer
-	while (m_max_vertex_count < idx_buff.tail)
+	while (vtx_buff.maxcount < idx_buff.tail)
 		GrowVertexBuffer();
 
 	for (int i = static_cast<int>(idx_buff.tail) - 1; i >= 0; i--)
@@ -5546,6 +5557,8 @@ void GSRendererHW::SetupIA(float target_scale, float sx, float sy, bool req_vert
 
 					if (req_vert_backup)
 					{
+						EnsureDrawStaging(m_vertex->next, m_index->tail);
+
 						memcpy(m_draw_vertex.buff, m_vertex->buff, sizeof(GSVertex) * m_vertex->next);
 						memcpy(m_draw_index.buff, m_index->buff, sizeof(u16) * m_index->tail);
 
@@ -5610,6 +5623,8 @@ void GSRendererHW::SetupIA(float target_scale, float sx, float sy, bool req_vert
 
 	if (req_vert_backup)
 	{
+		EnsureDrawStaging(m_vertex->next, m_index->tail);
+
 		memcpy(m_draw_vertex.buff, m_vertex->buff, sizeof(GSVertex) * m_vertex->next);
 		memcpy(m_draw_index.buff, m_index->buff, sizeof(u16) * m_index->tail);
 
