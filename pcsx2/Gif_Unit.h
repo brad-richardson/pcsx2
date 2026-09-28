@@ -209,6 +209,9 @@ namespace gif_test_hooks
 	// ordered Path1 byte stream. The JIT helper marks the boundary after any
 	// wraparound copies have been appended.
 	extern std::vector<u32>* g_path1_packet_sizes;
+	// MV2: called after a complete XGKICK has been copied to g_path1_sink.
+	// The embedding runtime forwards the packet to its ordered Path1 queue.
+	extern void (*g_path1_complete)();
 
 	// When true, Gif_Unit::checkPaths(p1=true, ...) reports path 1 as busy.
 	// Used by EeVu1Vif's Mscalf-stall test to force the GIF-busy code path.

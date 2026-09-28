@@ -1085,6 +1085,8 @@ void mVU_XGKICK_(u32 addr)
 #ifdef PCSX2_RECOMPILER_TESTS
 	if (gif_test_hooks::g_path1_packet_sizes)
 		gif_test_hooks::g_path1_packet_sizes->push_back(size);
+	if (gif_test_hooks::g_path1_complete)
+		gif_test_hooks::g_path1_complete();
 #endif
 }
 
@@ -1141,7 +1143,13 @@ void _vuXGKICKTransfermVU(bool flush)
 		VU1.xgkickdiff = 0x4000 - VU1.xgkickaddr;
 
 		if (VU1.xgkickendpacket && !VU1.xgkicksizeremaining)
+		{
+		#ifdef PCSX2_RECOMPILER_TESTS
+			if (gif_test_hooks::g_path1_complete)
+				gif_test_hooks::g_path1_complete();
+		#endif
 			VU1.xgkickenable = false;
+		}
 	}
 }
 
