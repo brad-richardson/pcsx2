@@ -165,22 +165,34 @@ extern "C" GE1_API int ge1_gs_open(int blending_level)
     }
 #endif
     // GE7: exact Adreno destination reads (all platforms; the Mac gate runs it).
-    // Env-gated, default off. Modes split/copy/passbreak (below); split and copy
+    // Default AUTO (Brad sign-off): split on Adreno, barrier road elsewhere.
+    // The VK backend resolves AUTO from the actual GPU at device creation (it
+    // owns the GPU identity) and logs the resolved mode once; Metal (Apple
+    // GPUs only) resolves here to the barrier road. Explicit
+    // GE1_ADRENO_DSTREAD=off|split|copy|passbreak overrides. split and copy
     // imply the copy road and win over the Android default above when set.
-    if (const char* dstread = std::getenv("GE1_ADRENO_DSTREAD"); dstread && *dstread) {
-        if (std::strcmp(dstread, "split") == 0) {
+    {
+        const char* dstread = std::getenv("GE1_ADRENO_DSTREAD");
+        const bool is_auto = !dstread || !*dstread || std::strcmp(dstread, "auto") == 0;
+        if (is_auto && renderer != GSRendererType::VK) {
+            std::fprintf(stderr, "GE7: dstread=off (auto: non-Vulkan renderer)\n");
+        } else if (is_auto) {
+            config.AdrenoDstReadAuto = true;
+        } else if (std::strcmp(dstread, "off") == 0) {
+            std::fprintf(stderr, "GE7: dstread=off (explicit)\n");
+        } else if (std::strcmp(dstread, "split") == 0) {
             config.OverrideTextureBarriers = 0;
             config.AdrenoDstReadSplit = true;
-            std::fprintf(stderr, "GE7: GE1_ADRENO_DSTREAD=split (copy road + overlap split)\n");
+            std::fprintf(stderr, "GE7: dstread=split (explicit)\n");
         } else if (std::strcmp(dstread, "copy") == 0) {
             // Same as GE1_ADRENO_SAFE on Android, but available on every platform:
             // the single-snapshot copy road, for A/B against split.
             config.OverrideTextureBarriers = 0;
-            std::fprintf(stderr, "GE7: GE1_ADRENO_DSTREAD=copy (copy road, single snapshot)\n");
+            std::fprintf(stderr, "GE7: dstread=copy (explicit)\n");
         } else if (std::strcmp(dstread, "passbreak") == 0) {
             // Barrier road's decisions; ordering through pass breaks, not barriers.
             config.AdrenoDstReadBreak = true;
-            std::fprintf(stderr, "GE7: GE1_ADRENO_DSTREAD=passbreak (barriers ordered by pass breaks)\n");
+            std::fprintf(stderr, "GE7: dstread=passbreak (explicit)\n");
         }
     }
     std::fill(s_priv.begin(), s_priv.end(), 0);

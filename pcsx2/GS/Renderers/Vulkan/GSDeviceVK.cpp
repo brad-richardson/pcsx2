@@ -2808,6 +2808,26 @@ bool GSDeviceVK::CheckFeatures()
 	m_features.framebuffer_fetch =
 		m_optional_extensions.vk_ext_rasterization_order_attachment_access && !GSConfig.DisableFramebufferFetch;
 	m_features.texture_barrier = GSConfig.OverrideTextureBarriers != 0;
+	// GE7 AUTO default (Brad sign-off): resolve the destination-read road from
+	// the actual GPU. Adreno: split mode (copy road + per-batch splits), since
+	// in-pass dst reads return garbage there. Everywhere else the barrier road
+	// is correct (MoltenVK/Metal). Explicit GE1_ADRENO_DSTREAD (off/split/copy/
+	// passbreak) bypasses this.
+	if (GSConfig.AdrenoDstReadAuto && !GSConfig.AdrenoDstReadSplit && !GSConfig.AdrenoDstReadBreak)
+	{
+		// PCI vendor ID 0x13B5 = Qualcomm; every Qualcomm GPU is Adreno,
+		// and Turnip reports it too.
+		if (m_device_properties.vendorID == 0x13B5)
+		{
+			m_features.texture_barrier = false;
+			GSConfig.AdrenoDstReadSplit = true;
+			std::fprintf(stderr, "GE7: dstread=split (auto: Adreno)\n");
+		}
+		else
+		{
+			std::fprintf(stderr, "GE7: dstread=off (auto: non-Adreno %s)\n", m_device_properties.deviceName);
+		}
+	}
 	m_features.multidraw_fb_copy = false;
 	m_features.broken_point_sampler = false;
 

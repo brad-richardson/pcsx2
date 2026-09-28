@@ -940,6 +940,13 @@ struct Pcsx2Config
 		// memory) instead of the in-pass barrier the Adreno driver mis-executes.
 		// Adapter env GE1_ADRENO_DSTREAD=passbreak, default off.
 		bool AdrenoDstReadBreak = false;
+		// GE7: AUTO default (Brad sign-off): split on Adreno, barrier road
+		// elsewhere. Resolved by GSDeviceVK::CheckFeatures from the actual GPU;
+		// other backends leave it unresolved (= barrier road). Adapter env
+		// GE1_ADRENO_DSTREAD unset/empty/auto; explicit off/split/copy/passbreak
+		// bypass it. Default false: upstream PCSX2 without the adapter is
+		// unaffected.
+		bool AdrenoDstReadAuto = false;
 		GSDepthFeedbackMode DepthFeedbackMode = GSDepthFeedbackMode::Auto;
 
 		u8 CAS_Sharpness = 50;
