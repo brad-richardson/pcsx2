@@ -13,6 +13,7 @@
 #include <vector>
 #include <arm_neon.h>
 #include <cstring>
+#include "../../om1/om1_hooks.h" // OM1: recorder hooks + no-codegen gate (all no-op unless attached)
 #include "Common.h"
 #include "VU.h"
 #include "MTVU.h"
