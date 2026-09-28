@@ -26,6 +26,7 @@
 
 #include <bit>
 #include <chrono>
+#include <cstdio>
 #include <limits>
 #include <mutex>
 #include <sstream>
@@ -6228,6 +6229,27 @@ GSTextureVK* GSDeviceVK::SetupPrimitiveTrackingDATE(GSHWDrawConfig& config)
 	return image;
 }
 
+// GE7 Part 3: live counter - splits fired vs copy-road-only draws in split
+// mode. Cumulative; reported every 600 frames on stderr (logcat on Android).
+// Counting only - rendering is untouched.
+static u64 s_ge7_split_draws = 0;
+static u64 s_ge7_split_batches = 0;
+static u64 s_ge7_copy_draws = 0;
+static u64 s_ge7_nosplit_barrier = 0;
+
+static void GE7CountReport()
+{
+	static int s_ge7_last_report_frame = 0;
+	const int frame = g_perfmon.GetFrame();
+	if (frame - s_ge7_last_report_frame >= 600)
+	{
+		s_ge7_last_report_frame = frame;
+		std::fprintf(stderr, "GE7COUNT frame=%d split_draws=%llu split_batches=%llu copy_draws=%llu nosplit=%llu\n",
+			frame, (unsigned long long)s_ge7_split_draws, (unsigned long long)s_ge7_split_batches,
+			(unsigned long long)s_ge7_copy_draws, (unsigned long long)s_ge7_nosplit_barrier);
+	}
+}
+
 void GSDeviceVK::RenderHW(GSHWDrawConfig& config)
 {
 	const GSVector2i rtsize(config.rt ? config.rt->GetSize() : config.ds->GetSize());
@@ -6345,6 +6367,8 @@ void GSDeviceVK::RenderHW(GSHWDrawConfig& config)
 	// GE7: passbreak mode orders barrier draws through pass breaks (tile store/load),
 	// keeping the barrier road's exact decisions.
 	const bool ge7_break = GSConfig.AdrenoDstReadBreak && m_features.texture_barrier;
+	// GE7 Part 3: live counter - set where the single-snapshot copy fires.
+	bool ge7_snapshot_taken = false;
 
 	// Destination Alpha Setup
 	const bool need_barrier = config.require_one_barrier ||
@@ -6460,6 +6484,9 @@ void GSDeviceVK::RenderHW(GSHWDrawConfig& config)
 		draw_rt_clone = static_cast<GSTextureVK*>(CreateTexture(rtsize.x, rtsize.y, 1, draw_rt->GetFormat(), true));
 		if (draw_rt_clone)
 		{
+			// GE7 Part 3: live counter - the single-snapshot copy fired.
+			if (GSConfig.AdrenoDstReadSplit)
+				ge7_snapshot_taken = true;
 			GL_PUSH("VK: Copy RT to temp texture {%d,%d %dx%d}",
 				config.drawarea.left, config.drawarea.top,
 				config.drawarea.width(), config.drawarea.height());
@@ -6670,6 +6697,22 @@ void GSDeviceVK::RenderHW(GSHWDrawConfig& config)
 		else
 			SendHWDraw(config, pipe.IsRTFeedbackLoop() ? draw_rt : nullptr, pipe.IsDepthFeedbackLoop() ? draw_ds : nullptr,
 				config.require_one_barrier, config.require_full_barrier);
+		// GE7 Part 3: live counter - split draws are counted inside
+		// GE7SendSplitDraw (both call sites); exactly one arm fires per
+		// dst-read draw here.
+		if (GSConfig.AdrenoDstReadSplit && !m_features.texture_barrier && !(ge7_full && draw_rt))
+		{
+			if (ge7_snapshot_taken)
+			{
+				s_ge7_copy_draws++;
+				GE7CountReport();
+			}
+			else if (config.require_one_barrier || config.require_full_barrier)
+			{
+				s_ge7_nosplit_barrier++;
+				GE7CountReport();
+			}
+		}
 	}
 
 	// blend second pass
@@ -6879,6 +6922,11 @@ void GSDeviceVK::GE7SendSplitDraw(const GSHWDrawConfig& config, GSTextureVK* dra
 		Draw(config);
 		return;
 	}
+
+	// GE7 Part 3: live counter - a per-batch split fired.
+	s_ge7_split_draws++;
+	s_ge7_split_batches += draw_list_size;
+	GE7CountReport();
 
 	// The texture-hazard sample area is read with arbitrary UVs, outside any one
 	// batch's bbox: snapshot it once up front like the D3D11 backend does.
