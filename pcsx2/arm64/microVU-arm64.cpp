@@ -2517,3 +2517,8 @@ bool SaveStateBase::vuJITFreeze()
 	Freeze(microVU1.prog.lpState);
 	return IsOkay();
 }
+
+//------------------------------------------------------------------
+// OM1 route-a capture recorder — same single-TU inclusion pattern.
+//------------------------------------------------------------------
+#include "microVU_OM1-arm64.inl"
