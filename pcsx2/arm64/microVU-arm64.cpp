@@ -2031,7 +2031,9 @@ void recMicroVU0::Reserve()
 void recMicroVU1::Reserve()
 {
 	mVUinit(microVU1, 1);
+#ifndef PS2X_MICROVU_EMBED
 	vu1Thread.Open();
+#endif
 }
 
 void recMicroVU0::Shutdown()
@@ -2056,8 +2058,10 @@ void recMicroVU0::Step()
 
 void recMicroVU1::Reset()
 {
+#ifndef PS2X_MICROVU_EMBED
 	vu1Thread.WaitVU();
 	vu1Thread.Get_MTVUChanges();
+#endif
 	mVUreset(microVU1, true);
 }
 
@@ -2229,7 +2233,9 @@ void recMicroVU1::Execute(u32 cycles)
 	if (microVU1.regs().flags & 0x4 && !THREAD_VU1)
 	{
 		microVU1.regs().flags &= ~0x4;
+#ifndef PS2X_MICROVU_EMBED
 		hwIntcIrq(7);
+#endif
 	}
 }
 
