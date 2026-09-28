@@ -2815,9 +2815,12 @@ bool GSDeviceVK::CheckFeatures()
 	// passbreak) bypasses this.
 	if (GSConfig.AdrenoDstReadAuto && !GSConfig.AdrenoDstReadSplit && !GSConfig.AdrenoDstReadBreak)
 	{
-		// PCI vendor ID 0x13B5 = Qualcomm; every Qualcomm GPU is Adreno,
-		// and Turnip reports it too.
-		if (m_device_properties.vendorID == 0x13B5)
+		// PCI vendor ID 0x5143 = Qualcomm; every Qualcomm GPU is Adreno, and
+		// Turnip reports it too. (0x13B5 is ARM/Mali: the first AUTO commit used
+		// it by mistake and resolved "non-Adreno Adreno (TM) 830" on the Odin.)
+		// The name check is a belt-and-braces fallback for odd driver reports.
+		if (m_device_properties.vendorID == 0x5143 ||
+			std::strstr(m_device_properties.deviceName, "Adreno") != nullptr)
 		{
 			m_features.texture_barrier = false;
 			GSConfig.AdrenoDstReadSplit = true;
