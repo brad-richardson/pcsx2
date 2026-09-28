@@ -132,6 +132,10 @@ extern "C" GE1_API int ge1_gs_open(int blending_level)
     // off because sim Metal rejects fetch pipelines). Default off.
     if (const char* nofetch = std::getenv("GE1_DISABLE_FETCH"); nofetch && std::strcmp(nofetch, "1") == 0)
         config.DisableFramebufferFetch = true;
+    // GP3: full fused vertex-kick path (direct kick + scalar-outcode cull +
+    // fused min/max + two-pass kernel). Env-gated, default off.
+    if (const char* vk = std::getenv("GE1_VERTEX_KICK"); vk && std::strcmp(vk, "2") == 0)
+        config.VertexKickFused = true;
 #ifdef __ANDROID__
     // Odin/Adreno default: preserve destination reads through texture barriers
     // while avoiding the broken framebuffer-fetch path. The safe probe stays

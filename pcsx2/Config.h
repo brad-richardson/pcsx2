@@ -904,6 +904,10 @@ struct Pcsx2Config
 		// GP2: ARMSX2 fast packed-vertex parse for STQRGBAXYZF2 (aarch64 TBL;
 		// bit-exact). Adapter env GE1_VERTEX_KICK=1.
 		bool VertexKickFastParse = false;
+		// GP3: full fused vertex-kick path (direct kick + scalar-outcode cull +
+		// fused min/max + two-pass kernel) for STQRGBAXYZF2 strips/fans.
+		// Adapter env GE1_VERTEX_KICK=2. Includes the fast parse internally.
+		bool VertexKickFused = false;
 		GSDepthFeedbackMode DepthFeedbackMode = GSDepthFeedbackMode::Auto;
 
 		u8 CAS_Sharpness = 50;

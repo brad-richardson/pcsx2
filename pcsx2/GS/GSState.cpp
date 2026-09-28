@@ -15,6 +15,8 @@
 
 #include <algorithm>
 #include <cfloat>
+#include <cstdio>
+#include <cstdlib>
 #include <fstream>
 #include <sstream>
 #include <iomanip>
@@ -319,6 +321,10 @@ void GSState::ResetDrawBufferIdx()
 					memcpy(m_vertex_buffers[entry_ptr].xy, m_vertex_buffers[i].xy, sizeof(m_vertex_buffers[i].xy));
 					m_vertex_buffers[entry_ptr].xyhead = m_vertex_buffers[i].xyhead;
 					m_vertex_buffers[entry_ptr].xy_tail = m_vertex_buffers[i].xy_tail;
+					// GP3: the moved draw keeps its fused-FMM state.
+					m_vertex_buffers[entry_ptr].fmm_acc = m_vertex_buffers[i].fmm_acc;
+					m_vertex_buffers[entry_ptr].fmm_watermark = m_vertex_buffers[i].fmm_watermark;
+					m_vertex_buffers[entry_ptr].fmm_valid = m_vertex_buffers[i].fmm_valid;
 				}
 				else
 				{
@@ -340,6 +346,9 @@ void GSState::ResetDrawBufferIdx()
 				memset(&m_env_buffers[i], 0, sizeof(GSDrawBufferEnv));
 				m_vertex_buffers[i].head = m_vertex_buffers[i].tail = m_vertex_buffers[i].next = 0;
 				m_vertex_buffers[i].xy_tail = 0;
+				// GP3: a cleared buffer restarts fused-FMM state.
+				m_vertex_buffers[i].fmm_watermark = 0;
+				m_vertex_buffers[i].fmm_valid = false;
 			}
 		}
 	}
@@ -508,6 +517,9 @@ void GSState::PushBuffer()
 		m_dirty_gs_regs = 0;
 		m_used_buffers_idx++;
 		m_recent_buffer_switch = true;
+		// GP3: a fresh buffer restarts fused-FMM state.
+		m_vertex->fmm_watermark = 0;
+		m_vertex->fmm_valid = false;
 	}
 }
 
@@ -1486,12 +1498,104 @@ void GSState::GIFPackedRegHandlerNOP(const GIFPackedReg* RESTRICT r)
 {
 }
 
+// GP3: the legacy packed-STQRGBAXYZF2 parse as a helper, so the fused-path seam
+// kicks one vertex through exactly this code. The handler's legacy loop calls it
+// too (byte-neutral: the parse preserves m_v.UV, so reading it per iteration is
+// what the loop always did).
+static void GP3ParseLegacySTQRGBAXYZF2(const GIFPackedReg* RESTRICT r, u32 uv, GSVector4i& m0, GSVector4i& m1)
+{
+	const GSVector4i st = GSVector4i::loadl(&r[0].U64[0]);
+	GSVector4i q = GSVector4i::loadl(&r[0].U64[1]);
+	const GSVector4i rgba = (GSVector4i::load<false>(&r[1]) & GSVector4i::x000000ff()).ps32().pu16();
+
+	q = q.blend8(GSVector4i::cast(GSVector4(FLT_MIN)), q == GSVector4i::zero()); // see GIFPackedRegHandlerSTQ
+
+	m0 = st.upl64(rgba.upl32(q));
+
+	GSVector4i xy = GSVector4i::loadl(&r[2].U64[0]);
+	GSVector4i zf = GSVector4i::loadl(&r[2].U64[1]);
+	xy = xy.upl16(xy.srl<4>()).upl32(GSVector4i::load((int)uv));
+	zf = zf.srl32<4>() & GSVector4i::x00ffffff().upl32(GSVector4i::x000000ff());
+
+	m1 = xy.upl32(zf);
+}
+
+namespace
+{
+	// GP3_COMPARE=1: every fused step runs one vertex through both paths and
+	// aborts on the first difference (vertex/index/min-max output). =2 verifies
+	// whole production-size kernel chunks instead (chunk-granular localization;
+	// covers the count>=4 NEON mirror build and ring writeback that =1 never
+	// exercises). Either way the run keeps the legacy results throughout, so a
+	// compare run's digests must equal the knob-off run's exactly.
+	int GP3CompareLevel()
+	{
+		static int cached = -1;
+		if (cached < 0)
+		{
+			const char* e = std::getenv("GP3_COMPARE");
+			cached = (e && e[0] >= '1' && e[0] <= '9') ? (e[0] - '0') : 0;
+		}
+		return cached;
+	}
+
+	// GP3_NO_KERNEL=1: route strips through the direct batch instead of the
+	// two-pass kernel (bisection aid; default off).
+	bool GP3NoKernel()
+	{
+		static int cached = -1;
+		if (cached < 0)
+		{
+			const char* e = std::getenv("GP3_NO_KERNEL");
+			cached = (e && e[0] == '1') ? 1 : 0;
+		}
+		return cached == 1;
+	}
+
+	// GP3_SMALL_CHUNK=n: cap kernel chunks at n vertices (bisection aid; 0/off
+	// by default). n <= 3 keeps the scalar mirror build and scalar ring
+	// writeback while exercising multi-vertex pass two.
+	u32 GP3SmallChunk()
+	{
+		static int cached = -1;
+		if (cached < 0)
+		{
+			const char* e = std::getenv("GP3_SMALL_CHUNK");
+			cached = (e && *e) ? std::atoi(e) : 0;
+		}
+		return static_cast<u32>(cached);
+	}
+} // namespace
+
 template <u32 prim, bool auto_flush>
 void GSState::GIFPackedRegHandlerSTQRGBAXYZF2(const GIFPackedReg* RESTRICT r, u32 size)
 {
 	pxAssert(size > 0 && size % 3 == 0);
 
 	CheckFlushes();
+
+	// GP3: full fused path (GE1_VERTEX_KICK=2), default off. Strips and fans,
+	// auto_flush=false only, native res, no draw buffering, no AA1 expansion;
+	// anything else falls through to the =1/legacy loops below.
+	if constexpr (!auto_flush && (prim == GS_TRIANGLESTRIP || prim == GS_TRIANGLEFAN))
+	{
+		if (GSConfig.VertexKickFused && m_nativeres && !GSConfig.UserHacks_DrawBuffering &&
+			!(PRIM->AA1 && IsCoverageAlphaSupported()))
+		{
+			const u32 count = size / 3;
+			if constexpr (prim == GS_TRIANGLESTRIP)
+			{
+				if (count >= GSVertexKickKernel::kMinKernelVertices && !GP3NoKernel())
+					KickPackedFused<prim>(r, count);
+				else
+					KickPackedDirect<prim>(r, count);
+			}
+			else
+				KickPackedDirect<prim>(r, count);
+			m_q = r[size - 3].STQ.Q; // remember the last one, STQ outputs this to the temp Q each time
+			return;
+		}
+	}
 
 	const GIFPackedReg* RESTRICT r_end = r + size;
 
@@ -1523,20 +1627,10 @@ void GSState::GIFPackedRegHandlerSTQRGBAXYZF2(const GIFPackedReg* RESTRICT r, u3
 	{
 		while (r < r_end)
 		{
-			const GSVector4i st = GSVector4i::loadl(&r[0].U64[0]);
-			GSVector4i q = GSVector4i::loadl(&r[0].U64[1]);
-			const GSVector4i rgba = (GSVector4i::load<false>(&r[1]) & GSVector4i::x000000ff()).ps32().pu16();
-
-			q = q.blend8(GSVector4i::cast(GSVector4(FLT_MIN)), q == GSVector4i::zero()); // see GIFPackedRegHandlerSTQ
-
-			m_v.m[0] = st.upl64(rgba.upl32(q)); // TODO: only store the last one
-
-			GSVector4i xy = GSVector4i::loadl(&r[2].U64[0]);
-			GSVector4i zf = GSVector4i::loadl(&r[2].U64[1]);
-			xy = xy.upl16(xy.srl<4>()).upl32(GSVector4i::load((int)m_v.UV));
-			zf = zf.srl32<4>() & GSVector4i::x00ffffff().upl32(GSVector4i::x000000ff());
-
-			m_v.m[1] = xy.upl32(zf); // TODO: only store the last one
+			GSVector4i m0, m1;
+			GP3ParseLegacySTQRGBAXYZF2(r, m_v.UV, m0, m1);
+			m_v.m[0] = m0; // TODO: only store the last one
+			m_v.m[1] = m1; // TODO: only store the last one
 
 			VertexKick<prim, auto_flush>(r[2].XYZF2.Skip());
 
@@ -1545,6 +1639,715 @@ void GSState::GIFPackedRegHandlerSTQRGBAXYZF2(const GIFPackedReg* RESTRICT r, u3
 	}
 
 	m_q = r[-3].STQ.Q; // remember the last one, STQ outputs this to the temp Q each time
+}
+
+// ------------------------------------------------------------------------
+// GP3 fused vertex-kick path (GE1_VERTEX_KICK=2).
+// ------------------------------------------------------------------------
+
+namespace
+{
+	// GP3_COMPARE=1: every fused step also runs the legacy kick from identical
+	// input and aborts on the first difference (vertex/index/min-max output).
+	// The run keeps the legacy results throughout, so a compare run's digests
+	// must equal the knob-off run's exactly.
+	struct GP3SnapScalars
+	{
+		u32 head = 0, tail = 0, next = 0, xy_tail = 0, itail = 0;
+		GSVector4i temp_rect = GSVector4i::zero();
+		GSVector4i xy[4] = {};
+		GSVector4i xyhead = GSVector4i::zero();
+		GSVertexKernels::FmmAcc fmm = {};
+		u32 watermark = 0;
+		bool valid = false;
+		bool has_env = false;
+		u32 dirty = 0;
+		int backed_up_ctx = 0;
+		GSDrawingEnvironment prev_env = {};
+	};
+
+	thread_local GP3SnapScalars t_gp3_pre, t_gp3_slot[2];
+	thread_local std::vector<GSVertex> t_gp3_vpre, t_gp3_vslot[2];
+	thread_local std::vector<u16> t_gp3_ipre, t_gp3_islot[2];
+	thread_local u32 t_gp3_vlo = 0, t_gp3_vhi = 0, t_gp3_ilo = 0, t_gp3_ihi = 0;
+	thread_local u64 t_gp3_step = 0;
+
+	[[noreturn]] void GP3CompareFail(u64 step, u64 draw, u32 prim, u32 k, const GIFPackedReg* rv, const char* what,
+		const void* fused, const void* legacy, size_t len)
+	{
+		std::fprintf(stderr, "GP3_COMPARE MISMATCH step=%llu draw=%llu prim=%u call_vertex=%u adc=%u xyzf2=%08x_%08x_%08x_%08x field=%s len=%zu\n",
+			(unsigned long long)step, (unsigned long long)draw, prim, k,
+			(rv[2].U32[3] >> 15) & 1u, rv[2].U32[0], rv[2].U32[1], rv[2].U32[2], rv[2].U32[3], what, len);
+		std::fprintf(stderr, "  cursor fused : head=%u tail=%u next=%u xy_tail=%u itail=%u watermark=%u valid=%u vlo=%u vhi=%u ilo=%u ihi=%u\n",
+			t_gp3_slot[0].head, t_gp3_slot[0].tail, t_gp3_slot[0].next, t_gp3_slot[0].xy_tail,
+			t_gp3_slot[0].itail, t_gp3_slot[0].watermark, t_gp3_slot[0].valid ? 1u : 0u,
+			t_gp3_vlo, t_gp3_vhi, t_gp3_ilo, t_gp3_ihi);
+		std::fprintf(stderr, "  cursor legacy: head=%u tail=%u next=%u xy_tail=%u itail=%u watermark=%u valid=%u\n",
+			t_gp3_slot[1].head, t_gp3_slot[1].tail, t_gp3_slot[1].next, t_gp3_slot[1].xy_tail,
+			t_gp3_slot[1].itail, t_gp3_slot[1].watermark, t_gp3_slot[1].valid ? 1u : 0u);
+		const u8* f = static_cast<const u8*>(fused);
+		const u8* l = static_cast<const u8*>(legacy);
+		for (size_t i = 0; i < len; i += 16)
+		{
+			std::fprintf(stderr, "  fused  %6zu:", i);
+			for (size_t j = i; j < i + 16 && j < len; j++)
+				std::fprintf(stderr, " %02x", f[j]);
+			std::fprintf(stderr, "\n  legacy %6zu:", i);
+			for (size_t j = i; j < i + 16 && j < len; j++)
+				std::fprintf(stderr, " %02x", l[j]);
+			std::fprintf(stderr, "\n");
+		}
+		std::fflush(stderr);
+		pxFailRel("GP3 compare mismatch");
+		std::abort();
+	}
+} // namespace
+
+void GSState::GP3RefreshCullBounds()
+{
+	const GSVector4i cull = m_context->scissor.cull;
+	if (std::memcmp(&cull, &m_gp3_cull_src, sizeof(cull)) != 0)
+	{
+		m_gp3_cull_src = cull;
+		m_gp3_cull_band = GSVertexKernels::MakeBandedCullBounds(cull);
+	}
+}
+
+template <u32 prim>
+void GSState::GP3LegacyKickOne(const GIFPackedReg* RESTRICT rv)
+{
+	GSVector4i m0, m1;
+	GP3ParseLegacySTQRGBAXYZF2(rv, m_v.UV, m0, m1);
+	m_v.m[0] = m0;
+	m_v.m[1] = m1;
+	VertexKick<prim, false>(rv[2].XYZF2.Skip());
+}
+
+void GSState::GP3SnapCapture(u32 vtx_room, u32 idx_room)
+{
+	GSVertexBuff& vb = *m_vertex;
+	GSIndexBuff& ib = *m_index;
+	t_gp3_pre.head = vb.head;
+	t_gp3_pre.tail = vb.tail;
+	t_gp3_pre.next = vb.next;
+	t_gp3_pre.xy_tail = vb.xy_tail;
+	t_gp3_pre.itail = ib.tail;
+	t_gp3_pre.temp_rect = temp_draw_rect;
+	for (int i = 0; i < 4; i++)
+		t_gp3_pre.xy[i] = vb.xy[i];
+	t_gp3_pre.xyhead = vb.xyhead;
+	t_gp3_pre.fmm = vb.fmm_acc;
+	t_gp3_pre.watermark = vb.fmm_watermark;
+	t_gp3_pre.valid = vb.fmm_valid;
+	// The snapshot block only fires at itail == 0 (direct path, draw start); a
+	// kernel chunk always enters with itail > 0.
+	t_gp3_pre.has_env = (ib.tail == 0);
+	if (t_gp3_pre.has_env)
+	{
+		t_gp3_pre.dirty = m_dirty_gs_regs;
+		t_gp3_pre.backed_up_ctx = m_backed_up_ctx;
+		t_gp3_pre.prev_env = m_prev_env;
+	}
+	t_gp3_vlo = std::min({vb.head, vb.next, vb.tail});
+	// Clamped to the allocation: vertex capacity is m_max_vertex_count + 3, index
+	// capacity six times that (see GrowVertexBuffer). The caller sizes the room
+	// for the step (whole chunk at level 2); the stash asserts below fire loudly
+	// if a write escapes the window.
+	const u32 max0 = std::max({vb.head, vb.next, vb.tail});
+	t_gp3_vhi = std::min(std::max(max0 + 4, vb.tail + vtx_room + 4), m_max_vertex_count + 3);
+	t_gp3_ilo = ib.tail;
+	t_gp3_ihi = std::min(ib.tail + 6 + idx_room, (m_max_vertex_count + 3) * 6);
+	t_gp3_vpre.assign(vb.buff + t_gp3_vlo, vb.buff + t_gp3_vhi);
+	t_gp3_ipre.assign(ib.buff + t_gp3_ilo, ib.buff + t_gp3_ihi);
+	t_gp3_step++;
+}
+
+void GSState::GP3SnapRestore()
+{
+	GSVertexBuff& vb = *m_vertex;
+	GSIndexBuff& ib = *m_index;
+	vb.head = t_gp3_pre.head;
+	vb.tail = t_gp3_pre.tail;
+	vb.next = t_gp3_pre.next;
+	vb.xy_tail = t_gp3_pre.xy_tail;
+	ib.tail = t_gp3_pre.itail;
+	temp_draw_rect = t_gp3_pre.temp_rect;
+	for (int i = 0; i < 4; i++)
+		vb.xy[i] = t_gp3_pre.xy[i];
+	vb.xyhead = t_gp3_pre.xyhead;
+	vb.fmm_acc = t_gp3_pre.fmm;
+	vb.fmm_watermark = t_gp3_pre.watermark;
+	vb.fmm_valid = t_gp3_pre.valid;
+	if (t_gp3_pre.has_env)
+	{
+		m_dirty_gs_regs = t_gp3_pre.dirty;
+		m_backed_up_ctx = t_gp3_pre.backed_up_ctx;
+		m_prev_env = t_gp3_pre.prev_env;
+	}
+	std::memcpy(vb.buff + t_gp3_vlo, t_gp3_vpre.data(), t_gp3_vpre.size() * sizeof(GSVertex));
+	std::memcpy(ib.buff + t_gp3_ilo, t_gp3_ipre.data(), t_gp3_ipre.size() * sizeof(u16));
+}
+
+void GSState::GP3SnapStash(int slot)
+{
+	GSVertexBuff& vb = *m_vertex;
+	GSIndexBuff& ib = *m_index;
+	// Anything outside the captured window would be an uncompared write, so fail
+	// loudly. (Post-step cursor values like next are only compared as scalars,
+	// not as write addresses.)
+	pxAssertRel(vb.head >= t_gp3_vlo && vb.next >= t_gp3_vlo, "GP3 compare window underflow");
+	pxAssertRel(vb.tail + 1 <= t_gp3_vhi, "GP3 compare window overflow");
+	pxAssertRel(ib.tail <= t_gp3_ihi, "GP3 compare index window overflow");
+	GP3SnapScalars& s = t_gp3_slot[slot];
+	s.head = vb.head;
+	s.tail = vb.tail;
+	s.next = vb.next;
+	s.xy_tail = vb.xy_tail;
+	s.itail = ib.tail;
+	s.temp_rect = temp_draw_rect;
+	for (int i = 0; i < 4; i++)
+		s.xy[i] = vb.xy[i];
+	s.xyhead = vb.xyhead;
+	s.fmm = vb.fmm_acc;
+	s.watermark = vb.fmm_watermark;
+	s.valid = vb.fmm_valid;
+	s.has_env = t_gp3_pre.has_env;
+	if (s.has_env)
+	{
+		s.dirty = m_dirty_gs_regs;
+		s.backed_up_ctx = m_backed_up_ctx;
+		s.prev_env = m_prev_env;
+	}
+	t_gp3_vslot[slot].assign(vb.buff + t_gp3_vlo, vb.buff + t_gp3_vhi);
+	t_gp3_islot[slot].assign(ib.buff + t_gp3_ilo, ib.buff + t_gp3_ihi);
+}
+
+void GSState::GP3SnapCompare(u32 prim, u64 step, u32 k, const GIFPackedReg* rv)
+{
+	const GP3SnapScalars& f = t_gp3_slot[0];
+	const GP3SnapScalars& l = t_gp3_slot[1];
+#define GP3_CMP_SCALAR(field) \
+	if (f.field != l.field) \
+		GP3CompareFail(step, s_n, prim, k, rv, #field, &f.field, &l.field, sizeof(f.field))
+	GP3_CMP_SCALAR(head);
+	GP3_CMP_SCALAR(tail);
+	GP3_CMP_SCALAR(next);
+	GP3_CMP_SCALAR(xy_tail);
+	GP3_CMP_SCALAR(itail);
+	GP3_CMP_SCALAR(watermark);
+	GP3_CMP_SCALAR(valid);
+#undef GP3_CMP_SCALAR
+	auto cmp_vec = [&](const char* what, const GSVector4i& a, const GSVector4i& b) {
+		if (std::memcmp(&a, &b, sizeof(a)) != 0)
+			GP3CompareFail(step, s_n, prim, k, rv, what, &a, &b, sizeof(a));
+	};
+	cmp_vec("temp_rect", f.temp_rect, l.temp_rect);
+	for (int i = 0; i < 4; i++)
+		cmp_vec("xy", f.xy[i], l.xy[i]);
+	cmp_vec("xyhead", f.xyhead, l.xyhead);
+	cmp_vec("fmm.pmin", f.fmm.pmin, l.fmm.pmin);
+	cmp_vec("fmm.pmax", f.fmm.pmax, l.fmm.pmax);
+	cmp_vec("fmm.tmin", f.fmm.tmin, l.fmm.tmin);
+	cmp_vec("fmm.tmax", f.fmm.tmax, l.fmm.tmax);
+	cmp_vec("fmm.tnan", f.fmm.tnan, l.fmm.tnan);
+	cmp_vec("fmm.cmin", f.fmm.cmin, l.fmm.cmin);
+	cmp_vec("fmm.cmax", f.fmm.cmax, l.fmm.cmax);
+	if (f.has_env)
+	{
+		if (f.dirty != l.dirty)
+			GP3CompareFail(step, s_n, prim, k, rv, "dirty_regs", &f.dirty, &l.dirty, sizeof(f.dirty));
+		if (f.backed_up_ctx != l.backed_up_ctx)
+			GP3CompareFail(step, s_n, prim, k, rv, "backed_up_ctx", &f.backed_up_ctx, &l.backed_up_ctx, sizeof(f.backed_up_ctx));
+		if (std::memcmp(&f.prev_env, &l.prev_env, sizeof(f.prev_env)) != 0)
+			GP3CompareFail(step, s_n, prim, k, rv, "prev_env", &f.prev_env, &l.prev_env, sizeof(f.prev_env));
+	}
+	// Vertex/index bytes are compared over the live region only: slots at/above
+	// the live tail are never indexed, culled from, or accumulated, so the
+	// kernel's provisional writes there are unobservable by construction (the
+	// legacy path leaves the restored pre-image in them instead). Cursors matched
+	// above, so both sides share the live region.
+	const u32 live_tail = std::max(f.tail, l.tail);
+	const u32 live_verts = (live_tail > t_gp3_vlo) ? (live_tail - t_gp3_vlo) : 0;
+	pxAssertRel(live_verts <= t_gp3_vslot[0].size() && live_verts <= t_gp3_vslot[1].size(), "GP3 live vertex window");
+	if (std::memcmp(t_gp3_vslot[0].data(), t_gp3_vslot[1].data(), live_verts * sizeof(GSVertex)) != 0)
+	{
+		GP3CompareFail(step, s_n, prim, k, rv, "vertices", t_gp3_vslot[0].data(), t_gp3_vslot[1].data(),
+			live_verts * sizeof(GSVertex));
+	}
+	const u32 live_itail = std::max(f.itail, l.itail);
+	const u32 live_idx = (live_itail > t_gp3_ilo) ? (live_itail - t_gp3_ilo) : 0;
+	pxAssertRel(live_idx <= t_gp3_islot[0].size() && live_idx <= t_gp3_islot[1].size(), "GP3 live index window");
+	if (std::memcmp(t_gp3_islot[0].data(), t_gp3_islot[1].data(), live_idx * sizeof(u16)) != 0)
+	{
+		GP3CompareFail(step, s_n, prim, k, rv, "indices", t_gp3_islot[0].data(), t_gp3_islot[1].data(),
+			live_idx * sizeof(u16));
+	}
+	// NOTE: m_v is deliberately not compared: the fused path maintains it only
+	// at batch granularity (the legacy path stages it per vertex), and only the
+	// batch tail is observable. The run keeps the legacy m_v throughout.
+}
+
+// The two-pass batch for triangle strips. The driver owns every seam; the
+// kernel owns the runs between them. Vertices go through the legacy seam until
+// the draw's first accept (which takes the per-draw environment snapshot
+// through exactly the legacy code); the kernel only ever enters with itail > 0.
+template <u32 prim>
+void GSState::KickPackedFused(const GIFPackedReg* RESTRICT r, u32 count)
+{
+	static_assert(prim == GS_TRIANGLESTRIP);
+	constexpr u32 max_vertices = MaxVerticesForPrim(prim);
+
+	const u32 uv = m_v.UV; // packed XYZF2 does not write UV: fixed for the call
+	const GSVertexKernels::CullGrid grid = GSVertexKernels::MakeCullGrid(4, 4);
+	const int compare = GP3CompareLevel();
+
+	GSVertexKickKernel::Invariants inv;
+	inv.uv = uv;
+	inv.grid = grid;
+	// m_v is written by whichever path kicks the batch's last vertex: the kernel
+	// from its own parse, the seam from the staged legacy parse.
+	inv.last_out = &m_v;
+
+	u32 k = 0;
+	while (k < count)
+	{
+		// Seam until the draw's first accept: the snapshot block below fires on
+		// legacy accepts only, and the kernel requires itail != 0.
+		if (m_index->tail == 0 || m_scissor_invalid)
+		{
+			GP3LegacyKickOne<prim>(r + k * 3);
+			k++;
+			continue;
+		}
+
+		u32 chunk = std::min<u32>(count - k, GSVertexKickKernel::kChunkVertices);
+		if (const u32 small = GP3SmallChunk())
+			chunk = std::min(chunk, small);
+		if (compare == 1)
+			chunk = 1;
+
+		// Stop short of the vertex whose accept would reach MaxVerticesForPrim,
+		// so the Flush(VERTEXCOUNT) it triggers happens inside a legacy kick.
+		// The live tail grows by at most one per vertex, so this bound is exact.
+		if constexpr (max_vertices != 0)
+		{
+			const u32 tail = m_vertex->tail;
+			const u32 room = (max_vertices > (tail + 1)) ? (max_vertices - 1 - tail) : 0;
+			if (room == 0)
+			{
+				GP3LegacyKickOne<prim>(r + k * 3);
+				k++;
+				continue;
+			}
+			chunk = std::min(chunk, room);
+		}
+
+		// Reserve room for the whole chunk plus a prim's worth of slack, so no
+		// store inside the kernel can land past maxcount and no growth is needed.
+		// Growth timing is not observable -- nothing reads the buffer between
+		// here and the flush that consumes it.
+		while ((m_vertex->tail + chunk + 3) > m_max_vertex_count)
+			GrowVertexBuffer();
+
+		// Re-read across the seam: a seam kick can flush (VERTEXCOUNT), and after
+		// a flush what the rest of the run is decided against is whatever the
+		// context holds now.
+		inv.xyof = m_xyof;
+		GP3RefreshCullBounds();
+		inv.bounds = m_gp3_cull_band;
+		inv.shade = (PRIM->TME ? 1u : 0u) | (PRIM->FST ? 2u : 0u) | (PRIM->IIP ? 4u : 0u);
+		GSLimit24BitDepth clamp_mode = GSLimit24BitDepth::Disabled;
+		if (GSIsHardwareRenderer() && GSLocalMemory::m_psm[m_context->ZBUF.PSM].bpp == 32)
+			clamp_mode = GSConfig.UserHacks_Limit24BitDepth;
+		inv.clamp_enabled = (clamp_mode != GSLimit24BitDepth::Disabled);
+		if (inv.clamp_enabled)
+			GSVertexKickKernel::MakeDepthClampMasks(clamp_mode, inv.clamp_keep, inv.clamp_shifted);
+
+		u32 acc_state = GSVertexKickKernel::kAccEmpty;
+		if (compare)
+		{
+			GP3SnapCapture(chunk, 3 * chunk);
+			const GSVector4i acc_rect = GSVertexKickKernel::RunChunk(r + k * 3, chunk,
+				m_vertex, m_index, m_gp3_side_xyp, m_gp3_side_meta, inv, &acc_state);
+			// The kernel maintains m_v per chunk (last_out); the legacy path
+			// stages it per vertex. Verify the chunk tail against the legacy
+			// staged value (at level 1 the chunk is one vertex: per kick).
+			GSVector4i fused_mv[2] = {GSVector4i(m_v.m[0]), GSVector4i(m_v.m[1])};
+			if (acc_state != GSVertexKickKernel::kAccEmpty)
+			{
+				const GSVector4i merged = (acc_state == GSVertexKickKernel::kAccReplace) ?
+					                          acc_rect :
+					                          temp_draw_rect.runion(acc_rect);
+				temp_draw_rect = merged.rintersect(m_context->scissor.in);
+			}
+			GP3SnapStash(0);
+			GP3SnapRestore();
+			for (u32 j = 0; j < chunk; j++)
+				GP3LegacyKickOne<prim>(r + (k + j) * 3);
+			GP3SnapStash(1);
+			GP3SnapCompare(prim, t_gp3_step, k, r + k * 3);
+			if (std::memcmp(&fused_mv[0], &m_v.m[0], sizeof(fused_mv)) != 0)
+				GP3CompareFail(t_gp3_step, s_n, prim, k, r + k * 3, "m_v_chunk", &fused_mv[0], &m_v.m[0], sizeof(fused_mv));
+		}
+		else
+		{
+			const GSVector4i acc_rect = GSVertexKickKernel::RunChunk(r + k * 3, chunk,
+				m_vertex, m_index, m_gp3_side_xyp, m_gp3_side_meta, inv, &acc_state);
+			if (acc_state != GSVertexKickKernel::kAccEmpty)
+			{
+				// Folded under one scissor clamp: rintersect is monotone and
+				// idempotent, so clamping once over the union equals the per-prim
+				// clamp-then-union chain.
+				const GSVector4i merged = (acc_state == GSVertexKickKernel::kAccReplace) ?
+					                          acc_rect :
+					                          temp_draw_rect.runion(acc_rect);
+				temp_draw_rect = merged.rintersect(m_context->scissor.in);
+			}
+		}
+
+		k += chunk;
+	}
+}
+
+// The per-vertex direct batch: fans always, strips below the kernel threshold.
+// The same kick the legacy loop runs, but the cursor lives in registers across
+// the batch, m_v is written once at the end, strips decide with the
+// scalar-outcode cull, and accepted prims fold their draw rects once per call.
+// Fans keep the legacy vector cull (their head vertex sits outside the ring
+// window) and send the draw's min/max to the legacy walk.
+template <u32 prim>
+void GSState::KickPackedDirect(const GIFPackedReg* RESTRICT r, u32 count)
+{
+	static_assert(prim == GS_TRIANGLESTRIP || prim == GS_TRIANGLEFAN);
+	constexpr u32 n = 3;
+	constexpr u32 max_vertices = MaxVerticesForPrim(prim);
+
+	const u32 uv = m_v.UV; // packed XYZF2 does not write UV: fixed for the call
+	const int compare = GP3CompareLevel();
+	GP3RefreshCullBounds();
+	const GSVertexKernels::CullBounds bounds = m_gp3_cull_band;
+	const GSVertexKernels::CullGrid grid = GSVertexKernels::MakeCullGrid(4, 4);
+
+	GSLimit24BitDepth clamp_mode = GSLimit24BitDepth::Disabled;
+	if (GSIsHardwareRenderer() && GSLocalMemory::m_psm[m_context->ZBUF.PSM].bpp == 32)
+		clamp_mode = GSConfig.UserHacks_Limit24BitDepth;
+	const bool clamp_enabled = (clamp_mode != GSLimit24BitDepth::Disabled);
+
+	const bool tme = PRIM->TME != 0;
+	const bool fst = PRIM->FST != 0;
+	const bool iip = PRIM->IIP != 0;
+
+#ifdef ARCH_ARM64
+	const GSVertexKernels::PackedParseConsts kc = GSVertexKernels::MakePackedParseConsts();
+#endif
+
+	GSVertexBuff* vb = m_vertex;
+	GSIndexBuff* ib = m_index;
+	GSVertex* RESTRICT vbuff = vb->buff;
+	u16* RESTRICT ibuff = ib->buff;
+	u32 head = vb->head, tail = vb->tail, next = vb->next, xy_tail = vb->xy_tail, itail = ib->tail;
+	GSVector4i acc_rect = GSVector4i::zero();
+	u32 acc_state = 0;
+	GSVector4i last_m[2];
+
+	// Rotating cull triple for strips, seeded from the xy ring with the current
+	// bounds (no maintained ring: immune to mid-draw PRIM-class changes).
+	GSVertexKernels::CullMirrorEntry e0{}, e1{}, e2{};
+	auto seed_triple = [&]() {
+		const GSVector4i s0 = vb->xy[(xy_tail - 1) & 3];
+		const GSVector4i s1 = vb->xy[(xy_tail - 2) & 3];
+		const GSVector4i s2 = vb->xy[(xy_tail - 3) & 3];
+		e0 = GSVertexKernels::MakeCullMirrorEntry<true>(s0.I32[0], s0.I32[1], bounds, 4);
+		e1 = GSVertexKernels::MakeCullMirrorEntry<true>(s1.I32[0], s1.I32[1], bounds, 4);
+		e2 = GSVertexKernels::MakeCullMirrorEntry<true>(s2.I32[0], s2.I32[1], bounds, 4);
+	};
+	if constexpr (prim == GS_TRIANGLESTRIP)
+		seed_triple();
+	else
+	{
+		// Fans keep the legacy vector cull; the strip triple is unused.
+		(void)seed_triple;
+		(void)e0;
+		(void)e1;
+		(void)e2;
+	}
+
+	auto store_cursor = [&]() {
+		vb->head = head;
+		vb->tail = tail;
+		vb->next = next;
+		vb->xy_tail = xy_tail;
+		ib->tail = itail;
+	};
+	auto load_pointers = [&]() {
+		vb = m_vertex;
+		ib = m_index;
+		vbuff = vb->buff;
+		ibuff = ib->buff;
+	};
+	auto load_cursor = [&]() {
+		load_pointers();
+		head = vb->head;
+		tail = vb->tail;
+		next = vb->next;
+		xy_tail = vb->xy_tail;
+		itail = ib->tail;
+	};
+	auto fold_acc = [&]() {
+		if (acc_state != 0)
+		{
+			const GSVector4i merged = (acc_state == 2) ? acc_rect : temp_draw_rect.runion(acc_rect);
+			temp_draw_rect = merged.rintersect(m_context->scissor.in);
+			acc_state = 0;
+		}
+	};
+
+	auto fused_one = [&](const GIFPackedReg* RESTRICT rv) {
+		GSVector4i m0, m1;
+#ifdef ARCH_ARM64
+		GSVertexKernels::ParsePackedSTQRGBAXYZF2_Fast(rv, uv, kc, m0, m1);
+#else
+		GSVertexKernels::ParsePackedSTQRGBAXYZF2_Fast(rv, uv, m0, m1);
+#endif
+		if (clamp_enabled)
+		{
+			if (clamp_mode == GSLimit24BitDepth::PrioritizeUpper)
+				m1.U32[1] = ((m1.U32[1] >> 8) & ~0xFF) | (m1.U32[1] & 0xFF);
+			else
+				m1.U32[1] &= 0x00FFFFFF;
+		}
+		last_m[0] = m0;
+		last_m[1] = m1;
+
+		GSVector4i* RESTRICT tailptr = (GSVector4i*)&vbuff[tail];
+		tailptr[0] = m0;
+		tailptr[1] = m1;
+
+		const GSVector4i xy = m1.xxxx().u16to32().sub32(m_xyof);
+		vb->xy[xy_tail & 3] = xy;
+
+		if constexpr (prim == GS_TRIANGLEFAN)
+		{
+			if (tail == head)
+				vb->xyhead = xy;
+		}
+		else
+		{
+			e2 = e1;
+			e1 = e0;
+			e0 = GSVertexKernels::MakeCullMirrorEntry<true>(xy.I32[0], xy.I32[1], bounds, 4);
+		}
+
+		tail++;
+		xy_tail++;
+
+		const u32 m = tail - head;
+		if (m < n)
+			return;
+
+		u32 skip = rv[2].XYZF2.Skip();
+		skip |= static_cast<u32>(m_scissor_invalid);
+
+		GSVector4i bbox;
+		if (skip == 0)
+		{
+			if constexpr (prim == GS_TRIANGLESTRIP)
+			{
+				skip |= GSVertexKernels::CullTestScalar<n, GS_TRIANGLE_CLASS>(e0, e1, e2);
+				if (skip == 0)
+				{
+					const GSVector4i v0 = vb->xy[(xy_tail - 1) & 3];
+					const GSVector4i v1 = vb->xy[(xy_tail - 2) & 3];
+					const GSVector4i v2 = vb->xy[(xy_tail - 3) & 3];
+					bbox = GSVertexKernels::ComputeCullBBox<n, GS_TRIANGLE_CLASS>(v0, v1, v2, grid, false);
+				}
+			}
+			else
+			{
+				// Legacy vector cull, same expressions as VertexKick (native
+				// arm; the handler declines the fused path under AA1 expansion).
+				const GSVector4i v0 = vb->xy[(xy_tail - 1) & 3];
+				const GSVector4i v1 = vb->xy[(xy_tail - 2) & 3];
+				const GSVector4i v2 = vb->xyhead;
+				bbox = v0.runion(v1).runion(v2);
+				const GSVector4i interior = (bbox + GSVector4i(0xF, 0xF, -1, -1)) & GSVector4i(~0xF);
+				bbox = interior + GSVector4i(0, 0, 1, 1);
+				const GSVector4i bbox_ex = bbox + GSVector4i(0, 0, 1, 1);
+				const GSVector4i& scissor = m_context->scissor.cull;
+				u32 test = static_cast<u32>(!bbox_ex.rintersects(scissor));
+				test |= static_cast<u32>(bbox.rempty());
+				test |= static_cast<u32>(v0.eq(v1)) | static_cast<u32>(v1.eq(v2)) | static_cast<u32>(v0.eq(v2));
+				skip |= test;
+			}
+		}
+
+		if (skip != 0)
+		{
+			if constexpr (prim == GS_TRIANGLESTRIP)
+				head = head + 1;
+			if (tail >= m_max_vertex_count)
+			{
+				store_cursor();
+				GrowVertexBuffer();
+				load_pointers();
+			}
+			return;
+		}
+
+		if (itail == 0)
+		{
+			const int ctx = m_env.PRIM.CTXT;
+			std::memcpy(&m_prev_env, &m_env, 88);
+			std::memcpy(&m_prev_env.CTXT[ctx], &m_env.CTXT[ctx], 96);
+			std::memcpy(&m_prev_env.CTXT[ctx].offset, &m_env.CTXT[ctx].offset, sizeof(m_env.CTXT[ctx].offset));
+			std::memcpy(&m_prev_env.CTXT[ctx].scissor, &m_env.CTXT[ctx].scissor, sizeof(m_env.CTXT[ctx].scissor));
+			m_dirty_gs_regs = 0;
+			m_backed_up_ctx = m_env.PRIM.CTXT;
+
+			if (GSConfig.UserHacks_DrawBuffering)
+				SetDrawBufferEnv();
+		}
+
+		if (tail >= m_max_vertex_count)
+		{
+			store_cursor();
+			GrowVertexBuffer();
+			load_pointers();
+		}
+
+		u16* RESTRICT buff = &ibuff[itail];
+		if constexpr (prim == GS_TRIANGLESTRIP)
+		{
+			u32 dst = head;
+			if (next < head)
+			{
+				vbuff[next + 0] = vbuff[head + 0];
+				vbuff[next + 1] = vbuff[head + 1];
+				vbuff[next + 2] = vbuff[head + 2];
+				dst = next;
+				tail = next + 3;
+#ifdef ARCH_ARM64
+				vb->fmm_watermark = std::min(vb->fmm_watermark, next);
+#endif
+			}
+			buff[0] = static_cast<u16>(dst + 0);
+			buff[1] = static_cast<u16>(dst + 1);
+			buff[2] = static_cast<u16>(dst + 2);
+			head = dst + 1;
+			next = dst + 3;
+			itail += 3;
+		}
+		else
+		{
+			buff[0] = static_cast<u16>(head + 0);
+			buff[1] = static_cast<u16>(tail - 2);
+			buff[2] = static_cast<u16>(tail - 1);
+			next = tail;
+			itail += 3;
+		}
+
+#ifdef ARCH_ARM64
+		if constexpr (prim == GS_TRIANGLEFAN)
+		{
+			// Fans reference {head, tail-2, tail-1}: the fan head does not fit
+			// the watermark model, so any fan emission sends the draw's min/max
+			// to the legacy walk.
+			vb->fmm_valid = false;
+		}
+		else
+		{
+			const u32 last = tail - 1; // last emitted index == the prim's provoking vertex
+			if (itail == n)
+			{
+				GSVertexKernels::FmmAccReset(vb->fmm_acc, tme, fst);
+				vb->fmm_valid = true;
+				vb->fmm_watermark = last - 2;
+			}
+			if (vb->fmm_valid)
+			{
+				for (u32 j = std::max(vb->fmm_watermark, last - 2); j < last; j++)
+				{
+					GSVertexKernels::FmmAccumVertex(vb->fmm_acc, GSVector4i(vbuff[j].m[0]),
+						GSVector4i(vbuff[j].m[1]), tme, fst, iip);
+				}
+				GSVertexKernels::FmmAccumVertex(vb->fmm_acc, m0, m1, tme, fst, true);
+				vb->fmm_watermark = last + 1;
+			}
+		}
+#endif
+
+		const GSVector4i draw_rect = GSVertexKernels::PrimDrawRect(bbox);
+		if (acc_state != 0)
+			acc_rect = acc_rect.runion(draw_rect);
+		else
+		{
+			acc_rect = draw_rect;
+			acc_state = (itail == n) ? 2 : 1;
+		}
+
+		if (max_vertices != 0 && tail >= max_vertices)
+		{
+			store_cursor();
+			fold_acc();
+			Flush(VERTEXCOUNT);
+			load_cursor();
+		}
+	};
+
+	bool last_was_fused = false;
+	for (u32 k = 0; k < count; k++)
+	{
+		const GIFPackedReg* RESTRICT rv = r + k * 3;
+		if (!compare)
+		{
+			fused_one(rv);
+			continue;
+		}
+		// Compare mode: a VERTEXCOUNT flush has side effects outside the
+		// snapshot (it draws), so the triggering vertex runs legacy-only,
+		// uncompared. The live tail grows by at most one per vertex, so testing
+		// tail + 1 is exact.
+		if (max_vertices != 0 && tail + 1 >= max_vertices)
+		{
+			store_cursor();
+			fold_acc();
+			GP3LegacyKickOne<prim>(rv);
+			load_cursor();
+			if constexpr (prim == GS_TRIANGLESTRIP)
+				seed_triple();
+			last_was_fused = false;
+			continue;
+		}
+		GP3SnapCapture(1, 3);
+		fused_one(rv);
+		store_cursor(); // the direct batch keeps the cursor in locals; stash reads members
+		fold_acc();
+		GP3SnapStash(0);
+		GP3SnapRestore();
+		GP3LegacyKickOne<prim>(rv);
+		GP3SnapStash(1);
+		GP3SnapCompare(prim, t_gp3_step, k, rv);
+		load_cursor();
+		if constexpr (prim == GS_TRIANGLESTRIP)
+			seed_triple();
+		last_was_fused = true;
+	}
+	store_cursor();
+	fold_acc();
+	if (compare)
+	{
+		// The fused path maintains m_v only at batch granularity; verify the
+		// batch tail against the legacy staged value when the last vertex went
+		// through the fused step.
+		if (last_was_fused &&
+			(std::memcmp(&last_m[0], &m_v.m[0], sizeof(last_m)) != 0))
+			GP3CompareFail(t_gp3_step, s_n, prim, count - 1, r + (count - 1) * 3, "m_v_tail", &last_m[0], &m_v.m[0], sizeof(last_m));
+	}
+	else
+	{
+		m_v.m[0] = last_m[0];
+		m_v.m[1] = last_m[1];
+	}
 }
 
 template <u32 prim, bool auto_flush>
@@ -1612,6 +2415,12 @@ __forceinline void GSState::ApplyPRIM(u32 prim)
 		m_vertex->next = 0;
 
 	m_vertex->head = m_vertex->tail = m_vertex->next; // remove unused vertices from the end of the vertex buffer
+#ifdef ARCH_ARM64
+	// GP3: positions at/above the new tail may be rewritten and must
+	// re-accumulate into the fused-FMM state if referenced again.
+	if (GSConfig.VertexKickFused)
+		m_vertex->fmm_watermark = std::min(m_vertex->fmm_watermark, m_vertex->next);
+#endif
 }
 
 void GSState::GIFRegHandlerPRIM(const GIFReg* RESTRICT r)
@@ -5877,6 +6686,12 @@ __forceinline void GSState::VertexKick(u32 skip)
 	if constexpr (prim == GS_INVALID)
 	{
 		vtx_buff.tail = vtx_buff.head;
+#ifdef ARCH_ARM64
+		// GP3: positions at/above the new tail may be rewritten and must
+		// re-accumulate into the fused-FMM state if referenced again.
+		if (GSConfig.VertexKickFused)
+			vtx_buff.fmm_watermark = std::min(vtx_buff.fmm_watermark, vtx_buff.head);
+#endif
 		return;
 	}
 
@@ -6060,6 +6875,10 @@ __forceinline void GSState::VertexKick(u32 skip)
 				vtx_buff.buff[next + 1] = vtx_buff.buff[head + 1];
 				head = next;
 				vtx_buff.tail = next + 2;
+#ifdef ARCH_ARM64
+				if (GSConfig.VertexKickFused)
+					vtx_buff.fmm_watermark = std::min(vtx_buff.fmm_watermark, next);
+#endif
 			}
 			buff[0] = static_cast<u16>(head + 0);
 			buff[1] = static_cast<u16>(head + 1);
@@ -6083,6 +6902,10 @@ __forceinline void GSState::VertexKick(u32 skip)
 				vtx_buff.buff[next + 2] = vtx_buff.buff[head + 2];
 				head = next;
 				vtx_buff.tail = next + 3;
+#ifdef ARCH_ARM64
+				if (GSConfig.VertexKickFused)
+					vtx_buff.fmm_watermark = std::min(vtx_buff.fmm_watermark, next);
+#endif
 			}
 			buff[0] = static_cast<u16>(head + 0);
 			buff[1] = static_cast<u16>(head + 1);
@@ -6114,6 +6937,42 @@ __forceinline void GSState::VertexKick(u32 skip)
 		default:
 			ASSUME(0);
 	}
+
+#ifdef ARCH_ARM64
+	// GP3 fused vertex-trace bounds (GE1_VERTEX_KICK=2): fold this prim's
+	// newly-referenced vertices into the per-buffer FindMinMax accumulator so the
+	// flush doesn't re-walk the index list. Triangle class except fans, whose
+	// head reference doesn't fit the watermark model (any fan emission sends the
+	// draw's min/max to the legacy walk).
+	if (GSConfig.VertexKickFused)
+	{
+		if constexpr (prim == GS_TRIANGLEFAN)
+			vtx_buff.fmm_valid = false;
+		else if constexpr (primclass == GS_TRIANGLE_CLASS)
+		{
+			const u32 last = vtx_buff.tail - 1; // last emitted index == the prim's provoking vertex
+			const bool tme = PRIM->TME != 0;
+			const bool fst = PRIM->FST != 0;
+			const bool iip = PRIM->IIP != 0;
+			if (idx_buff.tail == n)
+			{
+				GSVertexKernels::FmmAccReset(vtx_buff.fmm_acc, tme, fst);
+				vtx_buff.fmm_valid = true;
+				vtx_buff.fmm_watermark = last - 2;
+			}
+			if (vtx_buff.fmm_valid)
+			{
+				for (u32 j = std::max(vtx_buff.fmm_watermark, last - 2); j < last; j++)
+				{
+					GSVertexKernels::FmmAccumVertex(vtx_buff.fmm_acc, GSVector4i(vtx_buff.buff[j].m[0]),
+						GSVector4i(vtx_buff.buff[j].m[1]), tme, fst, iip);
+				}
+				GSVertexKernels::FmmAccumVertex(vtx_buff.fmm_acc, new_v0, new_v1, tme, fst, true);
+				vtx_buff.fmm_watermark = last + 1;
+			}
+		}
+	}
+#endif
 
 	// Update rectangle for the current draw. Needs exclusive endpoints.
 	const GSVector4i draw_rect = bbox.sra32<4>() + GSVector4i(0, 0, 1, 1);

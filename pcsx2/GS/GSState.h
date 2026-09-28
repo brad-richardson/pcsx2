@@ -12,12 +12,16 @@
 #include "GS/Renderers/Common/GSVertexTrace.h"
 #include "GS/Renderers/Common/GSDevice.h"
 #include "GS/GSVector.h"
+#include "GS/GSVertexKickFused.h"
 #include "GSAlignedClass.h"
 
 class GSDumpBase;
 
 class GSState : public GSAlignedClass<32>
 {
+	// GP3: GSVertexTrace::Update consumes the fused-FMM accumulator.
+	friend class GSVertexTrace;
+
 public:
 	GSState();
 	virtual ~GSState();
@@ -145,6 +149,16 @@ protected:
 		u32 xy_tail;
 		GSVector4i xy[4];
 		GSVector4i xyhead;
+		// GP3 fused vertex-trace bounds (GE1_VERTEX_KICK=2, aarch64 only):
+		// FindMinMax min/max accumulated at index emission over this buffer's
+		// referenced vertices. fmm_watermark is the first vertex position not
+		// yet folded in (clamped on rewinds/compaction so re-referenced
+		// positions re-accumulate); fmm_valid means the accumulator covers every
+		// emitted index of the pending draw. Reset lazily at the first emission
+		// of a draw (itail == n). Zero-initialized by ResetDrawBuffers' memset.
+		GSVertexKernels::FmmAcc fmm_acc;
+		u32 fmm_watermark;
+		bool fmm_valid;
 	};
 
 	GSVertexBuff m_vertex_buffers[MAX_DRAW_BUFFERS];
@@ -192,6 +206,23 @@ protected:
 	bool CheckOverlapVerts(u32 n);
 
 	template <u32 prim, bool auto_flush> void VertexKick(u32 skip);
+
+	// GP3 fused vertex-kick path (GE1_VERTEX_KICK=2). Strips of 6+ vertices run
+	// the two-pass kernel (KickPackedFused); fans and short strips run the
+	// per-vertex direct kick (KickPackedDirect). GP3LegacyKickOne is the seam:
+	// one vertex through exactly the legacy code.
+	template <u32 prim> void KickPackedFused(const GIFPackedReg* RESTRICT r, u32 count);
+	template <u32 prim> void KickPackedDirect(const GIFPackedReg* RESTRICT r, u32 count);
+	template <u32 prim> void GP3LegacyKickOne(const GIFPackedReg* RESTRICT rv);
+	void GP3RefreshCullBounds();
+	void GP3SnapCapture(u32 vtx_room, u32 idx_room);
+	void GP3SnapRestore();
+	void GP3SnapStash(int slot);
+	void GP3SnapCompare(u32 prim, u64 step, u32 k, const GIFPackedReg* rv);
+	alignas(16) u64 m_gp3_side_xyp[GSVertexKickKernel::kChunkVertices] = {};
+	alignas(16) u64 m_gp3_side_meta[GSVertexKickKernel::kChunkVertices] = {};
+	GSVector4i m_gp3_cull_src = GSVector4i::cxpr(-2, -2, -2, -2);
+	GSVertexKernels::CullBounds m_gp3_cull_band = {};
 
 	// following functions need m_vt to be initialized
 
