@@ -477,6 +477,11 @@ static size_t mVUcodeCacheWriteSpan(microVU& mVU)
 
 static void mVUopenCodeCache(microVU& mVU)
 {
+	if (om1::CodegenForbidden()) // OM1 offline consumer: never compile
+	{
+		std::fprintf(stderr, "[om1] FATAL: mVUopenCodeCache in no-codegen mode\n");
+		std::abort();
+	}
 	// Nested call (same thread re-enters before its outer close): no-op.
 	if (armAsm)
 		return;
@@ -514,6 +519,7 @@ static void mVUopenCodeCache(microVU& mVU)
 	// enabled. (Nested opens returned above, so this attaches exactly once
 	// per episode, on the thread that owns this VU's emission.)
 	mVUPersist::BeginEpisode(mVU, armAsmPtr + s_mVUblockStartOffset);
+	om1::EpisodeBegin(mVU.index, armAsmPtr + s_mVUblockStartOffset); // OM1
 }
 
 static void mVUcloseCodeCache(microVU& mVU)
@@ -535,6 +541,7 @@ static void mVUcloseCodeCache(microVU& mVU)
 	// Persisted-JIT recorder: finalize (or drop) the chunk. Runs after
 	// FinalizeCode so the captured bytes include any literal pool.
 	mVUPersist::EndEpisode(mVU, codeStart + codeSize);
+	om1::EpisodeEnd(mVU.index, codeStart + codeSize); // OM1
 
 	armAsm = nullptr; // unbind; do not delete (persistent)
 	HostSys::EndCodeWriteRange(mVU.prog.x86start, mVUcodeCacheWriteSpan(mVU));
@@ -1144,10 +1151,10 @@ void _vuXGKICKTransfermVU(bool flush)
 
 		if (VU1.xgkickendpacket && !VU1.xgkicksizeremaining)
 		{
-		#ifdef PCSX2_RECOMPILER_TESTS
+			#ifdef PCSX2_RECOMPILER_TESTS
 			if (gif_test_hooks::g_path1_complete)
 				gif_test_hooks::g_path1_complete();
-		#endif
+			#endif
 			VU1.xgkickenable = false;
 		}
 	}
