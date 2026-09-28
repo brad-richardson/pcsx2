@@ -137,11 +137,23 @@ extern "C" GE1_API int ge1_gs_open(int blending_level)
     // fused min/max + two-pass kernel). Env-gated, default off.
     if (const char* vk = std::getenv("GE1_VERTEX_KICK"); vk && std::strcmp(vk, "2") == 0)
         config.VertexKickFused = true;
-    // GP6: GS front/back split. off (default) = single-threaded, no record
-    // round-trip; inline = records executed on the calling thread (identity
-    // rung); lockstep = back thread + drain per record (bisect rung);
-    // pipelined = two-object split, true overlap.
-    if (const char* bt = std::getenv("GE1_BACKTHREAD"); bt && *bt)
+    // GP6: GS front/back split. off = single-threaded, no record round-trip;
+    // inline = records executed on the calling thread (identity rung);
+    // lockstep = back thread + drain per record (bisect rung); pipelined =
+    // two-object split, true overlap.
+    // BP1: Android default pipelined (Brad sign-off; OB5 final ABBA + the
+    // lagV-on det check). Same auto pattern as GE7's split below: unset or
+    // empty resolves to the platform default, an explicit value (off included)
+    // wins on every platform. Scoped to Android (the Adreno play path, like
+    // the barrier defaults under __ANDROID__ above; GE7 resolves Adreno from
+    // the GPU at device creation in GSDeviceVK.cpp) — Mac/iOS keep Off.
+    if (const char* bt = std::getenv("GE1_BACKTHREAD"); !bt || !*bt)
+    {
+#ifdef __ANDROID__
+        config.BackThreadMode = GSBackThreadMode::Pipelined;
+#endif
+    }
+    else
     {
         if (std::strcmp(bt, "inline") == 0)
             config.BackThreadMode = GSBackThreadMode::InlineRecords;
