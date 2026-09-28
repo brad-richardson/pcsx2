@@ -31,6 +31,15 @@ GE1_API float ge1_gs_gpu_ms(void);
 // PW1: flush the Vulkan pipeline cache and persist newly recorded TFX selectors now.
 // For a future app pause/stop hook; the periodic ge1_gs_vsync path covers force-stop.
 GE1_API int ge1_gs_flush_caches(void);
+// DS1: quick-save support. Thin wrappers over GSfreeze (the GS runs
+// single-threaded, GSVSyncMode::Disabled, so the caller owns the renderer).
+// freeze_size returns the blob bytes (>0) or 0 when closed/failed;
+// freeze_save writes exactly that many bytes (1 ok, 0 fail); freeze_load
+// restores (1 ok, 0 fail). The save reads render targets back into VRAM so
+// target-resident pixels survive the round trip.
+GE1_API int ge1_gs_freeze_size(void);
+GE1_API int ge1_gs_freeze_save(uint8_t* out, uint32_t size);
+GE1_API int ge1_gs_freeze_load(const uint8_t* data, uint32_t size);
 #ifdef __cplusplus
 }
 #endif

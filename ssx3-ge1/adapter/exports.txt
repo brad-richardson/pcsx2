@@ -10,3 +10,6 @@ _ge1_gs_gpu_ms
 _ge1_gs_flush_caches
 _ge1_gs_export_iosurface
 _ge1_gs_release_iosurface
+_ge1_gs_freeze_size
+_ge1_gs_freeze_save
+_ge1_gs_freeze_load

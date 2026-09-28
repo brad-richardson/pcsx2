@@ -1,6 +1,7 @@
 // GE1's private PCSX2 GS host. This adapter calls public GS.h entry points.
 #include "ge1_gs.h"
 #include "pcsx2/GS.h"
+#include "pcsx2/GS/GS.h"
 #include "pcsx2/Host.h"
 #include "pcsx2/ImGui/ImGuiManager.h"
 #include "common/Console.h"
@@ -435,4 +436,36 @@ extern "C" GE1_API int ge1_gs_flush_caches(void)
     GSFlushPipelineCache();
     persist_recorded_selectors();
     return 1;
+}
+
+extern "C" GE1_API int ge1_gs_freeze_size(void)
+{
+    if (!s_open)
+        return 0;
+    freezeData fd{0, nullptr};
+    if (GSfreeze(FreezeAction::Size, &fd) != 0 || fd.size <= 0)
+        return 0;
+    return fd.size;
+}
+
+extern "C" GE1_API int ge1_gs_freeze_save(uint8_t* out, uint32_t size)
+{
+    if (!s_open || !out || size == 0)
+        return 0;
+    // Read render targets back into VRAM for this save only, so the frozen
+    // VRAM is complete; the flag is restored before returning.
+    const bool read_tc = GSConfig.UserHacks_ReadTCOnClose;
+    GSConfig.UserHacks_ReadTCOnClose = true;
+    freezeData fd{static_cast<int>(size), out};
+    const int rc = GSfreeze(FreezeAction::Save, &fd);
+    GSConfig.UserHacks_ReadTCOnClose = read_tc;
+    return rc == 0 ? 1 : 0;
+}
+
+extern "C" GE1_API int ge1_gs_freeze_load(const uint8_t* data, uint32_t size)
+{
+    if (!s_open || !data || size == 0)
+        return 0;
+    freezeData fd{static_cast<int>(size), const_cast<u8*>(data)};
+    return GSfreeze(FreezeAction::Load, &fd) == 0 ? 1 : 0;
 }
