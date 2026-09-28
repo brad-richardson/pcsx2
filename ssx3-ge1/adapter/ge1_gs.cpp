@@ -142,6 +142,25 @@ extern "C" GE1_API int ge1_gs_open(int blending_level)
         config.DisableFramebufferFetch = false;
     }
 #endif
+    // GE7: exact Adreno destination reads (all platforms; the Mac gate runs it).
+    // Env-gated, default off. Modes split/copy/passbreak (below); split and copy
+    // imply the copy road and win over the Android default above when set.
+    if (const char* dstread = std::getenv("GE1_ADRENO_DSTREAD"); dstread && *dstread) {
+        if (std::strcmp(dstread, "split") == 0) {
+            config.OverrideTextureBarriers = 0;
+            config.AdrenoDstReadSplit = true;
+            std::fprintf(stderr, "GE7: GE1_ADRENO_DSTREAD=split (copy road + overlap split)\n");
+        } else if (std::strcmp(dstread, "copy") == 0) {
+            // Same as GE1_ADRENO_SAFE on Android, but available on every platform:
+            // the single-snapshot copy road, for A/B against split.
+            config.OverrideTextureBarriers = 0;
+            std::fprintf(stderr, "GE7: GE1_ADRENO_DSTREAD=copy (copy road, single snapshot)\n");
+        } else if (std::strcmp(dstread, "passbreak") == 0) {
+            // Barrier road's decisions; ordering through pass breaks, not barriers.
+            config.AdrenoDstReadBreak = true;
+            std::fprintf(stderr, "GE7: GE1_ADRENO_DSTREAD=passbreak (barriers ordered by pass breaks)\n");
+        }
+    }
     std::fill(s_priv.begin(), s_priv.end(), 0);
     s_open = GSopen(config, renderer, s_priv.data(), GSVSyncMode::Disabled, false);
     if (s_open)
