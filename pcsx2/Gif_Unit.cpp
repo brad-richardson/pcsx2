@@ -13,6 +13,8 @@ Gif_Unit gifUnit;
 namespace gif_test_hooks
 {
 	std::vector<u8>* g_path1_sink = nullptr;
+	bool g_path1_discard = false;
+	std::vector<u32>* g_path1_packet_sizes = nullptr;
 	bool g_force_path1_busy = false;
 }
 #endif

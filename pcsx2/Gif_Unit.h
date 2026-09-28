@@ -202,6 +202,13 @@ namespace gif_test_hooks
 	// this pointer. Both entry points feed it — see Gif_Path::CopyGSPacketData
 	// and Gif_Unit::TransferGSPacketData.
 	extern std::vector<u8>* g_path1_sink;
+	// MV1 bench speed mode: consume Path 1 transfers without copying bytes
+	// or feeding the undrained standalone GIF ring.
+	extern bool g_path1_discard;
+	// MV1: record each completed XGKICK's byte count alongside the flat
+	// ordered Path1 byte stream. The JIT helper marks the boundary after any
+	// wraparound copies have been appended.
+	extern std::vector<u32>* g_path1_packet_sizes;
 
 	// When true, Gif_Unit::checkPaths(p1=true, ...) reports path 1 as busy.
 	// Used by EeVu1Vif's Mscalf-stall test to force the GIF-busy code path.
@@ -331,7 +338,7 @@ struct Gif_Path
 	void CopyGSPacketData(u8* pMem, u32 size, bool aligned = false)
 	{
 #ifdef PCSX2_RECOMPILER_TESTS
-		if (gif_test_hooks::g_path1_sink && idx == GIF_PATH_1)
+		if ((gif_test_hooks::g_path1_sink || gif_test_hooks::g_path1_discard) && idx == GIF_PATH_1)
 		{
 			// mVU's XGKICK wrap path (mVU_XGKICK_) copies the pre-wrap head
 			// of the packet straight into this buffer and hands only the
@@ -340,8 +347,9 @@ struct Gif_Path
 			// GIFtag — a harness blind spot, not a divergence. Feed the sink
 			// here too, and skip the ring entirely: with the sink installed
 			// nothing ever drains it.
-			gif_test_hooks::g_path1_sink->insert(
-				gif_test_hooks::g_path1_sink->end(), pMem, pMem + size);
+			if (!gif_test_hooks::g_path1_discard)
+				gif_test_hooks::g_path1_sink->insert(
+					gif_test_hooks::g_path1_sink->end(), pMem, pMem + size);
 			return;
 		}
 #endif
@@ -652,7 +660,7 @@ struct Gif_Unit
 	u32 TransferGSPacketData(GIF_TRANSFER_TYPE tranType, u8* pMem, u32 size, bool aligned = false)
 	{
 #ifdef PCSX2_RECOMPILER_TESTS
-		if (gif_test_hooks::g_path1_sink && tranType == GIF_TRANS_XGKICK)
+		if ((gif_test_hooks::g_path1_sink || gif_test_hooks::g_path1_discard) && tranType == GIF_TRANS_XGKICK)
 		{
 			// Hard cap: GIF Path 1 ring is 16 KB (one VU memory). Anything
 			// larger means the JIT/helper miscalculated `size` (e.g. the
@@ -666,8 +674,9 @@ struct Gif_Unit
 					static_cast<u32>(tranType), size);
 				return 0; // Drop the transfer entirely; caller should treat as no-op.
 			}
-			gif_test_hooks::g_path1_sink->insert(
-				gif_test_hooks::g_path1_sink->end(), pMem, pMem + size);
+			if (!gif_test_hooks::g_path1_discard)
+				gif_test_hooks::g_path1_sink->insert(
+					gif_test_hooks::g_path1_sink->end(), pMem, pMem + size);
 			return size;
 		}
 #endif

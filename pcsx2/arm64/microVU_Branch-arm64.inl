@@ -1082,6 +1082,10 @@ void mVU_XGKICK_(u32 addr)
 	{
 		gifUnit.TransferGSPacketData(GIF_TRANS_XGKICK, &vuRegs[1].Mem[addr], size, true);
 	}
+#ifdef PCSX2_RECOMPILER_TESTS
+	if (gif_test_hooks::g_path1_packet_sizes)
+		gif_test_hooks::g_path1_packet_sizes->push_back(size);
+#endif
 }
 
 // C helper: cycle-counted XGKICK transfer

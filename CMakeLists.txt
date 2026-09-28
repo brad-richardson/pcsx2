@@ -95,6 +95,8 @@ else()
 	add_subdirectory(pcsx2-vurunner EXCLUDE_FROM_ALL)
 endif()
 
+add_subdirectory(mv1-adapter EXCLUDE_FROM_ALL)
+
 # SDL3 / kmsdrm frontend (handheld target)
 if(UNIX AND NOT APPLE)
 	if(ENABLE_SDL_FRONTEND)
