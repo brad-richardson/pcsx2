@@ -4309,6 +4309,10 @@ GSTextureCache::Target* GSTextureCache::LookupDisplayTarget(GIFRegTEX0 TEX0, con
 	return dst;
 }
 
+// FX2: RT-alpha scale/unscale conversion copies (counting only; GSRendererHW.cpp).
+extern u64 g_fx2_rta_scale_copies;
+extern u64 g_fx2_rta_unscale_copies;
+
 void GSTextureCache::Target::ScaleRTAlpha()
 {
 	if (!m_rt_alpha_scale && m_type == RenderTarget)
@@ -4327,6 +4331,7 @@ void GSTextureCache::Target::ScaleRTAlpha()
 				const GSVector4 dRect(m_texture->GetRect().rintersect(valid_rect));
 				const GSVector4 sRect = dRect / GSVector4(rtsize.x, rtsize.y).xyxy();
 				g_gs_device->StretchRect(m_texture, sRect, temp_rt, dRect, ShaderConvert::RTA_CORRECTION, Nearest);
+				g_fx2_rta_scale_copies++;
 				g_gs_device->Recycle(m_texture);
 				m_texture = temp_rt;
 			}
@@ -4353,6 +4358,7 @@ void GSTextureCache::Target::UnscaleRTAlpha()
 				const GSVector4 dRect(m_texture->GetRect().rintersect(valid_rect));
 				const GSVector4 sRect = dRect / GSVector4(rtsize.x, rtsize.y).xyxy();
 				g_gs_device->StretchRect(m_texture, sRect, temp_rt, dRect, ShaderConvert::RTA_DECORRECTION, Nearest);
+				g_fx2_rta_unscale_copies++;
 				g_gs_device->Recycle(m_texture);
 				m_texture = temp_rt;
 			}

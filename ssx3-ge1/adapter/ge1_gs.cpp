@@ -178,6 +178,13 @@ extern "C" GE1_API int ge1_gs_open(int blending_level)
             std::fprintf(stderr, "GE7: dstread=passbreak (explicit)\n");
         }
     }
+    // FX2: terrain glint (Cs*Ad + Cd, alpha masked) through fixed-function
+    // DST_ALPHA on an RT-alpha-scaled target instead of a dst read. Output-only
+    // approximation (+-1 LSB on glint pixels). Env-gated, default off.
+    if (const char* accu = std::getenv("GE1_ADRENO_AD_ACCU"); accu && std::strcmp(accu, "rta") == 0) {
+        config.AdrenoAdAccuRta = true;
+        std::fprintf(stderr, "FX2: ad_accu=rta\n");
+    }
     std::fill(s_priv.begin(), s_priv.end(), 0);
     s_open = GSopen(config, renderer, s_priv.data(), GSVSyncMode::Disabled, false);
     if (s_open)

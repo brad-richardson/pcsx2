@@ -7877,6 +7877,28 @@ __ri u32 GSRendererHW::EmulateChannelShuffle(GSTextureCache::Target* src, bool t
 	return true;
 }
 
+// FX2: cumulative counters for GE1_ADRENO_AD_ACCU=rta, reported every 600
+// frames on stderr (logcat on Android). kind 0 = hit on a target that gets
+// scaled now, 1 = hit on an already-scaled target, 2 = glint-shaped draw kept
+// on today's path because its target can't be scaled. Counting only.
+u64 g_fx2_rta_scale_copies = 0;
+u64 g_fx2_rta_unscale_copies = 0;
+static void FX2Count(int kind)
+{
+	static u64 s_fx2_count[3] = {};
+	static int s_fx2_last_report_frame = 0;
+	s_fx2_count[kind]++;
+	const int frame = g_perfmon.GetFrame();
+	if (frame - s_fx2_last_report_frame >= 600)
+	{
+		s_fx2_last_report_frame = frame;
+		std::fprintf(stderr, "FX2COUNT frame=%d hit_scale=%llu hit_scaled=%llu fallback=%llu rta_scale=%llu rta_unscale=%llu\n",
+			frame, (unsigned long long)s_fx2_count[0], (unsigned long long)s_fx2_count[1],
+			(unsigned long long)s_fx2_count[2], (unsigned long long)g_fx2_rta_scale_copies,
+			(unsigned long long)g_fx2_rta_unscale_copies);
+	}
+}
+
 void GSRendererHW::EmulateBlending(int rt_alpha_min, int rt_alpha_max, DATEOptions& date_options,
 	GSTextureCache::Target* rt, bool can_scale_rt_alpha, bool& new_rt_alpha_scale)
 {
@@ -8056,7 +8078,25 @@ void GSRendererHW::EmulateBlending(int rt_alpha_min, int rt_alpha_max, DATEOptio
 	// the one this draw makes with its framebuffer mask on. See ResolveHeldAlphaMask().
 	const bool held_one_barrier =
 		GSDrawAlphaMask::OneBarrierWithHeldMask(m_conf.require_one_barrier, m_held_alpha_mask.fbmask != 0);
-	if (blend_ad_alpha_masked && ((is_basic_blend || (COLCLAMP.CLAMP == 0) || held_one_barrier)))
+	// FX2: (Cs - 0)*Ad + Cd with alpha masked (SSX 3 terrain glint, blend index 0211)
+	// on the copy road: the dst read only fetches Ad, which the hardware blender
+	// reads for free as DST_ALPHA once the target's alpha is scaled (Ad*255/128.25).
+	// Skip the a_masked sw blend so the no-sw path below takes rta_correction and
+	// {DST_ALPHA, ONE, ADD}. Only when the target is or can be RT-alpha-scaled;
+	// never the BLEND_HW3 colour compensation.
+	bool fx2_ad_accu = false;
+	if (GSConfig.AdrenoAdAccuRta && blend_ad_alpha_masked && is_basic_blend &&
+		m_conf.ps.blend_a == 0 && m_conf.ps.blend_b == 2 && m_conf.ps.blend_d == 1 &&
+		COLCLAMP.CLAMP && !m_draw_env->PABE.PABE && !m_cached_ctx.TEST.DATE && !m_conf.ps.fbmask &&
+		!m_conf.ps.dither && !features.texture_barrier && !held_one_barrier &&
+		!m_conf.require_full_barrier && !m_conf.ps.IsFeedbackLoopDepth() && !GSConfig.UseDebugBlend)
+	{
+		fx2_ad_accu = can_scale_rt_alpha || new_rt_alpha_scale;
+		FX2Count(fx2_ad_accu ? (new_rt_alpha_scale ? 1 : 0) : 2);
+	}
+	if (fx2_ad_accu)
+		blend_ad_alpha_masked = false;
+	else if (blend_ad_alpha_masked && ((is_basic_blend || (COLCLAMP.CLAMP == 0) || held_one_barrier)))
 	{
 		// Swap Ad with As for hw blend.
 		m_conf.ps.a_masked = 1;
@@ -8329,6 +8369,18 @@ void GSRendererHW::EmulateBlending(int rt_alpha_min, int rt_alpha_max, DATEOptio
 		color_dest_blend = false;
 		accumulation_blend = false;
 		blend_mix = false;
+		color_dest_blend2 = false;
+		blend_zero_to_one_range = false;
+	}
+
+	// FX2: pure hw blend. On an already-scaled target whose conservative alpha
+	// range exceeds 128 the High-level check above would still pick sw blending.
+	if (fx2_ad_accu)
+	{
+		sw_blending = false;
+		accumulation_blend = false;
+		blend_mix = false;
+		color_dest_blend = false;
 		color_dest_blend2 = false;
 		blend_zero_to_one_range = false;
 	}
