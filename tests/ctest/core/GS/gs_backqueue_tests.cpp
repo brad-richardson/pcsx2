@@ -73,6 +73,67 @@ TEST(GsBackQueue, WraparoundManyTimes)
 	EXPECT_TRUE(ring.IsEmpty());
 }
 
+TEST(GsBackQueue, LimitBelowCapacity)
+{
+	// GW3: a limit below the slot count reports full at the limit and keeps
+	// FIFO order across wraparound (indices still mask by the slot count).
+	SpscRing<u32, 16> ring;
+	ring.SetLimit(4);
+	for (u32 i = 0; i < 1000; i++)
+	{
+		while (ring.Size() < 4)
+		{
+			u32* slot = ring.BeginPush();
+			ASSERT_NE(slot, nullptr);
+			*slot = i * 4 + ring.Size();
+			ring.CommitPush();
+		}
+		EXPECT_EQ(ring.BeginPush(), nullptr); // full at the limit
+		for (u32 k = 0; k < 4; k++)
+		{
+			u32* p = ring.Peek();
+			ASSERT_NE(p, nullptr);
+			EXPECT_EQ(*p, i * 4 + k);
+			ring.Pop();
+		}
+	}
+	EXPECT_TRUE(ring.IsEmpty());
+
+	ring.SetLimit(0); // out of range -> full capacity
+	for (u32 i = 0; i < 16; i++)
+	{
+		ASSERT_NE(ring.BeginPush(), nullptr);
+		ring.CommitPush();
+	}
+	EXPECT_EQ(ring.BeginPush(), nullptr);
+}
+
+TEST(GsBackQueue, ChannelCapsScale)
+{
+	// GW3 knob (GE1_BACKQ_CAPS): stock caps by default and for any value but 2/4.
+	Channel chan;
+	EXPECT_EQ(chan.draw_cap, kBaseDrawNodes);
+	EXPECT_EQ(chan.payload_cap, kBasePayloadNodes);
+	const u32 scales[] = {0, 1, 2, 3, 4, 8};
+	for (u32 scale : scales)
+	{
+		Channel c;
+		c.SetCapsScale(scale);
+		const u32 want = (scale == 2 || scale == 4) ? scale : 1;
+		EXPECT_EQ(c.draw_cap, kBaseDrawNodes * want);
+		EXPECT_EQ(c.payload_cap, kBasePayloadNodes * want);
+		EXPECT_LE(c.draw_cap, Channel::kMaxDrawNodes);
+		EXPECT_LE(c.payload_cap, Channel::kMaxPayloadNodes);
+		u32 pushed = 0;
+		while (c.ring.BeginPush())
+		{
+			c.ring.CommitPush();
+			pushed++;
+		}
+		EXPECT_EQ(pushed, kBaseRecords * want);
+	}
+}
+
 TEST(GsBackQueue, RecordSlotTagRoundTrip)
 {
 	RecordRing ring;

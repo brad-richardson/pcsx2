@@ -141,6 +141,10 @@ extern "C" GE1_API int ge1_gs_open(int blending_level)
     // fused min/max + two-pass kernel). Env-gated, default off.
     if (const char* vk = std::getenv("GE1_VERTEX_KICK"); vk && std::strcmp(vk, "2") == 0)
         config.VertexKickFused = true;
+    // GW3: back-queue caps scale for the GP6 split (draw/payload pools and the
+    // record ring, x2 or x4). Host buffering only, output-identical. Default off.
+    if (const char* bq = std::getenv("GE1_BACKQ_CAPS"); bq && (std::strcmp(bq, "2") == 0 || std::strcmp(bq, "4") == 0))
+        config.BackQueueCapsScale = static_cast<u8>(*bq - '0');
     // GP6: GS front/back split. off = single-threaded, no record round-trip;
     // inline = records executed on the calling thread (identity rung);
     // lockstep = back thread + drain per record (bisect rung); pipelined =

@@ -929,6 +929,9 @@ struct Pcsx2Config
 		/// not persisted, and not compared — set by OpenGSRenderer on GSConfig
 		/// only, and read by the renderer's constructor.
 		GSBackThreadMode BackThreadModeResolved = GSBackThreadMode::Off;
+		/// GW3: back-queue caps scale (draw nodes 64, payload nodes 8, record
+		/// ring 512, each times 1/2/4). Adapter env GE1_BACKQ_CAPS. Not persisted.
+		u8 BackQueueCapsScale = 1;
 		// GE7: exact destination reads on Adreno. Copy road (no in-pass reads,
 		// which return garbage on Adreno 830) plus splitting overlapping sw-blend
 		// draws into non-overlapping batches with a fresh RT copy between them

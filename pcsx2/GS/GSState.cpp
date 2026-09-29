@@ -108,6 +108,10 @@ GSState::GSState(GSBackQueue::Channel* shared_chan, bool is_front_parser)
 	m_nativeres = GSConfig.UpscaleMultiplier == 1.0f;
 	m_mipmap = GSConfig.Mipmap;
 	m_back_records = GSConfig.BackThreadModeResolved != GSBackThreadMode::Off;
+	// GW3: the storage owner sets the pool/ring caps (a front parser shares
+	// the back object's channel, already configured).
+	if (!shared_chan)
+		m_chan_storage.SetCapsScale(GSConfig.BackQueueCapsScale);
 	if (shared_chan)
 	{
 		// Front parser object of the two-object split: records go to the back
@@ -569,7 +573,7 @@ GSBackQueue::DrawNode* GSState::AcquireDrawNode()
 			return node;
 		}
 
-		if (m_chan->draw_arena.size() < GSBackQueue::Channel::kMaxDrawNodes)
+		if (m_chan->draw_arena.size() < m_chan->draw_cap)
 			break;
 
 		std::this_thread::yield();
@@ -592,7 +596,7 @@ GSBackQueue::DrawNode* GSState::AcquireDrawNode()
 
 void GSState::ReleaseDrawNode(GSBackQueue::DrawNode* node)
 {
-	// Cannot fail: the free ring's capacity equals the arena cap.
+	// Cannot fail: the free ring's capacity is at least the arena cap.
 	GSBackQueue::DrawNode** slot = m_chan->draw_free.BeginPush();
 	pxAssert(slot);
 	*slot = node;
@@ -620,7 +624,7 @@ GSBackQueue::PayloadNode* GSState::AcquirePayloadNode()
 			return node;
 		}
 
-		if (m_chan->payload_arena.size() < GSBackQueue::Channel::kMaxPayloadNodes)
+		if (m_chan->payload_arena.size() < m_chan->payload_cap)
 			break;
 
 		std::this_thread::yield();
@@ -657,7 +661,7 @@ void GSState::RotateTransferPayload()
 
 void GSState::ExecReleasePayloadRecord(const GSBackQueue::ReleasePayloadRecord& rec)
 {
-	// Cannot fail: the free ring's capacity equals the arena cap.
+	// Cannot fail: the free ring's capacity is at least the arena cap.
 	GSBackQueue::PayloadNode** slot = m_chan->payload_free.BeginPush();
 	pxAssert(slot);
 	*slot = rec.node;

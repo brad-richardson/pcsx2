@@ -290,6 +290,10 @@ namespace GSBackQueue
 
 		static constexpr u32 Capacity() { return kCount; }
 
+		// GW3: producer-side occupancy limit (<= kCount). Storage stays kCount;
+		// the ring reports full at the limit. Set before the first push.
+		void SetLimit(u32 limit) { m_limit = (limit == 0 || limit > kCount) ? kCount : limit; }
+
 		u32 Size() const { return m_tail.load(std::memory_order_acquire) - m_head.load(std::memory_order_acquire); }
 		bool IsEmpty() const { return Size() == 0; }
 
@@ -305,10 +309,10 @@ namespace GSBackQueue
 			// real thing while a not-full reading is always true. That keeps the
 			// consumer's line out of the push path: it is re-read once per
 			// kCount pushes instead of once per push.
-			if (tail - m_cached_head == kCount)
+			if (tail - m_cached_head >= m_limit)
 			{
 				m_cached_head = m_head.load(std::memory_order_acquire);
-				if (tail - m_cached_head == kCount)
+				if (tail - m_cached_head >= m_limit)
 					return nullptr;
 			}
 			return &m_slots[tail & (kCount - 1)];
@@ -351,6 +355,7 @@ namespace GSBackQueue
 		u32 m_cached_tail = 0; // consumer's shadow of m_tail
 		alignas(64) std::atomic<u32> m_tail{0}; // producer cursor
 		u32 m_cached_head = 0; // producer's shadow of m_head
+		u32 m_limit = kCount; // producer's occupancy limit (GW3)
 	};
 
 	// Tagged slot sized for the largest record (DRAW). All records are trivially
@@ -384,7 +389,15 @@ namespace GSBackQueue
 	static_assert(std::is_trivially_copyable_v<DrawRecord>);
 	static_assert(std::is_trivially_copyable_v<ReleasePayloadRecord>);
 
-	using RecordRing = SpscRing<RecordSlot, 512>;
+	// GW3: back-queue caps knob (GE1_BACKQ_CAPS, GSConfig.BackQueueCapsScale).
+	// Storage is sized for the largest scale; the channel applies
+	// base x scale as runtime limits, so scale 1 keeps the stock caps.
+	static constexpr u32 kBaseRecords = 512;
+	static constexpr u32 kBaseDrawNodes = 64;
+	static constexpr u32 kBasePayloadNodes = 8;
+	static constexpr u32 kMaxCapsScale = 4;
+
+	using RecordRing = SpscRing<RecordSlot, kBaseRecords * kMaxCapsScale>;
 
 	// GV7-1d-ii: everything shared between the producing (front) and consuming
 	// (back) sides of the split. In single-object modes the GSState uses its own
@@ -413,16 +426,33 @@ namespace GSBackQueue
 
 		// Draw-node pool: the producer acquires (free ring first, then arena
 		// growth up to the cap, then backpressure), the consumer releases after
-		// the draw executes. Free-ring capacity == arena cap, so Release can
+		// the draw executes. Free-ring capacity >= arena cap, so Release can
 		// never fail.
-		static constexpr u32 kMaxDrawNodes = 64;
+		static constexpr u32 kMaxDrawNodes = kBaseDrawNodes * kMaxCapsScale; // storage
+		u32 draw_cap = kBaseDrawNodes; // arena cap in use (GW3)
 		std::vector<DrawNode*> draw_arena;
 		SpscRing<DrawNode*, kMaxDrawNodes> draw_free;
 
 		// Transfer payload pool: the producer stages into the current node, the
 		// consumer releases rotated-out nodes via RELEASE_PAYLOAD records.
-		static constexpr u32 kMaxPayloadNodes = 8;
+		static constexpr u32 kMaxPayloadNodes = kBasePayloadNodes * kMaxCapsScale; // storage
+		u32 payload_cap = kBasePayloadNodes; // arena cap in use (GW3)
 		std::vector<PayloadNode*> payload_arena;
 		SpscRing<PayloadNode*, kMaxPayloadNodes> payload_free;
+
+		// GW3: scale the draw/payload arena caps and the record ring's limit
+		// together (1, 2 or 4; anything else = 1). The 120 Hz heavy profile
+		// had the front yield-spinning on full pools while the back idled;
+		// buffering only, the back executes the same records in the same
+		// order. The free rings never need a limit: they hold at most the
+		// arena size. Call before the consumer starts.
+		void SetCapsScale(u32 scale)
+		{
+			if (scale != 2 && scale != 4)
+				scale = 1;
+			draw_cap = kBaseDrawNodes * scale;
+			payload_cap = kBasePayloadNodes * scale;
+			ring.SetLimit(kBaseRecords * scale);
+		}
 	};
 } // namespace GSBackQueue
