@@ -10,12 +10,42 @@
 #include "common/FPControl.h"
 
 #include <algorithm>
+#include <cstdlib>
 #include <cstring>
 #include <limits>
 #include <vector>
 
 namespace {
 bool s_ready = false;
+// MP1 L1: PS2X_MICROVU_BRIDGE_LEAN=0 keeps the pre-MP1 byte-by-byte code diff
+// (read once at init; the runtime reads the same knob for shared data).
+bool s_leanDiff = true;
+
+// MP1 L1: first differing byte of a/b (n if none). Chunked memcmp (the
+// libc's vector compare) instead of a byte loop; same result.
+uint32_t firstDiff(const uint8_t* a, const uint8_t* b, uint32_t n)
+{
+    constexpr uint32_t kChunk = 256u;
+    uint32_t i = 0;
+    while (i + kChunk <= n && std::memcmp(a + i, b + i, kChunk) == 0)
+        i += kChunk;
+    for (; i < n; ++i)
+        if (a[i] != b[i])
+            return i;
+    return n;
+}
+
+// MP1 L1: one past the last differing byte of a/b in [lo, n) (lo if none).
+uint32_t lastDiffEnd(const uint8_t* a, const uint8_t* b, uint32_t n, uint32_t lo)
+{
+    constexpr uint32_t kChunk = 256u;
+    uint32_t j = n;
+    while (j >= lo + kChunk && std::memcmp(a + j - kChunk, b + j - kChunk, kChunk) == 0)
+        j -= kChunk;
+    while (j > lo && a[j - 1] == b[j - 1])
+        --j;
+    return j;
+}
 bool s_seeded = false;
 uint64_t s_code_generation = std::numeric_limits<uint64_t>::max();
 std::vector<uint8_t> s_path1;
@@ -111,8 +141,15 @@ extern "C" PS2X_MV2_EXPORT int ps2x_microvu_init(const char** error)
     EmuConfig.Speedhacks.vu1Instant = false;
     EmuConfig.Speedhacks.vuFlagHack = false;
     EmuConfig.Gamefixes.XgKickHack = false;
+    const char* lean = std::getenv("PS2X_MICROVU_BRIDGE_LEAN");
+    s_leanDiff = !(lean && lean[0] == '0');
     s_ready = true;
     return 1;
+}
+
+extern "C" PS2X_MV2_EXPORT uint8_t* ps2x_microvu_vu1_data()
+{
+    return s_ready ? VU1.Mem : nullptr;
 }
 
 extern "C" PS2X_MV2_EXPORT void ps2x_microvu_shutdown()
@@ -149,10 +186,16 @@ extern "C" PS2X_MV2_EXPORT int ps2x_microvu_run(
     if (generation != s_code_generation) {
         uint32_t first = code_size;
         uint32_t last = 0;
-        for (uint32_t i = 0; i < code_size; ++i) {
-            if (VU1.Micro[i] != code[i]) {
-                first = std::min(first, i);
-                last = i + 1;
+        if (s_leanDiff) {
+            first = firstDiff(VU1.Micro, code, code_size);
+            if (first != code_size)
+                last = lastDiffEnd(VU1.Micro, code, code_size, first);
+        } else {
+            for (uint32_t i = 0; i < code_size; ++i) {
+                if (VU1.Micro[i] != code[i]) {
+                    first = std::min(first, i);
+                    last = i + 1;
+                }
             }
         }
         std::memcpy(VU1.Micro, code, code_size);
@@ -165,7 +208,10 @@ extern "C" PS2X_MV2_EXPORT int ps2x_microvu_run(
         CpuMicroVU1.Clear(first, last - first);
         s_code_generation = generation;
     }
-    std::memcpy(VU1.Mem, data, data_size);
+    // MP1 L1: a caller that keeps VU1 data in the library's memory
+    // (ps2x_microvu_vu1_data) needs no staging copy either way.
+    if (data != VU1.Mem)
+        std::memcpy(VU1.Mem, data, data_size);
     vif1Regs.top = top;
     vif1Regs.itop = itop;
     VU0.VI[REG_FBRST].UL = fbrst;
@@ -190,7 +236,8 @@ extern "C" PS2X_MV2_EXPORT int ps2x_microvu_run(
     gif_test_hooks::g_path1_complete = nullptr;
     s_path1_fn = nullptr;
     s_path1_opaque = nullptr;
-    std::memcpy(data, VU1.Mem, data_size);
+    if (data != VU1.Mem)
+        std::memcpy(data, VU1.Mem, data_size);
     exportState(*state, top, itop, entry_cycle, budget);
     return 1;
 }
