@@ -947,6 +947,12 @@ struct Pcsx2Config
 		// bypass it. Default false: upstream PCSX2 without the adapter is
 		// unaffected.
 		bool AdrenoDstReadAuto = false;
+		// FX2: SSX 3 terrain glint (game blend mode 17, Cs*Ad + Cd with alpha
+		// write-masked). On the copy road, draw it with fixed-function
+		// DST_ALPHA/ONE on an RT-alpha-scaled target (PCSX2's rta_correction)
+		// instead of a dst-read snapshot per draw; +-1 LSB vs the GS's >>7.
+		// Adapter env GE1_ADRENO_AD_ACCU=rta, default off.
+		bool AdrenoAdAccuRta = false;
 		GSDepthFeedbackMode DepthFeedbackMode = GSDepthFeedbackMode::Auto;
 
 		u8 CAS_Sharpness = 50;
