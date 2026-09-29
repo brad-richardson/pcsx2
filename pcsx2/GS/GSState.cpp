@@ -1973,11 +1973,12 @@ void GSState::GIFPackedRegHandlerSTQRGBAXYZF2(const GIFPackedReg* RESTRICT r, u3
 	CheckFlushes();
 
 	// GP3: full fused path (GE1_VERTEX_KICK=2), default off. Strips and fans,
-	// auto_flush=false only, native res, no draw buffering, no AA1 expansion;
-	// anything else falls through to the =1/legacy loops below.
+	// auto_flush=false only, native res, no AA1 expansion; anything else falls
+	// through to the =1/legacy loops below. GS10: draw buffering is served, with
+	// its first-prim overlap check routed through the legacy seam.
 	if constexpr (!auto_flush && (prim == GS_TRIANGLESTRIP || prim == GS_TRIANGLEFAN))
 	{
-		if (GSConfig.VertexKickFused && m_nativeres && !GSConfig.UserHacks_DrawBuffering &&
+		if (GSConfig.VertexKickFused && m_nativeres &&
 			!(PRIM->AA1 && IsCoverageAlphaSupported()))
 		{
 			const u32 count = size / 3;
@@ -2311,7 +2312,10 @@ void GSState::KickPackedFused(const GIFPackedReg* RESTRICT r, u32 count)
 	{
 		// Seam until the draw's first accept: the snapshot block below fires on
 		// legacy accepts only, and the kernel requires itail != 0.
-		if (m_index->tail == 0 || m_scissor_invalid)
+		// GS10: while a draw-buffer switch is fresh, the legacy kick's
+		// CheckOverlapVerts may flush on the first prim (it reads m_v's XY),
+		// so those vertices take the seam too (ARMSX2's overlap_active seam).
+		if (m_index->tail == 0 || m_scissor_invalid || (m_recent_buffer_switch && GSConfig.UserHacks_DrawBuffering))
 		{
 			GP3LegacyKickOne<prim>(r + k * 3);
 			k++;
@@ -2696,9 +2700,24 @@ void GSState::KickPackedDirect(const GIFPackedReg* RESTRICT r, u32 count)
 	for (u32 k = 0; k < count; k++)
 	{
 		const GIFPackedReg* RESTRICT rv = r + k * 3;
+		// GS10: a fresh draw-buffer switch arms CheckOverlapVerts, which reads
+		// m_v's XY and may flush, so run legacy-only (uncompared) until the
+		// legacy kick disarms it (ARMSX2's overlap_active seam).
+		if (m_recent_buffer_switch && GSConfig.UserHacks_DrawBuffering)
+		{
+			store_cursor();
+			fold_acc();
+			GP3LegacyKickOne<prim>(rv);
+			load_cursor();
+			if constexpr (prim == GS_TRIANGLESTRIP)
+				seed_triple();
+			last_was_fused = false;
+			continue;
+		}
 		if (!compare)
 		{
 			fused_one(rv);
+			last_was_fused = true;
 			continue;
 		}
 		// Compare mode: a VERTEXCOUNT flush has side effects outside the
@@ -2741,8 +2760,9 @@ void GSState::KickPackedDirect(const GIFPackedReg* RESTRICT r, u32 count)
 			(std::memcmp(&last_m[0], &m_v.m[0], sizeof(last_m)) != 0))
 			GP3CompareFail(t_gp3_step, s_n, prim, count - 1, r + (count - 1) * 3, "m_v_tail", &last_m[0], &m_v.m[0], sizeof(last_m));
 	}
-	else
+	else if (last_was_fused)
 	{
+		// A legacy last vertex already staged m_v itself.
 		m_v.m[0] = last_m[0];
 		m_v.m[1] = last_m[1];
 	}
