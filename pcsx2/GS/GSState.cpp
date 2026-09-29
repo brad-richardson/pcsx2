@@ -286,9 +286,13 @@ void GSFrontState::MirrorPostVsyncState()
 	// The vsync executed on the (drained) back object on this thread; Merge
 	// decremented the back's scanmask copy. Both objects are quiesced here —
 	// re-mirror so next frame's front parse sees what a single object would
-	// have. (s_n needs no mirror: the front assigns every draw serial, and
-	// the back only installs them per record.)
+	// have.
 	m_scanmask_used = m_back->m_scanmask_used;
+	// GS10: Merge() takes a draw serial on the executing object (IncDraw per
+	// displayed frame). Serials are otherwise front-assigned and the drained
+	// back holds the last one it installed, so adopting its counter here keeps
+	// the split's serials equal to a single object's (TC ages, transfer serials).
+	s_n = m_back->s_n;
 }
 
 std::string GSState::GetDrawDumpPath(const char* format, ...)
@@ -3943,6 +3947,17 @@ void GSState::FlushPrim()
 		// keeps the front parsing its own buffers.
 		m_vertex = &m_vertex_buffers[m_current_buffer_idx];
 		m_index = &m_index_buffers[m_current_buffer_idx];
+
+		// GS10: the executor's tail refreshes the live m_env's scissor for the
+		// draw's context (DrawRecordTail: "it may have been modified by a
+		// previous draw"). On a single object that write lands in the parse
+		// state; draw buffering is where it matters, because FlushBuffers
+		// stages buffered environments into m_env by register bytes only (and
+		// a base-only flush leaves them staged), so the derived scissor can
+		// lag its registers. The split front owns the parse env, so it applies
+		// the same pure refresh itself; the back's copy is its record's.
+		if (m_mem_target != this)
+			m_env.CTXT[PRIM->CTXT].UpdateScissor();
 	}
 	else
 	{
