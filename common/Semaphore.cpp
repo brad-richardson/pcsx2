@@ -62,11 +62,6 @@ void Threading::WorkSema::WaitForWork()
 
 void Threading::WorkSema::WaitForWorkWithSpin()
 {
-	WaitForWorkWithSpin(SPIN_TIME_NS);
-}
-
-void Threading::WorkSema::WaitForWorkWithSpin(u32 spin_ns)
-{
 	s32 value = m_state.load(std::memory_order_relaxed);
 	pxAssert(!IsDead(value));
 	while (IsReadyForSleep(value))
@@ -82,7 +77,7 @@ void Threading::WorkSema::WaitForWorkWithSpin(u32 spin_ns)
 	u32 waited = 0;
 	while (value < 0)
 	{
-		if (waited > spin_ns)
+		if (waited > SPIN_TIME_NS)
 		{
 			if (!m_state.compare_exchange_weak(value, STATE_SLEEPING, std::memory_order_relaxed))
 				continue;

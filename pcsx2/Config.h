@@ -929,15 +929,6 @@ struct Pcsx2Config
 		/// not persisted, and not compared — set by OpenGSRenderer on GSConfig
 		/// only, and read by the renderer's constructor.
 		GSBackThreadMode BackThreadModeResolved = GSBackThreadMode::Off;
-		/// GW3: back-queue caps scale (draw nodes 64, payload nodes 8, record
-		/// ring 512, each times 1/2/4). Adapter env GE1_BACKQ_CAPS. Not persisted.
-		u8 BackQueueCapsScale = 1;
-		/// TU3: re-emit the dynamic blend constant on every draw that uses it,
-		/// setting a different value first so the driver cannot skip it as
-		/// unchanged. Works around our Turnip (A830) drawing constant-blend
-		/// draws with a stale constant (MCOMM menu backdrop). Adapter env
-		/// GE1_VK_BLENDCONST_REEMIT=1, only with GE1_VK_TURNIP=1. Not persisted.
-		bool VkBlendConstReemit = false;
 		/// UR1: GE1 export-path output filters (the snapshot/AHB/IOSurface
 		/// exports, which do GE1's final scale). ExportCAS sharpens the frame
 		/// with PCSX2's CAS (sharpen-only, CAS_Sharpness) before the scale;

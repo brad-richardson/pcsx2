@@ -281,15 +281,6 @@ extern "C" GE1_API int ge1_gs_open(int blending_level)
     // fused min/max + two-pass kernel). Env-gated, default off.
     if (const char* vk = std::getenv("GE1_VERTEX_KICK"); vk && std::strcmp(vk, "2") == 0)
         config.VertexKickFused = true;
-    // GW3: back-queue caps scale for the GP6 split (draw/payload pools and the
-    // record ring, x2 or x4). Host buffering only, output-identical. Default off.
-    // TU3: our Turnip keeps a stale blend constant on some constant-blend draws;
-    // force its re-emission. Turnip path only (GE1_VK_TURNIP=1). Default off.
-    if (const char* rb = std::getenv("GE1_VK_BLENDCONST_REEMIT"); rb && std::strcmp(rb, "1") == 0)
-        if (const char* tu = std::getenv("GE1_VK_TURNIP"); tu && std::strcmp(tu, "1") == 0)
-            config.VkBlendConstReemit = true;
-    if (const char* bq = std::getenv("GE1_BACKQ_CAPS"); bq && (std::strcmp(bq, "2") == 0 || std::strcmp(bq, "4") == 0))
-        config.BackQueueCapsScale = static_cast<u8>(*bq - '0');
     // GP6: GS front/back split. off = single-threaded, no record round-trip;
     // inline = records executed on the calling thread (identity rung);
     // lockstep = back thread + drain per record (bisect rung); pipelined =
@@ -319,16 +310,10 @@ extern "C" GE1_API int ge1_gs_open(int blending_level)
     }
 #ifdef __ANDROID__
     // Odin/Adreno default: preserve destination reads through texture barriers
-    // while avoiding the broken framebuffer-fetch path. The safe probe stays
-    // available for diagnosis; the original profile is an explicit override.
+    // while avoiding the broken framebuffer-fetch path. GE1_ADRENO_DSTREAD=copy
+    // below is the copy-road probe.
     config.OverrideTextureBarriers = 1;
     config.DisableFramebufferFetch = true;
-    if (const char* safe = std::getenv("GE1_ADRENO_SAFE"); safe && std::strcmp(safe, "1") == 0) {
-        config.OverrideTextureBarriers = 0;
-    } else if (const char* original = std::getenv("GE1_ADRENO_ORIGINAL"); original && std::strcmp(original, "1") == 0) {
-        config.OverrideTextureBarriers = -1;
-        config.DisableFramebufferFetch = false;
-    }
 #endif
     // GE7: exact Adreno destination reads (all platforms; the Mac gate runs it).
     // Default AUTO (Brad sign-off): split on Adreno, barrier road elsewhere.
@@ -351,8 +336,7 @@ extern "C" GE1_API int ge1_gs_open(int blending_level)
             config.AdrenoDstReadSplit = true;
             std::fprintf(stderr, "GE7: dstread=split (explicit)\n");
         } else if (std::strcmp(dstread, "copy") == 0) {
-            // Same as GE1_ADRENO_SAFE on Android, but available on every platform:
-            // the single-snapshot copy road, for A/B against split.
+            // The single-snapshot copy road (all platforms), for A/B against split.
             config.OverrideTextureBarriers = 0;
             std::fprintf(stderr, "GE7: dstread=copy (explicit)\n");
         } else if (std::strcmp(dstread, "passbreak") == 0) {

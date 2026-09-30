@@ -9,7 +9,6 @@
 #include "GS/GSVertexKickParse.h"
 
 #include "common/Console.h"
-#include "common/HostSys.h"
 #include "common/BitUtils.h"
 #include "common/Path.h"
 #include "common/StringUtil.h"
@@ -109,10 +108,6 @@ GSState::GSState(GSBackQueue::Channel* shared_chan, bool is_front_parser)
 	m_nativeres = GSConfig.UpscaleMultiplier == 1.0f;
 	m_mipmap = GSConfig.Mipmap;
 	m_back_records = GSConfig.BackThreadModeResolved != GSBackThreadMode::Off;
-	// GW3: the storage owner sets the pool/ring caps (a front parser shares
-	// the back object's channel, already configured).
-	if (!shared_chan)
-		m_chan_storage.SetCapsScale(GSConfig.BackQueueCapsScale);
 	if (shared_chan)
 	{
 		// Front parser object of the two-object split: records go to the back
@@ -574,7 +569,7 @@ GSBackQueue::DrawNode* GSState::AcquireDrawNode()
 			return node;
 		}
 
-		if (m_chan->draw_arena.size() < m_chan->draw_cap)
+		if (m_chan->draw_arena.size() < GSBackQueue::Channel::kMaxDrawNodes)
 			break;
 
 		std::this_thread::yield();
@@ -597,7 +592,7 @@ GSBackQueue::DrawNode* GSState::AcquireDrawNode()
 
 void GSState::ReleaseDrawNode(GSBackQueue::DrawNode* node)
 {
-	// Cannot fail: the free ring's capacity is at least the arena cap.
+	// Cannot fail: the free ring's capacity equals the arena cap.
 	GSBackQueue::DrawNode** slot = m_chan->draw_free.BeginPush();
 	pxAssert(slot);
 	*slot = node;
@@ -625,7 +620,7 @@ GSBackQueue::PayloadNode* GSState::AcquirePayloadNode()
 			return node;
 		}
 
-		if (m_chan->payload_arena.size() < m_chan->payload_cap)
+		if (m_chan->payload_arena.size() < GSBackQueue::Channel::kMaxPayloadNodes)
 			break;
 
 		std::this_thread::yield();
@@ -662,7 +657,7 @@ void GSState::RotateTransferPayload()
 
 void GSState::ExecReleasePayloadRecord(const GSBackQueue::ReleasePayloadRecord& rec)
 {
-	// Cannot fail: the free ring's capacity is at least the arena cap.
+	// Cannot fail: the free ring's capacity equals the arena cap.
 	GSBackQueue::PayloadNode** slot = m_chan->payload_free.BeginPush();
 	pxAssert(slot);
 	*slot = rec.node;
@@ -736,21 +731,9 @@ void GSState::BackThreadLoop()
 	Console.WriteLn("GS: back thread is unpinned (any core).");
 #endif
 
-	// VG2 lever 4: GE1_BACK_SPIN_US=<n> bounds this thread's idle spin before
-	// it sleeps on the semaphore (VG1: ShortSpin was 1.85 of GS Back's
-	// 4.3 ms/f on the Odin). Unset = today's shared budget (SPIN_TIME_NS,
-	// 50 us or WAIT_SPIN_MICROSECONDS). Host scheduling only; the records
-	// and their order are unchanged.
-	u32 spin_ns = SPIN_TIME_NS;
-	if (const char* env = std::getenv("GE1_BACK_SPIN_US"); env && *env)
-	{
-		spin_ns = static_cast<u32>(std::strtoul(env, nullptr, 10)) * 1000u;
-		Console.WriteLn("GS: back thread idle spin %u us (GE1_BACK_SPIN_US).", spin_ns / 1000u);
-	}
-
 	for (;;)
 	{
-		m_chan->sema.WaitForWorkWithSpin(spin_ns);
+		m_chan->sema.WaitForWorkWithSpin();
 
 		if (m_back_thread_exit.load(std::memory_order_acquire))
 			break;

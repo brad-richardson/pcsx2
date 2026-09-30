@@ -5624,7 +5624,7 @@ void GSDeviceVK::SetIndexBuffer(VkBuffer buffer)
 
 void GSDeviceVK::SetBlendConstants(u8 color)
 {
-	if (m_blend_constant_color == color && !GSConfig.VkBlendConstReemit)
+	if (m_blend_constant_color == color)
 		return;
 
 	m_blend_constant_color = color;
@@ -5958,13 +5958,6 @@ __ri void GSDeviceVK::ApplyBaseState(u32 flags, VkCommandBuffer cmdbuf)
 	if (flags & DIRTY_FLAG_BLEND_CONSTANTS)
 	{
 		const GSVector4 col(static_cast<float>(m_blend_constant_color) / 128.0f);
-		// TU3: a different value first, so the driver sees a change and re-emits
-		// the constant even when it equals its cached (but stale) value.
-		if (GSConfig.VkBlendConstReemit)
-		{
-			const GSVector4 other(-1.0f);
-			vkCmdSetBlendConstants(cmdbuf, other.v);
-		}
 		vkCmdSetBlendConstants(cmdbuf, col.v);
 	}
 
