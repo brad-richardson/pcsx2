@@ -691,12 +691,24 @@ private:
 	// PW1: cumulative TFX pipeline + SPIR-V compile accounting (GS thread only; recording costs
 	// two clock reads per newly created pipeline and nothing in steady state), plus the recorded
 	// set of TFX selectors for pre-warm. Dormant unless the GE1 adapter enables recording.
-	u64 m_tfx_pipelines_created = 0;
-	u64 m_tfx_pipeline_create_ns = 0;
-	u64 m_spv_compiles = 0;
-	u64 m_spv_compile_ns = 0;
-	bool m_selector_record_enabled = false;
+	// SH1: atomics + a lock on the recorded list, since with the pipelined back thread the draws
+	// (and so these records) run on the back thread while the adapter reads them at vsync.
+	std::atomic<u64> m_tfx_pipelines_created{0};
+	std::atomic<u64> m_tfx_pipeline_create_ns{0};
+	std::atomic<u64> m_spv_compiles{0};
+	std::atomic<u64> m_spv_compile_ns{0};
+	std::atomic<bool> m_selector_record_enabled{false};
+	std::mutex m_recorded_selectors_lock;
 	std::vector<PipelineSelector> m_recorded_selectors;
+	// SH1: first-use stall tagging (GE1_PIPE_STATS_CSV): slow TFX creates (>= 1 ms, a driver
+	// compile rather than a pipeline-cache hit), the slowest create, texture uploads and new
+	// textures per vsync.
+	std::atomic<u64> m_tfx_slow_creates{0};
+	std::atomic<u64> m_tfx_max_create_ns{0};
+	std::atomic<u64> m_tex_upload_bytes{0};
+	std::atomic<u64> m_tex_uploads{0};
+	std::atomic<u64> m_tex_creates{0};
+	std::atomic<u64> m_tex_create_ns{0};
 
 	VkRenderPass m_utility_color_render_pass_load = VK_NULL_HANDLE;
 	VkRenderPass m_utility_color_render_pass_clear = VK_NULL_HANDLE;
@@ -897,6 +909,18 @@ public:
 	void SetSelectorRecordEnabled(bool enabled);
 	u32 TakeRecordedSelectors(PipelineSelector* out, u32 capacity);
 	u32 PrewarmTFXPipelines(const PipelineSelector* sels, u32 count);
+	// SH1: texture upload / creation accounting (any thread; relaxed atomics).
+	void RecordTextureUpload(u64 bytes)
+	{
+		m_tex_uploads.fetch_add(1, std::memory_order_relaxed);
+		m_tex_upload_bytes.fetch_add(bytes, std::memory_order_relaxed);
+	}
+	void RecordTextureCreate(u64 ns)
+	{
+		m_tex_creates.fetch_add(1, std::memory_order_relaxed);
+		m_tex_create_ns.fetch_add(ns, std::memory_order_relaxed);
+	}
+	void GetAndResetStallStats(u64 out[6]);
 
 	void PushDebugGroup(const char* fmt, ...) override;
 	void PopDebugGroup() override;

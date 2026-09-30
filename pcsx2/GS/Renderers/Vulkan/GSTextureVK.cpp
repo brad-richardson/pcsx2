@@ -11,6 +11,8 @@
 #include "common/Console.h"
 #include "common/BitUtils.h"
 
+#include <chrono>
+
 VkFramebuffer GSTextureVK::CreateNullFramebuffer(u32 w, u32 h)
 {
 	const VkRenderPass rp = GSDeviceVK::GetInstance()->GetRenderPass(
@@ -85,6 +87,18 @@ GSTextureVK::~GSTextureVK()
 std::unique_ptr<GSTextureVK> GSTextureVK::Create(Usage usage, Format format, int width, int height, int levels)
 {
 	pxAssert(ValidateUsageAndFormat(usage, format));
+
+	// SH1: new-texture accounting for the stall tags (GE1_PIPE_STATS_CSV).
+	struct CreateTimer
+	{
+		const std::chrono::steady_clock::time_point start = std::chrono::steady_clock::now();
+		~CreateTimer()
+		{
+			if (GSDeviceVK* dev = GSDeviceVK::GetInstance())
+				dev->RecordTextureCreate(static_cast<u64>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+					std::chrono::steady_clock::now() - start).count()));
+		}
+	} create_timer;
 
 	const VkFormat vk_format = GSDeviceVK::GetInstance()->LookupNativeFormat(format);
 
@@ -341,6 +355,7 @@ bool GSTextureVK::DoUpdate(const GSVector4i& r, const void* data, int pitch, int
 	const u32 height = r.height();
 	const u32 upload_pitch = Common::AlignUpPow2(pitch, GSDeviceVK::GetInstance()->GetBufferCopyRowPitchAlignment());
 	const u32 required_size = CalcUploadSize(height, upload_pitch);
+	GSDeviceVK::GetInstance()->RecordTextureUpload(required_size);
 
 	// If the texture is larger than half our streaming buffer size, use a separate buffer.
 	// Otherwise allocation will either fail, or require lots of cmdbuffer submissions.
@@ -462,6 +477,7 @@ void GSTextureVK::Unmap()
 	const u32 pitch =
 		Common::AlignUpPow2(CalcUploadPitch(width), GSDeviceVK::GetInstance()->GetBufferCopyRowPitchAlignment());
 	const u32 required_size = CalcUploadSize(height, pitch);
+	GSDeviceVK::GetInstance()->RecordTextureUpload(required_size);
 	VKStreamBuffer& buffer = GSDeviceVK::GetInstance()->GetTextureUploadBuffer();
 	const u32 buffer_offset = buffer.GetCurrentOffset();
 	buffer.CommitMemory(required_size);

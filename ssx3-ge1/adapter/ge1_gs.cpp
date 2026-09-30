@@ -32,6 +32,7 @@ std::FILE* s_stats = nullptr;
 std::uint64_t s_vsyncs = 0;
 std::uint64_t s_flush_every = 0;
 std::string s_prewarm_path;
+std::chrono::steady_clock::time_point s_last_vsync{}; // SH1: stats CSV wall_us
 constexpr std::uint32_t kSelectorTakeBatch = 1024;
 
 void persist_recorded_selectors()
@@ -335,7 +336,7 @@ extern "C" GE1_API int ge1_gs_open(int blending_level)
             s_stats = std::fopen(csv, "w");
             if (s_stats)
             {
-                std::fprintf(s_stats, "vsync,new_tfx,tfx_us,new_spv,spv_us,flush_us\n");
+                std::fprintf(s_stats, "vsync,new_tfx,tfx_us,new_spv,spv_us,flush_us,tfx_slow,tfx_max_us,up_kb,uploads,tex_new,tex_new_us,wall_us\n");
                 std::fflush(s_stats);
             }
             else
@@ -409,6 +410,7 @@ extern "C" GE1_API void ge1_gs_close(void)
     s_vsyncs = 0;
     s_flush_every = 0;
     s_prewarm_path.clear();
+    s_last_vsync = {};
     s_pixels.clear();
 }
 
@@ -474,10 +476,22 @@ extern "C" GE1_API int ge1_gs_vsync(uint32_t field, uint64_t csr, uint64_t smode
     {
         std::uint64_t new_tfx = 0, tfx_ns = 0, new_spv = 0, spv_ns = 0;
         GSGetAndResetPipelineStats(&new_tfx, &tfx_ns, &new_spv, &spv_ns);
-        std::fprintf(s_stats, "%llu,%llu,%llu,%llu,%llu,%llu\n", static_cast<unsigned long long>(s_vsyncs),
+        // SH1: stall tags and the wall time since the previous vsync on this thread (the
+        // back thread's creates/uploads can land one vsync late in pipelined mode).
+        std::uint64_t st[6];
+        GSGetAndResetStallStats(st);
+        const auto now = std::chrono::steady_clock::now();
+        const std::uint64_t wall_us = s_last_vsync.time_since_epoch().count() == 0 ? 0 :
+            static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(now - s_last_vsync).count());
+        s_last_vsync = now;
+        std::fprintf(s_stats, "%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu\n",
+            static_cast<unsigned long long>(s_vsyncs),
             static_cast<unsigned long long>(new_tfx), static_cast<unsigned long long>(tfx_ns / 1000),
             static_cast<unsigned long long>(new_spv), static_cast<unsigned long long>(spv_ns / 1000),
-            static_cast<unsigned long long>(flush_us));
+            static_cast<unsigned long long>(flush_us), static_cast<unsigned long long>(st[0]),
+            static_cast<unsigned long long>(st[1] / 1000), static_cast<unsigned long long>(st[2] / 1024),
+            static_cast<unsigned long long>(st[3]), static_cast<unsigned long long>(st[4]),
+            static_cast<unsigned long long>(st[5] / 1000), static_cast<unsigned long long>(wall_us));
         std::fflush(s_stats);
     }
     return 1;
