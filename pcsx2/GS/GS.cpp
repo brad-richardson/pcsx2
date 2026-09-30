@@ -152,6 +152,16 @@ u32 GSPrewarmTFXPipelines(const void* selectors, u32 count)
 	return 0;
 }
 
+void GSGetAndResetStallStats(u64 out[6])
+{
+	for (int i = 0; i < 6; i++)
+		out[i] = 0;
+#ifdef ENABLE_VULKAN
+	if (GSDeviceVK* dev = GetVKDeviceForPW1())
+		dev->GetAndResetStallStats(out);
+#endif
+}
+
 bool GSIsHardwareRenderer()
 {
 	// Null gets flagged as hw.

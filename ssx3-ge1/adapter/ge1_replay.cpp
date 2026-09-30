@@ -123,6 +123,13 @@ int main(int argc, char** argv)
     const bool exporting = ring.init();
 #endif
     out << "type,tick,index,bytes,fnv64,cpu_ms,gpu_ms,width,height\n";
+    // SH1: GE1_REPLAY_BACK_CSV=path writes the back thread's busy ms per frame
+    // (index,tick,back_ms; -1 when no back thread runs). Off by default.
+    std::ofstream back_csv;
+    if (const char* p = std::getenv("GE1_REPLAY_BACK_CSV"); p && *p) {
+        back_csv.open(p);
+        back_csv << "index,tick,back_ms\n";
+    }
     std::vector<uint8_t> rec;
     std::vector<uint8_t> fifo;
     uint64_t packet_count = 0, transfer_count = 0, read_count = 0, frame_count = 0;
@@ -199,6 +206,8 @@ int main(int argc, char** argv)
                     std::chrono::duration<double, std::milli>(end - start).count();
                 frame_gs_cpu_ms = 0.0;
                 const float gpu = ge1_gs_gpu_ms();
+                if (back_csv.is_open())
+                    back_csv << frame_count << ',' << tick << ',' << ge1_gs_back_ms() << '\n';
                 const bool named = listed_tick(tick);
                 if ((snap_every && tick % snap_every == 0) || named) {
                     uint32_t w = 0, h = 0;

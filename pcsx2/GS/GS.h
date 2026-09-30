@@ -103,6 +103,9 @@ u32 GSGetTFXSelectorSize();
 void GSSetTFXSelectorRecord(bool enabled);
 u32 GSTakeRecordedTFXSelectors(void* out, u32 capacity);
 u32 GSPrewarmTFXPipelines(const void* selectors, u32 count);
+// SH1: stall tags since the last call (reset on read): slow TFX creates (>= 1 ms), slowest create ns,
+// texture upload bytes, texture uploads, new textures, new-texture ns. Zeros unless the VK device is up.
+void GSGetAndResetStallStats(u64 out[6]);
 
 GSRendererType GSGetCurrentRenderer();
 bool GSIsHardwareRenderer();

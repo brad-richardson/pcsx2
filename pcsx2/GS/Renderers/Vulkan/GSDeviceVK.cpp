@@ -5348,21 +5348,39 @@ VkPipeline GSDeviceVK::GetTFXPipeline(const PipelineSelector& p)
 
 	VkPipeline pipeline = CreateTFXPipeline(p);
 	m_tfx_pipelines.emplace(p, pipeline);
-	if (m_selector_record_enabled)
+	if (m_selector_record_enabled.load(std::memory_order_relaxed))
+	{
+		std::lock_guard<std::mutex> lock(m_recorded_selectors_lock);
 		m_recorded_selectors.push_back(p);
+	}
 	return pipeline;
 }
 
 void GSDeviceVK::RecordTFXPipelineCreate(u64 ns)
 {
-	m_tfx_pipelines_created++;
-	m_tfx_pipeline_create_ns += ns;
+	m_tfx_pipelines_created.fetch_add(1, std::memory_order_relaxed);
+	m_tfx_pipeline_create_ns.fetch_add(ns, std::memory_order_relaxed);
+	if (ns >= 1000000)
+		m_tfx_slow_creates.fetch_add(1, std::memory_order_relaxed);
+	u64 prev = m_tfx_max_create_ns.load(std::memory_order_relaxed);
+	while (ns > prev && !m_tfx_max_create_ns.compare_exchange_weak(prev, ns, std::memory_order_relaxed))
+		;
 }
 
 void GSDeviceVK::RecordSPVCompile(u64 ns)
 {
-	m_spv_compiles++;
-	m_spv_compile_ns += ns;
+	m_spv_compiles.fetch_add(1, std::memory_order_relaxed);
+	m_spv_compile_ns.fetch_add(ns, std::memory_order_relaxed);
+}
+
+void GSDeviceVK::GetAndResetStallStats(u64 out[6])
+{
+	out[0] = m_tfx_slow_creates.exchange(0, std::memory_order_relaxed);
+	out[1] = m_tfx_max_create_ns.exchange(0, std::memory_order_relaxed);
+	out[2] = m_tex_upload_bytes.exchange(0, std::memory_order_relaxed);
+	out[3] = m_tex_uploads.exchange(0, std::memory_order_relaxed);
+	out[4] = m_tex_creates.exchange(0, std::memory_order_relaxed);
+	out[5] = m_tex_create_ns.exchange(0, std::memory_order_relaxed);
 }
 
 bool GSDeviceVK::FlushPipelineCache()
@@ -5372,29 +5390,30 @@ bool GSDeviceVK::FlushPipelineCache()
 
 void GSDeviceVK::GetAndResetPipeStats(u64* tfx_pipelines, u64* tfx_ns, u64* spv_compiles, u64* spv_ns)
 {
+	const u64 got_tfx = m_tfx_pipelines_created.exchange(0, std::memory_order_relaxed);
+	const u64 got_tfx_ns = m_tfx_pipeline_create_ns.exchange(0, std::memory_order_relaxed);
+	const u64 got_spv = m_spv_compiles.exchange(0, std::memory_order_relaxed);
+	const u64 got_spv_ns = m_spv_compile_ns.exchange(0, std::memory_order_relaxed);
 	if (tfx_pipelines)
-		*tfx_pipelines = m_tfx_pipelines_created;
+		*tfx_pipelines = got_tfx;
 	if (tfx_ns)
-		*tfx_ns = m_tfx_pipeline_create_ns;
+		*tfx_ns = got_tfx_ns;
 	if (spv_compiles)
-		*spv_compiles = m_spv_compiles;
+		*spv_compiles = got_spv;
 	if (spv_ns)
-		*spv_ns = m_spv_compile_ns;
-	m_tfx_pipelines_created = 0;
-	m_tfx_pipeline_create_ns = 0;
-	m_spv_compiles = 0;
-	m_spv_compile_ns = 0;
+		*spv_ns = got_spv_ns;
 }
 
 void GSDeviceVK::SetSelectorRecordEnabled(bool enabled)
 {
-	m_selector_record_enabled = enabled;
+	m_selector_record_enabled.store(enabled, std::memory_order_relaxed);
 }
 
 u32 GSDeviceVK::TakeRecordedSelectors(PipelineSelector* out, u32 capacity)
 {
 	if (!out || capacity == 0)
 		return 0;
+	std::lock_guard<std::mutex> lock(m_recorded_selectors_lock);
 	const u32 count = static_cast<u32>(std::min<size_t>(m_recorded_selectors.size(), capacity));
 	std::memcpy(out, m_recorded_selectors.data(), count * sizeof(PipelineSelector));
 	m_recorded_selectors.erase(m_recorded_selectors.begin(), m_recorded_selectors.begin() + count);
