@@ -9,6 +9,7 @@
 #include "GS/GSVertexKickParse.h"
 
 #include "common/Console.h"
+#include "common/HostSys.h"
 #include "common/BitUtils.h"
 #include "common/Path.h"
 #include "common/StringUtil.h"
@@ -735,9 +736,21 @@ void GSState::BackThreadLoop()
 	Console.WriteLn("GS: back thread is unpinned (any core).");
 #endif
 
+	// VG2 lever 4: GE1_BACK_SPIN_US=<n> bounds this thread's idle spin before
+	// it sleeps on the semaphore (VG1: ShortSpin was 1.85 of GS Back's
+	// 4.3 ms/f on the Odin). Unset = today's shared budget (SPIN_TIME_NS,
+	// 50 us or WAIT_SPIN_MICROSECONDS). Host scheduling only; the records
+	// and their order are unchanged.
+	u32 spin_ns = SPIN_TIME_NS;
+	if (const char* env = std::getenv("GE1_BACK_SPIN_US"); env && *env)
+	{
+		spin_ns = static_cast<u32>(std::strtoul(env, nullptr, 10)) * 1000u;
+		Console.WriteLn("GS: back thread idle spin %u us (GE1_BACK_SPIN_US).", spin_ns / 1000u);
+	}
+
 	for (;;)
 	{
-		m_chan->sema.WaitForWorkWithSpin();
+		m_chan->sema.WaitForWorkWithSpin(spin_ns);
 
 		if (m_back_thread_exit.load(std::memory_order_acquire))
 			break;

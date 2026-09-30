@@ -207,6 +207,8 @@ namespace Threading
 		void WaitForWork();
 		/// Wait for work to be added to the queue, spinning for a bit before sleeping the thread
 		void WaitForWorkWithSpin();
+		/// Same, with an explicit spin budget in ns (the default uses SPIN_TIME_NS).
+		void WaitForWorkWithSpin(u32 spin_ns);
 		/// Wait for the worker thread to finish processing all entries in the queue or die
 		/// Returns false if the thread is dead
 		bool WaitForEmpty();
