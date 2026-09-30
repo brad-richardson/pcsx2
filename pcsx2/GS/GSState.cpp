@@ -7547,19 +7547,17 @@ __forceinline void GSState::VertexKick(u32 skip)
 {
 	constexpr u32 n = NumIndicesForPrim(prim);
 	constexpr int primclass = GSUtil::GetPrimClass(prim);
-	GSVertexBuff& vtx_buff = *m_vertex;
-	GSIndexBuff& idx_buff = *m_index;
 	static_assert(n > 0);
-	pxAssert(vtx_buff.tail < vtx_buff.maxcount + 3);
+	pxAssert(m_vertex->tail < m_vertex->maxcount + 3);
 
 	if constexpr (prim == GS_INVALID)
 	{
-		vtx_buff.tail = vtx_buff.head;
+		m_vertex->tail = m_vertex->head;
 #ifdef ARCH_ARM64
 		// GP3: positions at/above the new tail may be rewritten and must
 		// re-accumulate into the fused-FMM state if referenced again.
 		if (GSConfig.VertexKickFused)
-			vtx_buff.fmm_watermark = std::min(vtx_buff.fmm_watermark, vtx_buff.head);
+			m_vertex->fmm_watermark = std::min(m_vertex->fmm_watermark, m_vertex->head);
 #endif
 		return;
 	}
@@ -7567,7 +7565,14 @@ __forceinline void GSState::VertexKick(u32 skip)
 	if (GSConfig.UserHacks_DrawBuffering)
 		if (CheckOverlapVerts(n))
 			Flush(CONTEXTCHANGE);
-	
+
+	// GS10: bind the buffers only after the draw-buffering overlap flush. The
+	// flush compacts the buffers (ResetDrawBufferIdx), and when the current
+	// buffer was not slot 0 it moves; references taken before would write this
+	// vertex into the abandoned slot, dropping it from the draw (the next prim
+	// then joins the wrong vertices; SSX 3 ap120 6482-6485 top-left slivers).
+	GSVertexBuff& vtx_buff = *m_vertex;
+	GSIndexBuff& idx_buff = *m_index;
 	if (auto_flush && skip == 0 && idx_buff.tail > 0 && ((vtx_buff.tail + 1) - vtx_buff.head) >= n)
 	{
 		HandleAutoFlush<prim>();
