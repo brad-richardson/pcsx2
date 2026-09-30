@@ -10,6 +10,7 @@
 #include "common/FPControl.h"
 
 #include <algorithm>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <limits>
@@ -139,7 +140,14 @@ extern "C" PS2X_MV2_EXPORT int ps2x_microvu_init(const char** error)
     rc.vu1ExactMode = false;
     EmuConfig.Speedhacks.vuThread = false;
     EmuConfig.Speedhacks.vu1Instant = false;
-    EmuConfig.Speedhacks.vuFlagHack = false;
+    // VU2: PS2X_MICROVU_FLAG_HACK=1 turns on PCSX2's default "mVU Flag
+    // Hack" (SpeedhackOptions: vuFlagHack = true). microVU then updates the
+    // status flag only where its non-sticky bits are read (FSxxx, block and
+    // program ends), so the sticky bits skip the rest. Default off = exact.
+    const char* flagHack = std::getenv("PS2X_MICROVU_FLAG_HACK");
+    EmuConfig.Speedhacks.vuFlagHack = flagHack && flagHack[0] == '1';
+    if (EmuConfig.Speedhacks.vuFlagHack)
+        std::fprintf(stderr, "[microvu] flag hack on (VU2, PCSX2 default vuFlagHack)\n");
     EmuConfig.Gamefixes.XgKickHack = false;
     const char* lean = std::getenv("PS2X_MICROVU_BRIDGE_LEAN");
     s_leanDiff = !(lean && lean[0] == '0');
