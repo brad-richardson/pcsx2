@@ -932,6 +932,12 @@ struct Pcsx2Config
 		/// GW3: back-queue caps scale (draw nodes 64, payload nodes 8, record
 		/// ring 512, each times 1/2/4). Adapter env GE1_BACKQ_CAPS. Not persisted.
 		u8 BackQueueCapsScale = 1;
+		/// TU3: re-emit the dynamic blend constant on every draw that uses it,
+		/// setting a different value first so the driver cannot skip it as
+		/// unchanged. Works around our Turnip (A830) drawing constant-blend
+		/// draws with a stale constant (MCOMM menu backdrop). Adapter env
+		/// GE1_VK_BLENDCONST_REEMIT=1, only with GE1_VK_TURNIP=1. Not persisted.
+		bool VkBlendConstReemit = false;
 		// GE7: exact destination reads on Adreno. Copy road (no in-pass reads,
 		// which return garbage on Adreno 830) plus splitting overlapping sw-blend
 		// draws into non-overlapping batches with a fresh RT copy between them

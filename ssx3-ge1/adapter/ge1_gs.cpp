@@ -143,6 +143,11 @@ extern "C" GE1_API int ge1_gs_open(int blending_level)
         config.VertexKickFused = true;
     // GW3: back-queue caps scale for the GP6 split (draw/payload pools and the
     // record ring, x2 or x4). Host buffering only, output-identical. Default off.
+    // TU3: our Turnip keeps a stale blend constant on some constant-blend draws;
+    // force its re-emission. Turnip path only (GE1_VK_TURNIP=1). Default off.
+    if (const char* rb = std::getenv("GE1_VK_BLENDCONST_REEMIT"); rb && std::strcmp(rb, "1") == 0)
+        if (const char* tu = std::getenv("GE1_VK_TURNIP"); tu && std::strcmp(tu, "1") == 0)
+            config.VkBlendConstReemit = true;
     if (const char* bq = std::getenv("GE1_BACKQ_CAPS"); bq && (std::strcmp(bq, "2") == 0 || std::strcmp(bq, "4") == 0))
         config.BackQueueCapsScale = static_cast<u8>(*bq - '0');
     // GP6: GS front/back split. off = single-threaded, no record round-trip;
