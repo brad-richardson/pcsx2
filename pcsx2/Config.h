@@ -1049,6 +1049,15 @@ struct Pcsx2Config
 		// single feedback-loop barrier chunk, which returns garbage on Adreno 830
 		// (menu font static). Prefer the hw blend-mix path for mixable equations.
 		bool AdrenoPreferBlendMix = false;
+		/// UR1: GE1 export-path output filters (the snapshot/AHB/IOSurface
+		/// exports, which do GE1's final scale). ExportCAS sharpens the frame
+		/// with PCSX2's CAS (sharpen-only, CAS_Sharpness) before the scale;
+		/// ExportSharpBilinear nearest-prescales to the smallest integer
+		/// multiple covering the output, then bilinear-downsamples (PCSX2's
+		/// "Bilinear (Sharp)"). Adapter env GE1_CAS / PS2X_PRESENT_FILTER=sharp.
+		/// Not persisted.
+		bool ExportCAS = false;
+		bool ExportSharpBilinear = false;
 		// GE7: exact destination reads on Adreno. Copy road (no in-pass reads,
 		// which return garbage on Adreno 830) plus splitting overlapping sw-blend
 		// draws into non-overlapping batches with a fresh RT copy between them

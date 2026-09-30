@@ -8,8 +8,10 @@
 #include "common/FileSystem.h"
 #include "common/MemorySettingsInterface.h"
 
+#include <algorithm>
 #include <array>
 #include <chrono>
+#include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -60,6 +62,79 @@ void persist_recorded_selectors()
     std::fflush(f);
     std::fclose(f);
 }
+// UR1: SSX 3's displayed frame height (NTSC 640x448, the src rect every
+// export scales from). native = display height / this.
+constexpr float kSourceHeight = 448.0f;
+
+bool parse_size(const char* s, unsigned* w, unsigned* h)
+{
+    return s && std::sscanf(s, "%ux%u", w, h) == 2 && *w > 0 && *h > 0 && *w <= 8192 && *h <= 8192;
+}
+
+// UR1 knobs, default off (returns false and leaves config untouched):
+//   GE1_UPSCALE=<float>|native|halfnative  internal resolution (PCSX2 UpscaleMultiplier;
+//       native = display height / 448 from GE1_DISPLAY_SIZE=WxH, which the runtime sets
+//       from the game rect; halfnative = half of that)
+//   GE1_FXAA=1                             PCSX2 FXAA on the merged frame
+//   GE1_CAS=<0..1>                         CAS sharpen-only on the export, that sharpness
+//   PS2X_PRESENT_FILTER=sharp              sharp bilinear for the export's final scale
+//   GE1_SNAPSHOT_SIZE=WxH                  snapshot size (replay crops at display size)
+// The SSX 3 GameDB fixes that matter when upscaled (halfPixelOffset 2 = Special,
+// nativeScaling 1 = Normal, textureInsideRT 1) are already set unconditionally.
+bool configure_output(Pcsx2Config::GSOptions& config)
+{
+    bool on = false;
+    if (const char* up = std::getenv("GE1_UPSCALE"); up && *up)
+    {
+        float scale = 0.0f;
+        const bool native = std::strcmp(up, "native") == 0, half = std::strcmp(up, "halfnative") == 0;
+        if (native || half)
+        {
+            unsigned dw = 0, dh = 0;
+            if (parse_size(std::getenv("GE1_DISPLAY_SIZE"), &dw, &dh))
+                scale = static_cast<float>(dh) / kSourceHeight * (half ? 0.5f : 1.0f);
+            else
+                std::fprintf(stderr, "UR1: GE1_UPSCALE=%s needs GE1_DISPLAY_SIZE=WxH; staying 1x\n", up);
+        }
+        else
+        {
+            scale = std::strtof(up, nullptr);
+        }
+        if (scale > 1.0f)
+        {
+            config.UpscaleMultiplier = std::min(scale, 8.0f);
+            on = true;
+        }
+    }
+    if (const char* fx = std::getenv("GE1_FXAA"); fx && std::strcmp(fx, "1") == 0)
+    {
+        config.FXAA = true;
+        on = true;
+    }
+    if (const char* cas = std::getenv("GE1_CAS"); cas && *cas)
+    {
+        const float s = std::strtof(cas, nullptr);
+        if (s > 0.0f)
+        {
+            config.ExportCAS = true;
+            config.CAS_Sharpness = static_cast<u8>(std::lround(std::min(s, 1.0f) * 100.0f));
+            on = true;
+        }
+    }
+    if (const char* pf = std::getenv("PS2X_PRESENT_FILTER"); pf && std::strcmp(pf, "sharp") == 0)
+    {
+        config.ExportSharpBilinear = true;
+        on = true;
+    }
+    if (std::getenv("GE1_SNAPSHOT_SIZE"))
+        on = true;
+    if (on)
+        std::fprintf(stderr, "UR1: upscale=%.4f fxaa=%d cas=%s(%u) filter=%s aspect=stretch\n",
+            config.UpscaleMultiplier, config.FXAA ? 1 : 0, config.ExportCAS ? "on" : "off",
+            static_cast<unsigned>(config.CAS_Sharpness), config.ExportSharpBilinear ? "sharp" : "bilinear");
+    return on;
+}
+
 constexpr u32 kOffsets[20] = {
     0x0000, 0x0010, 0x0020, 0x0030, 0x0040, 0x0050, 0x0060,
     0x0070, 0x0080, 0x0090, 0x00a0, 0x00b0, 0x00c0, 0x00d0,
@@ -123,6 +198,15 @@ extern "C" GE1_API int ge1_gs_open(int blending_level)
     config.FXAA = false;
     config.LoadTextureReplacements = false;
     config.ShadeBoost = false;
+    // UR1: internal resolution + output filters. All unset = today, byte-identical.
+    if (configure_output(config))
+    {
+        // GE1 fills whatever export size the runtime asks for (the runtime owns
+        // the aspect: 16:9 anamorphic). At a 4:3 export (640x480) Stretch and the
+        // default auto 4:3 give the same rect.
+        config.AspectRatio = AspectRatioType::Stretch;
+        EmuConfig.CurrentAspectRatio = AspectRatioType::Stretch;
+    }
     // GE4: Adreno sw-blend workaround (menu font static). Env-gated, default off.
     if (const char* bmix = std::getenv("GE1_ADRENO_BLEND_MIX"); bmix && std::strcmp(bmix, "1") == 0)
         config.AdrenoPreferBlendMix = true;
@@ -356,7 +440,12 @@ extern "C" GE1_API int ge1_gs_snapshot(uint32_t* width, uint32_t* height, const 
 {
     if (!s_open || !width || !height || !rgba)
         return 0;
-    if (!GSSaveSnapshotToMemory(640, 480, false, false, width, height, &s_pixels))
+    // UR1: GE1_SNAPSHOT_SIZE=WxH snapshots at that size (the display game rect,
+    // what a display-sized export draws); default 640x480.
+    unsigned sw = 640, sh = 480;
+    if (const char* ss = std::getenv("GE1_SNAPSHOT_SIZE"); ss && !parse_size(ss, &sw, &sh))
+        sw = 640, sh = 480;
+    if (!GSSaveSnapshotToMemory(sw, sh, false, false, width, height, &s_pixels))
         return 0;
     *rgba = s_pixels.data();
     return 1;

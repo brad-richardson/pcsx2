@@ -1,12 +1,16 @@
 #include "ge1_gs.h"
 
 #include <chrono>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <fstream>
 #include <iomanip>
 #include <iostream>
 #include <vector>
+#ifdef __ANDROID__
+#include <android/hardware_buffer.h>
+#endif
 
 static uint32_t u32at(const uint8_t* p) { uint32_t v; std::memcpy(&v, p, 4); return v; }
 static uint64_t u64at(const uint8_t* p) { uint64_t v; std::memcpy(&v, p, 8); return v; }
@@ -32,6 +36,49 @@ static bool listed_tick(uint64_t tick)
     return false;
 }
 
+#ifdef __ANDROID__
+// UR1: GE1_REPLAY_EXPORT=WxH exports every frame into a ring of AHBs of that size,
+// as the runtime's GE1 present does (one export in flight; its fence is waited
+// before the next export, like queuePendingAhb). Off by default.
+struct ExportRing
+{
+    AHardwareBuffer* bufs[4] = {};
+    uint32_t w = 0, h = 0, next = 0;
+    uint64_t pending = 0, exports = 0, failures = 0;
+    bool init()
+    {
+        const char* s = std::getenv("GE1_REPLAY_EXPORT");
+        if (!s || std::sscanf(s, "%ux%u", &w, &h) != 2 || !w || !h)
+            return false;
+        for (AHardwareBuffer*& b : bufs) {
+            AHardwareBuffer_Desc d = {};
+            d.width = w; d.height = h; d.layers = 1;
+            d.format = AHARDWAREBUFFER_FORMAT_R8G8B8A8_UNORM;
+            d.usage = AHARDWAREBUFFER_USAGE_GPU_COLOR_OUTPUT | AHARDWAREBUFFER_USAGE_GPU_SAMPLED_IMAGE |
+                      AHARDWAREBUFFER_USAGE_COMPOSER_OVERLAY | AHARDWAREBUFFER_USAGE_CPU_READ_RARELY;
+            if (AHardwareBuffer_allocate(&d, &b) != 0) { std::cerr << "UR1: AHB alloc failed\n"; return false; }
+        }
+        std::cerr << "UR1: replay export " << w << 'x' << h << " every frame\n";
+        return true;
+    }
+    void frame()
+    {
+        if (pending) ge1_gs_wait_export(pending);
+        pending = 0;
+        uint64_t fence = 0;
+        if (ge1_gs_export_ahb(bufs[next], w, h, &fence) == 1) { pending = fence; exports++; }
+        else failures++;
+        next = (next + 1) % 4;
+    }
+    void close()
+    {
+        if (pending) ge1_gs_wait_export(pending);
+        for (AHardwareBuffer*& b : bufs) if (b) { ge1_gs_release_ahb(b); AHardwareBuffer_release(b); b = nullptr; }
+        if (w) std::cerr << "UR1: exports=" << exports << " failures=" << failures << '\n';
+    }
+};
+#endif
+
 int main(int argc, char** argv)
 {
     if (argc != 6) {
@@ -47,6 +94,10 @@ int main(int argc, char** argv)
     char magic[8]; in.read(magic, 8);
     if (!in || std::memcmp(magic, "PS2XGSC2", 8)) { std::cerr << "not C2\n"; return 2; }
     if (!ge1_gs_open(blend)) { std::cerr << "GS open failed\n"; return 3; }
+#ifdef __ANDROID__
+    ExportRing ring;
+    const bool exporting = ring.init();
+#endif
     out << "type,tick,index,bytes,fnv64,cpu_ms,gpu_ms,width,height\n";
     std::vector<uint8_t> rec;
     std::vector<uint8_t> fifo;
@@ -116,6 +167,9 @@ int main(int argc, char** argv)
                     result = 5; break;
                 }
                 frame_count++;
+#ifdef __ANDROID__
+                if (exporting) ring.frame();
+#endif
                 const auto end = std::chrono::steady_clock::now();
                 const double cpu = frame_gs_cpu_ms +
                     std::chrono::duration<double, std::milli>(end - start).count();
@@ -157,6 +211,9 @@ int main(int argc, char** argv)
             frame_gs_cpu_ms += std::chrono::duration<double, std::milli>(
                 std::chrono::steady_clock::now() - start).count();
     }
+#ifdef __ANDROID__
+    ring.close();
+#endif
     ge1_gs_close();
     std::cerr << "packets=" << packet_count << " transfers=" << transfer_count
               << " fifo=" << read_count << " frames=" << frame_count << " rc=" << result << '\n';
