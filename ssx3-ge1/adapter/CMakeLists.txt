@@ -25,6 +25,9 @@ endif()
 if(NOT IOS)
   add_executable(ge1_replay ge1_replay.cpp)
   target_link_libraries(ge1_replay PRIVATE ge1_gs)
+  if(ANDROID)
+    target_link_libraries(ge1_replay PRIVATE nativewindow)
+  endif()
 endif()
 
 # GI1: macOS metallibs for GE1_RENDERER=metal replays. Same sources and

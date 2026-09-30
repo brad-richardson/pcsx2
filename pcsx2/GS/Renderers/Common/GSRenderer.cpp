@@ -1087,6 +1087,34 @@ bool GSRenderer::IsIdleFrame() const
 	return (m_last_draw_n == s_n && m_last_transfer_n == s_transfer_n);
 }
 
+// UR1: the exports' final scale (current -> rc in rt). Knobs off: one bilinear
+// TRANSPARENCY_FILTER stretch, as before. ExportCAS sharpens at the source size
+// first; ExportSharpBilinear nearest-prescales to the smallest integer multiple
+// covering rc, then the same bilinear stretch downsamples it.
+static void ExportStretch(GSTexture* current, GSVector4i src_rect, GSVector4 src_uv, GSTexture* rt, const GSVector4i& rc)
+{
+	GSTexture* src = current;
+	if (GSConfig.ExportCAS && g_gs_device->Features().cas_sharpening)
+		g_gs_device->CAS(src, src_rect, src_uv, GSVector4(rc), true);
+	GSTexture* pre = nullptr;
+	const int sw = src_rect.width(), sh = src_rect.height();
+	if (GSConfig.ExportSharpBilinear && sw > 0 && sh > 0 && (rc.width() > sw || rc.height() > sh))
+	{
+		const int k = std::max((rc.width() + sw - 1) / sw, (rc.height() + sh - 1) / sh);
+		pre = g_gs_device->CreateRenderTarget(sw * k, sh * k, GSTexture::Format::Color, false);
+		if (pre)
+		{
+			g_gs_device->StretchRect(src, src_uv, pre, GSVector4(0.0f, 0.0f, static_cast<float>(sw * k),
+				static_cast<float>(sh * k)), ShaderConvert::COPY, Nearest);
+			src = pre;
+			src_uv = GSVector4(0.0f, 0.0f, 1.0f, 1.0f);
+		}
+	}
+	g_gs_device->StretchRect(src, src_uv, rt, GSVector4(rc), ShaderConvert::TRANSPARENCY_FILTER, Biln);
+	if (pre)
+		g_gs_device->Recycle(pre);
+}
+
 bool GSRenderer::SaveSnapshotToMemory(u32 window_width, u32 window_height, bool apply_aspect, bool crop_borders,
 	u32* width, u32* height, std::vector<u32>* pixels)
 {
@@ -1149,7 +1177,7 @@ bool GSRenderer::SaveSnapshotToMemory(u32 window_width, u32 window_height, bool 
 		if (dl)
 		{
 			const GSVector4i rc(0, 0, draw_width, draw_height);
-			g_gs_device->StretchRect(current, src_uv, rt, GSVector4(rc), ShaderConvert::TRANSPARENCY_FILTER, Biln);
+			ExportStretch(current, src_rect, src_uv, rt, rc);
 			dl->CopyFromTexture(rc, rt, rc, 0);
 			dl->Flush();
 
@@ -1203,7 +1231,7 @@ bool GSRenderer::ExportSnapshotToAHB(AHardwareBuffer* buffer, u32 width, u32 hei
 	if (!rt)
 		return false;
 	const GSVector4i rc(0, 0, draw_width, draw_height);
-	g_gs_device->StretchRect(current, src_uv, rt, GSVector4(rc), ShaderConvert::TRANSPARENCY_FILTER, Biln);
+	ExportStretch(current, src_rect, src_uv, rt, rc);
 	const bool ok = static_cast<GSDeviceVK*>(g_gs_device.get())->CopySnapshotToAHB(rt, buffer, width, height,
 		(width - draw_width) / 2, (height - draw_height) / 2, fence_counter);
 	g_gs_device->Recycle(rt);
@@ -1233,7 +1261,7 @@ bool GSRenderer::ExportSnapshotToIOSurface(void* iosurface, u32 width, u32 heigh
 	if (!rt)
 		return false;
 	const GSVector4i rc(0, 0, draw_width, draw_height);
-	g_gs_device->StretchRect(current, src_uv, rt, GSVector4(rc), ShaderConvert::TRANSPARENCY_FILTER, Biln);
+	ExportStretch(current, src_rect, src_uv, rt, rc);
 	const bool ok = MT_CopySnapshotToIOSurface(g_gs_device.get(), rt, iosurface, width, height,
 		(width - draw_width) / 2, (height - draw_height) / 2, done, ctx);
 	g_gs_device->Recycle(rt);
