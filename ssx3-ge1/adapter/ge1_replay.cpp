@@ -61,14 +61,38 @@ struct ExportRing
         std::cerr << "UR1: replay export " << w << 'x' << h << " every frame\n";
         return true;
     }
-    void frame()
+    void frame(uint64_t tick, bool named)
     {
         if (pending) ge1_gs_wait_export(pending);
         pending = 0;
         uint64_t fence = 0;
-        if (ge1_gs_export_ahb(bufs[next], w, h, &fence) == 1) { pending = fence; exports++; }
+        AHardwareBuffer* const buf = bufs[next];
+        if (ge1_gs_export_ahb(buf, w, h, &fence) == 1) { pending = fence; exports++; }
         else failures++;
         next = (next + 1) % 4;
+        // UR2: GE1_REPLAY_AHB_PPM=1 reads the exported AHB back (what SurfaceFlinger
+        // gets) at named ticks as <tick>.ahb.ppm next to the snapshots.
+        const char* dir = std::getenv("GE1_REPLAY_PPM_DIR");
+        const char* want = std::getenv("GE1_REPLAY_AHB_PPM");
+        if (!named || !pending || !dir || !want || std::strcmp(want, "1") != 0)
+            return;
+        ge1_gs_wait_export(pending);
+        pending = 0;
+        AHardwareBuffer_Desc d = {};
+        AHardwareBuffer_describe(buf, &d);
+        void* mem = nullptr;
+        if (AHardwareBuffer_lock(buf, AHARDWAREBUFFER_USAGE_CPU_READ_RARELY, -1, nullptr, &mem) != 0 || !mem) {
+            std::cerr << "UR2: AHB lock failed tick=" << tick << '\n';
+            return;
+        }
+        std::ofstream ppm(std::string(dir) + "/" + std::to_string(tick) + ".ahb.ppm", std::ios::binary);
+        ppm << "P6\n" << w << ' ' << h << "\n255\n";
+        for (uint32_t y = 0; y < h; ++y)
+            for (uint32_t x = 0; x < w; ++x) {
+                const uint8_t* px = static_cast<const uint8_t*>(mem) + (uint64_t(y) * d.stride + x) * 4;
+                ppm.write(reinterpret_cast<const char*>(px), 3); // R8G8B8A8: R, G, B
+            }
+        AHardwareBuffer_unlock(buf, nullptr);
     }
     void close()
     {
@@ -168,7 +192,7 @@ int main(int argc, char** argv)
                 }
                 frame_count++;
 #ifdef __ANDROID__
-                if (exporting) ring.frame();
+                if (exporting) ring.frame(tick, listed_tick(tick));
 #endif
                 const auto end = std::chrono::steady_clock::now();
                 const double cpu = frame_gs_cpu_ms +

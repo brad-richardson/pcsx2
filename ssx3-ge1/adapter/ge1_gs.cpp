@@ -135,6 +135,59 @@ bool configure_output(Pcsx2Config::GSOptions& config)
     return on;
 }
 
+// UR2 knobs, default off (config untouched when unset):
+//   GE1_UPSCALE_FIX=<tok>[,<tok>...]  PCSX2 upscale fixes, applied only when
+//       UpscaleMultiplier > 1 (1x stays byte-identical). Tokens: half-pixel
+//       offset off|normal|special|aggressive|native|nativetex (GameDB default
+//       special), round1|round2 (round sprite), align (align sprite X), none.
+//   GE1_ANISO=2|4|8|16                 PCSX2 MaxAnisotropy (shader aniso on
+//       non-mipmapped triangle draws)
+//   GE1_TRILINEAR=off|ps2|forced       PCSX2 TriFilter (default automatic = ps2)
+void configure_filtering(Pcsx2Config::GSOptions& config)
+{
+    const char* fix = std::getenv("GE1_UPSCALE_FIX");
+    if (fix && *fix && config.UpscaleMultiplier > 1.0f)
+    {
+        const std::string s(fix);
+        size_t pos = 0;
+        while (pos <= s.size())
+        {
+            const size_t end = std::min(s.find(',', pos), s.size());
+            const std::string t = s.substr(pos, end - pos);
+            if (t == "off") config.UserHacks_HalfPixelOffset = GSHalfPixelOffset::Off;
+            else if (t == "normal") config.UserHacks_HalfPixelOffset = GSHalfPixelOffset::Normal;
+            else if (t == "special") config.UserHacks_HalfPixelOffset = GSHalfPixelOffset::Special;
+            else if (t == "aggressive") config.UserHacks_HalfPixelOffset = GSHalfPixelOffset::SpecialAggressive;
+            else if (t == "native") config.UserHacks_HalfPixelOffset = GSHalfPixelOffset::Native;
+            else if (t == "nativetex") config.UserHacks_HalfPixelOffset = GSHalfPixelOffset::NativeWTexOffset;
+            else if (t == "round1") config.UserHacks_RoundSprite = 1;
+            else if (t == "round2") config.UserHacks_RoundSprite = 2;
+            else if (t == "align") config.UserHacks_AlignSpriteX = true;
+            else if (!t.empty() && t != "none") std::fprintf(stderr, "UR2: GE1_UPSCALE_FIX token '%s' ignored\n", t.c_str());
+            pos = end + 1;
+        }
+        std::fprintf(stderr, "UR2: upscale fix %s: hpo=%d round=%d align=%d\n", fix,
+            static_cast<int>(config.UserHacks_HalfPixelOffset), static_cast<int>(config.UserHacks_RoundSprite),
+            config.UserHacks_AlignSpriteX ? 1 : 0);
+    }
+    if (const char* af = std::getenv("GE1_ANISO"); af && *af)
+    {
+        const int n = std::atoi(af);
+        if (n == 2 || n == 4 || n == 8 || n == 16)
+        {
+            config.MaxAnisotropy = static_cast<u8>(n);
+            std::fprintf(stderr, "UR2: anisotropic %dx\n", n);
+        }
+    }
+    if (const char* tri = std::getenv("GE1_TRILINEAR"); tri && *tri)
+    {
+        if (std::strcmp(tri, "off") == 0) config.TriFilter = TriFiltering::Off;
+        else if (std::strcmp(tri, "ps2") == 0) config.TriFilter = TriFiltering::PS2;
+        else if (std::strcmp(tri, "forced") == 0) config.TriFilter = TriFiltering::Forced;
+        std::fprintf(stderr, "UR2: trilinear %s (TriFilter=%d)\n", tri, static_cast<int>(config.TriFilter));
+    }
+}
+
 constexpr u32 kOffsets[20] = {
     0x0000, 0x0010, 0x0020, 0x0030, 0x0040, 0x0050, 0x0060,
     0x0070, 0x0080, 0x0090, 0x00a0, 0x00b0, 0x00c0, 0x00d0,
@@ -207,6 +260,8 @@ extern "C" GE1_API int ge1_gs_open(int blending_level)
         config.AspectRatio = AspectRatioType::Stretch;
         EmuConfig.CurrentAspectRatio = AspectRatioType::Stretch;
     }
+    // UR2: upscale fixes (only > 1x), anisotropic + trilinear filtering. Unset = today.
+    configure_filtering(config);
     // GE4: Adreno sw-blend workaround (menu font static). Env-gated, default off.
     if (const char* bmix = std::getenv("GE1_ADRENO_BLEND_MIX"); bmix && std::strcmp(bmix, "1") == 0)
         config.AdrenoPreferBlendMix = true;
