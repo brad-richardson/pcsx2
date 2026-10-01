@@ -1027,6 +1027,19 @@ void GSState::FlushBuffers(bool flush_base_only, bool use_flush_reason, GSFlushR
 	std::memcpy(&m_prev_env.CTXT[1], &m_env_buffers[m_current_buffer_idx].m_env.CTXT[1], 96);
 	std::memcpy(&m_prev_env.CTXT[ctx].offset, &m_env_buffers[m_current_buffer_idx].m_env.CTXT[ctx].offset, sizeof(m_env_buffers[m_current_buffer_idx].m_env.CTXT[ctx].offset));
 	std::memcpy(&m_prev_env.CTXT[ctx].scissor, &m_env_buffers[m_current_buffer_idx].m_env.CTXT[ctx].scissor, sizeof(m_env_buffers[m_current_buffer_idx].m_env.CTXT[ctx].scissor));
+
+	// GS10: re-derive the kick's cached context state (m_xyof, m_scissor_invalid)
+	// from the restored m_env. Each FlushDraw ends with UpdateContext() against
+	// whatever env was staged at the time; a buffer pushed before its first
+	// accept has a zeroed env (m_backed_up_ctx 0, so a "< 0" skip never
+	// fires), and when the last buffer has no indices no later FlushDraw
+	// refreshes the caches. The next kicks then cull against XYOFFSET 0 and
+	// drop the draw's prims (SSX 3 ap120 tick 6569: 84 indices of an overlay
+	// pass lost, a lit terrain wedge). Only with more than one buffer in use
+	// (restore_env), as in the pre-ARMSX2 lib; a single buffer's FlushDraw
+	// already refreshed the caches against the live env.
+	if (restore_env)
+		UpdateContext();
 }
 
 void GSState::PushBuffer()
