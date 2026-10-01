@@ -315,6 +315,7 @@ bool ge1_host_reserve_sw_code()
 // denied on FUSE storage, pad rumble), so failing or doing nothing is the right answer here.
 #include "common/FileSystem.h"
 #include "pcsx2/Input/AndroidNativeRumble.h"
+#include "common/HostSys.h"
 
 int FileSystem::OpenFDFileContent(const char* filename)
 {
@@ -333,5 +334,12 @@ bool FileSystem::CreateFileViaJava(const char* path)
 
 void Native::onPadRumble(int pad, int largeMotor, int smallMotor)
 {
+}
+
+// The notification chime (LnxMisc.cpp leaves it to native-lib on Android). The same set ARMSX2's
+// pcsx2/Android/AndroidStubs.cpp stubs for its libretro core, which also links without native-lib.
+bool Common::PlaySoundAsync(const char* path)
+{
+	return false;
 }
 #endif
