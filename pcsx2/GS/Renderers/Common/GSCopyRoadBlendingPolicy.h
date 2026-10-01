@@ -96,6 +96,7 @@ constexpr bool DestinationReadCostsPerDraw(const GSCopyRoadBlendingInputs& in)
 			return in.barrier_costs_per_draw;
 
 		case GSSelfReadRoad::Copy:
+		case GSSelfReadRoad::CopySplit:
 		default:
 			// Copies, but on a GPU where a copy is just a copy.
 			return !in.multidraw_fb_copy;

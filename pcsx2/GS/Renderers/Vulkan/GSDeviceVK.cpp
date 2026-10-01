@@ -4031,7 +4031,27 @@ GSSelfReadRoadDecision GSDeviceVK::ResolveSelfReadRoad()
 	road_inputs.override_texture_barriers = GSConfig.OverrideTextureBarriers;
 	// Harness-only (gsrunner -declare-feedback-loop); Off on every other run.
 	road_inputs.arm = static_cast<u8>(g_gs_measurement_overrides.self_read_arm);
+	// ssx3 GE7: the split road. Explicit GE1_ADRENO_DSTREAD=split, or AUTO (Brad sign-off) on Adreno:
+	// PCI vendor 0x5143 = Qualcomm (every Qualcomm GPU is Adreno, and Turnip reports it too), with
+	// the device name as a fallback for odd driver reports. Explicit off/copy/passbreak bypass AUTO.
+	const bool ge7_auto = GSConfig.AdrenoDstReadAuto && !GSConfig.AdrenoDstReadSplit && !GSConfig.AdrenoDstReadBreak;
+	const bool ge7_adreno = m_device_properties.vendorID == 0x5143 ||
+							std::strstr(m_device_properties.deviceName, "Adreno") != nullptr;
+	road_inputs.copy_split_requested = GSConfig.AdrenoDstReadSplit;
+	road_inputs.copy_split_auto_adreno = ge7_auto && ge7_adreno;
 	const GSSelfReadRoadDecision road = DecideSelfReadRoad(road_inputs);
+	if (ge7_auto)
+	{
+		if (road.road == GSSelfReadRoad::CopySplit)
+		{
+			GSConfig.AdrenoDstReadSplit = true;
+			std::fprintf(stderr, "GE7: dstread=split (auto: Adreno)\n");
+		}
+		else
+		{
+			std::fprintf(stderr, "GE7: dstread=off (auto: non-Adreno %s)\n", m_device_properties.deviceName);
+		}
+	}
 
 	// Before anything that can create an image, a descriptor layout or a render pass, because each
 	// of those bakes the spelling in permanently.
