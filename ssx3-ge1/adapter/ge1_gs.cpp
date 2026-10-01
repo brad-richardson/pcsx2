@@ -6,6 +6,10 @@
 #include "pcsx2/ImGui/ImGuiManager.h"
 #include "common/Console.h"
 #include "common/FileSystem.h"
+#include "common/Path.h"
+#ifdef __APPLE__
+#include <TargetConditionals.h>
+#endif
 #include "common/MemorySettingsInterface.h"
 
 #include <algorithm>
@@ -208,7 +212,19 @@ extern "C" GE1_API int ge1_gs_open(int blending_level)
             return 0;
         EmuFolders::Resources = resources;
     } else if (!EmuFolders::SetResourcesDirectory()) {
+#if defined(__APPLE__) && TARGET_OS_IPHONE
+        // CN1A: on the ARMSX2 base, pcsx2/MacOSStubs.cpp (built for iOS) answers
+        // CocoaTools::GetResourcePath() with nullopt and wins over GI1CocoaTools.mm
+        // in libPCSX2.a, so SetResourcesDirectory() looks for <app>/resources. The
+        // GI1 bundle is flat (fonts/ and default.metallib at the bundle root, which
+        // is AppRoot), so use that.
+        if (!FileSystem::DirectoryExists(Path::Combine(EmuFolders::AppRoot, "fonts").c_str()))
+            return 0;
+        EmuFolders::Resources = EmuFolders::AppRoot;
+        std::fprintf(stderr, "CN1A: resources = app bundle root (flat GI1 bundle)\n");
+#else
         return 0;
+#endif
     }
     if (const char* data = std::getenv("GE1_GS_DATA_DIR"); data && *data)
         EmuConfig.CustomDataPath = data;
