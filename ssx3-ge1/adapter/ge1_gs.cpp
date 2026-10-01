@@ -274,6 +274,27 @@ extern "C" GE1_API int ge1_gs_open(int blending_level)
     // off because sim Metal rejects fetch pipelines). Default off.
     if (const char* nofetch = std::getenv("GE1_DISABLE_FETCH"); nofetch && std::strcmp(nofetch, "1") == 0)
         config.DisableFramebufferFetch = true;
+    // GP6/BP1 on the ARMSX2 base (CN1A): ARMSX2 2.7.2 carries the GSBackQueue
+    // split (our GP6 port is their code) as a plain on/off GSOptions::BackThread;
+    // the inline/lockstep bisect rungs are gone. Unset or empty resolves to the
+    // platform default (Android pipelined, BP1 Brad sign-off; Mac/iOS off); an
+    // explicit value wins: pipelined = on, off = off, inline/lockstep = off.
+    if (const char* bt = std::getenv("GE1_BACKTHREAD"); !bt || !*bt)
+    {
+#ifdef __ANDROID__
+        config.BackThread = true;
+#endif
+    }
+    else
+    {
+        config.BackThread = std::strcmp(bt, "pipelined") == 0;
+        if (std::strcmp(bt, "inline") == 0 || std::strcmp(bt, "lockstep") == 0)
+            std::fprintf(stderr, "GP6: GE1_BACKTHREAD=%s has no ARMSX2 equivalent; back thread off\n", bt);
+    }
+    // GP2/GP3 on the ARMSX2 base: the fused vertex kick is ARMSX2's always-on
+    // kick, so GE1_VERTEX_KICK has nothing left to select.
+    if (const char* vk = std::getenv("GE1_VERTEX_KICK"); vk && *vk && std::strcmp(vk, "2") != 0)
+        std::fprintf(stderr, "GP3: GE1_VERTEX_KICK=%s ignored (ARMSX2 base: fused kick always on)\n", vk);
 #ifdef __ANDROID__
     // Odin/Adreno default: preserve destination reads through texture barriers
     // while avoiding the broken framebuffer-fetch path. The safe probe stays
