@@ -4078,6 +4078,17 @@ void GSState::FlushPrim()
 
 		// The consumer releases the node after the tail runs.
 		PushRecord(GSBackQueue::RecordType::Draw, rec);
+
+		// GS10: the executor's tail refreshes the live m_env's scissor for the
+		// draw's context (DrawRecordTail: "it may have been modified by a
+		// previous draw"). On a single object that write lands in the parse
+		// state; draw buffering is where it matters, because FlushBuffers
+		// stages buffered environments into m_env by register bytes only (and
+		// a base-only flush leaves them staged), so the derived scissor can
+		// lag its registers. The split front owns the parse env, so it applies
+		// the same pure refresh itself; the back's copy is its record's.
+		if (m_mem_target != this)
+			m_env.CTXT[PRIM->CTXT].UpdateScissor();
 	}
 	else
 	{
