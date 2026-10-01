@@ -330,16 +330,10 @@ extern "C" GE1_API int ge1_gs_open(int blending_level)
     // The Odin play env's GE1_VERTEX_KICK=2 line is inert.
 #ifdef __ANDROID__
     // Odin/Adreno default: preserve destination reads through texture barriers
-    // while avoiding the broken framebuffer-fetch path. The safe probe stays
-    // available for diagnosis; the original profile is an explicit override.
+    // while avoiding the broken framebuffer-fetch path. GE1_ADRENO_SAFE and
+    // GE1_ADRENO_ORIGINAL are gone (CU3-dead; no env/test/bench sets them).
     config.OverrideTextureBarriers = 1;
     config.DisableFramebufferFetch = true;
-    if (const char* safe = std::getenv("GE1_ADRENO_SAFE"); safe && std::strcmp(safe, "1") == 0) {
-        config.OverrideTextureBarriers = 0;
-    } else if (const char* original = std::getenv("GE1_ADRENO_ORIGINAL"); original && std::strcmp(original, "1") == 0) {
-        config.OverrideTextureBarriers = -1;
-        config.DisableFramebufferFetch = false;
-    }
 #endif
     // GE7: exact Adreno destination reads (all platforms; the Mac gate runs it).
     // Default AUTO (Brad sign-off): split on Adreno, barrier road elsewhere.
@@ -362,8 +356,7 @@ extern "C" GE1_API int ge1_gs_open(int blending_level)
             config.AdrenoDstReadSplit = true;
             std::fprintf(stderr, "GE7: dstread=split (explicit)\n");
         } else if (std::strcmp(dstread, "copy") == 0) {
-            // Same as GE1_ADRENO_SAFE on Android, but available on every platform:
-            // the single-snapshot copy road, for A/B against split.
+            // The single-snapshot copy road, for A/B against split.
             config.OverrideTextureBarriers = 0;
             std::fprintf(stderr, "GE7: dstread=copy (explicit)\n");
         } else if (std::strcmp(dstread, "passbreak") == 0) {
