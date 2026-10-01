@@ -97,6 +97,12 @@ endif()
 
 add_subdirectory(mv1-adapter EXCLUDE_FROM_ALL)
 
+# AX3b: OM1 adapters with parameterized private inputs (OM1_REC_DIR,
+# OM1_CAPTURE_INCLUDE, OM1RT_WORKTREE/OM1RT_SRC, OM1_WORKTREE). om1bench-adapter
+# stays out: its only target needs generated guest code + archived OC1 inputs.
+add_subdirectory(om1-adapter EXCLUDE_FROM_ALL)
+add_subdirectory(om1rt-adapter EXCLUDE_FROM_ALL)
+
 # SDL3 / kmsdrm frontend (handheld target)
 if(UNIX AND NOT APPLE)
 	if(ENABLE_SDL_FRONTEND)

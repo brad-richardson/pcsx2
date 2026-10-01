@@ -6,6 +6,7 @@
 #include "VUmicro.h"
 #include "common/FPControl.h"
 #include "arm64/microVU_Persist-arm64.h"
+#include "om1/om1_hooks.h"
 #include "ps2_vu1cap.h"
 #include <algorithm>
 #include <array>
@@ -198,10 +199,23 @@ static void printStats(const char* kind, unsigned long long key, CycleStats& s)
 
 int main(int argc, char** argv)
 {
-    if (argc < 2 || argc > 4) { std::fprintf(stderr, "usage: mv1_replay <VU1CAP01> [passes] [speed]\n"); return 2; }
-    const int passes = argc >= 3 ? std::atoi(argv[2]) : 1;
-    const bool speed = argc == 4 && std::strcmp(argv[3], "speed") == 0;
-    if (argc == 4 && !speed) { std::fprintf(stderr, "unknown mode: %s\n", argv[3]); return 2; }
+    // om1_record <VU1CAP01> <passes> <outdir> <tag> [speed] [--no-record]
+    if (argc < 5) { std::fprintf(stderr, "usage: om1_record <VU1CAP01> <passes> <outdir> <tag> [speed] [--no-record]\n"); return 2; }
+    const int passes = std::atoi(argv[2]);
+    const char* outdir = argv[3];
+    const char* tag = argv[4];
+    bool speed = false, record = true;
+    for (int i = 5; i < argc; ++i)
+    {
+        if (!std::strcmp(argv[i], "speed")) speed = true;
+        else if (!std::strcmp(argv[i], "--no-record")) record = false;
+        else { std::fprintf(stderr, "unknown arg: %s\n", argv[i]); return 2; }
+    }
+    if (record)
+    {
+        // Attach before Initialize so Reserve-time emission is captured too.
+        om1::Attach(1);
+    }
     if (passes < 1 || passes > 8) { std::fprintf(stderr, "passes must be 1..8\n"); return 2; }
     ps2_vu1cap::Reader reader;
     std::string err;
@@ -219,8 +233,7 @@ int main(int argc, char** argv)
     rc.vu1SignOverflow = false; rc.vu1ExactMode = false;
     EmuConfig.Speedhacks.vuThread = false;
     EmuConfig.Speedhacks.vu1Instant = false;
-    EmuConfig.Speedhacks.vuFlagHack = std::getenv("PS2X_MICROVU_FLAG_HACK") != nullptr;
-    std::fprintf(stderr, "AX3 vuFlagHack=%d\n", (int)EmuConfig.Speedhacks.vuFlagHack);
+    EmuConfig.Speedhacks.vuFlagHack = false;
     EmuConfig.Gamefixes.XgKickHack = false;
     std::fprintf(stderr, "settings: Normal clamp=1,0,0,0 FPCR=DAZ+FZ round=zero flags=full XgKickHack=off vu1Instant=off cycle_budget=65536 passes=%d mode=%s\n", passes, speed ? "speed" : "report");
     std::array<uint8_t, ps2_vu1cap::kDataSize> data{}, expected{}, prev{};
@@ -357,6 +370,20 @@ int main(int argc, char** argv)
           (unsigned long long)st.programsHydrated, (unsigned long long)st.blocksHydrated,
           (unsigned long long)st.hydrationRejects);
     }
+    int wrc = 0;
+    if (record)
+    {
+        om1::Detach();
+        std::printf("om1_rec episodes=%u blocks=%u triples=%u resets=%u codeBytes=%llu\n",
+          om1::EpisodeCount(), om1::BlockCount(), om1::TripleCount(), om1::ResetCount(),
+          om1::CodeBytes());
+        if (!om1::Write(outdir, tag))
+        {
+            std::fprintf(stderr, "om1_record: write failed\n");
+            wrc = 1;
+        }
+    }
     cleanup();
+    return wrc;
     return 0;
 }
