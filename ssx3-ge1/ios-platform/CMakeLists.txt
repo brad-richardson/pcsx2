@@ -49,15 +49,14 @@ get_git_version_info()
 write_svnrev_h()
 
 add_subdirectory("${GE1_PCSX2_ROOT}/common" "${CMAKE_BINARY_DIR}/common")
+# CN1A: ARMSX2's pcsx2/CMakeLists.txt links the header-only libretro-headers target.
+add_subdirectory("${GE1_PCSX2_ROOT}/3rdparty/libretro" "${CMAKE_BINARY_DIR}/3rdparty/libretro")
 add_subdirectory("${GE1_PCSX2_ROOT}/pcsx2" "${CMAKE_BINARY_DIR}/pcsx2")
 
-# Video capture (.mp4 dump) is unsupported on the iOS GS path: GSCapture.cpp
-# (excluded in pcsx2/CMakeLists when IOS) needs ffmpeg headers. This stub
-# keeps GS.cpp's references linked; IsCapturing() is always false.
+# CN1A: ARMSX2 2.7.2 has no GSCapture at all, so GSCaptureStub.cpp is no longer built.
 # GI1iOSStubs.cpp covers the IOKit disc sources, the curl downloader factory
 # and the Cocoa achievement chime, all excluded on iOS.
 target_sources(PCSX2 PRIVATE
-  "${CMAKE_CURRENT_SOURCE_DIR}/GSCaptureStub.cpp"
   "${CMAKE_CURRENT_SOURCE_DIR}/GI1iOSStubs.cpp"
   "${CMAKE_CURRENT_SOURCE_DIR}/GI1CocoaTools.mm")
 
