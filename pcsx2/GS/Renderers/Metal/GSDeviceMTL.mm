@@ -1449,10 +1449,15 @@ bool GSDeviceMTL::Create(GSVSyncMode vsync_mode, bool allow_present_throttle)
 		// hop to the main thread — Create runs on the GS worker while the main
 		// thread waits for it, so dispatch_sync(main) would deadlock.
 #else
-		OnMainThread([this]
+		// GE1S: the same holds for the surfaceless Mac host (GE1_RENDERER=metal):
+		// skip the layer and the main-thread hop, which deadlocked at Create.
+		if (m_window_info.type != WindowInfo::Type::Surfaceless)
 		{
-			AttachSurfaceOnMainThread();
-		});
+			OnMainThread([this]
+			{
+				AttachSurfaceOnMainThread();
+			});
+		}
 #endif
 
 		// Metal does not support mailbox.
@@ -1471,7 +1476,8 @@ bool GSDeviceMTL::Create(GSVSyncMode vsync_mode, bool allow_present_throttle)
 	// are never executed (BeginPresent early-outs for Surfaceless).
 	MTLPixelFormat layer_px_fmt = MTLPixelFormatBGRA8Unorm;
 #else
-	MTLPixelFormat layer_px_fmt = [m_layer pixelFormat];
+	// GE1S: a surfaceless Mac host has no layer (same reasoning as GI1).
+	MTLPixelFormat layer_px_fmt = m_layer ? [m_layer pixelFormat] : MTLPixelFormatBGRA8Unorm;
 #endif
 
 	m_features.broken_point_sampler = false;
