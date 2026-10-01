@@ -1069,6 +1069,13 @@ struct Pcsx2Config
 		// memory) instead of the in-pass barrier the Adreno driver mis-executes.
 		// Adapter env GE1_ADRENO_DSTREAD=passbreak, default off.
 		bool AdrenoDstReadBreak = false;
+		// CN1-C: on the GE7 split road, a draw promoted to sw blend only by the
+		// over-one blend-mix rule whose overlap is UNKNOWN takes one pre-draw RT
+		// copy (require_one_barrier, ARMSX2's own arm for GPUs without barriers)
+		// instead of the per-batch split (~2x Odin GPU on SSX 3's terrain).
+		// Adapter env GE1_ADRENO_OVERONE=split sets this and keeps the per-batch
+		// split (the exact path); default false.
+		bool AdrenoOverOneSplit = false;
 		// GE7: AUTO default (Brad sign-off): split on Adreno, barrier road
 		// elsewhere. Resolved by GSDeviceVK::CheckFeatures from the actual GPU;
 		// other backends leave it unresolved (= barrier road). Adapter env

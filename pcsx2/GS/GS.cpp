@@ -1387,6 +1387,10 @@ void GSWaitExportFence(u64 fence_counter)
 
 void GSReleaseExportAHB(AHardwareBuffer* buffer)
 {
+	// CN1-C: ReleaseExportAHB waits for GPU idle (submits the current command
+	// buffer); quiesce the back thread first, as for the export itself.
+	if (g_gs_renderer)
+		g_gs_renderer->DrainBackQueue();
 	if (g_gs_device && GSCurrentRenderer == GSRendererType::VK)
 		static_cast<GSDeviceVK*>(g_gs_device.get())->ReleaseExportAHB(buffer);
 }

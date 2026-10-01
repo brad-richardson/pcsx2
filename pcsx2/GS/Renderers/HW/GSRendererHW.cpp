@@ -8683,7 +8683,13 @@ void GSRendererHW::EmulateBlending(int rt_alpha_min, int rt_alpha_max, DATEOptio
 			// full barrier, so this only ever loosens a draw proven safe, never a doubtful one.
 			const bool promoted_by_over_one_only = blend_mix_alpha_over_one && !blend_requires_barrier &&
 			                                       !prefer_sw_blend && !free_blend && !force_sw_blending;
-			const bool promoted_safe = promoted_by_over_one_only && no_prim_overlap;
+			// CN1-C: the GE7 split road serves a full barrier with an RT copy and a pass break per
+			// batch. Unless GE1_ADRENO_OVERONE=split, an over-one-only promotion there keeps the
+			// one-snapshot read a GPU without barriers gets (the promotion already left out
+			// PRIM_OVERLAP_YES on such GPUs).
+			const bool ge7_overone_one_copy = GSConfig.AdrenoDstReadSplit && !features.feedback_loops() &&
+			                                  !GSConfig.AdrenoOverOneSplit && m_prim_overlap != PRIM_OVERLAP_YES;
+			const bool promoted_safe = promoted_by_over_one_only && (no_prim_overlap || ge7_overone_one_copy);
 
 			// No need to set a_masked bit for blend_ad_alpha_masked case
 			const bool blend_non_recursive_one_barrier = blend_non_recursive && blend_ad_alpha_masked;

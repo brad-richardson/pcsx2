@@ -1714,6 +1714,14 @@ bool GSRenderer::SaveSnapshotToMemory(u32 window_width, u32 window_height, bool 
 #ifdef __ANDROID__
 bool GSRenderer::ExportSnapshotToAHB(AHardwareBuffer* buffer, u32 width, u32 height, u64* fence_counter)
 {
+	// GP6 (dropped by the CN1-A carry, restored in CN1-C): device calls on the
+	// calling thread while ARMSX2's back thread may be mid-draw on the same
+	// command buffer. Post-vsync callers are already drained (no-op there); the
+	// latch path (PS2X_PRESENT_PER_VSYNC unset, the 60 play env) exports
+	// mid-frame, and without this drain a back-thread draw lands outside a
+	// render pass (Turnip: tu6_emit_lrz on a null subpass, SIGSEGV).
+	DrainBackQueue();
+
 	GSTexture* const current = g_gs_device->GetCurrent();
 	if (!buffer || !current || !width || !height)
 		return false;
@@ -1741,6 +1749,14 @@ bool GSRenderer::ExportSnapshotToAHB(AHardwareBuffer* buffer, u32 width, u32 hei
 #ifdef __APPLE__
 bool GSRenderer::ExportSnapshotToIOSurface(void* iosurface, u32 width, u32 height, GSExportIOSurfaceDoneFn done, void* ctx)
 {
+	// GP6 (dropped by the CN1-A carry, restored in CN1-C): device calls on the
+	// calling thread while ARMSX2's back thread may be mid-draw on the same
+	// command buffer. Post-vsync callers are already drained (no-op there); the
+	// latch path (PS2X_PRESENT_PER_VSYNC unset, the 60 play env) exports
+	// mid-frame, and without this drain a back-thread draw lands outside a
+	// render pass (Turnip: tu6_emit_lrz on a null subpass, SIGSEGV).
+	DrainBackQueue();
+
 	GSTexture* const current = g_gs_device->GetCurrent();
 	if (!iosurface || !current || !width || !height || !done)
 		return false;
