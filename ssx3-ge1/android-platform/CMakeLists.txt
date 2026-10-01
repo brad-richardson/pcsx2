@@ -10,6 +10,11 @@ set(BAKE_SHADERS_IN_CPP OFF CACHE BOOL "" FORCE)
 # looking for Shaderc::shaderc_shared (pcsx2/CMakeLists.txt). LSFG and adrenotools stay off (their
 # defaults): LSFG is never shipped, and Turnip loads through our GE1_VK_TURNIP HAL seam.
 set(ARMSX2_USE_BUNDLED_SHADERC ON CACHE BOOL "" FORCE)
+# BF2: Android GE1 release candidates (match the ARMSX2 release subset):
+# LTO on the hot EE/VU/GS core sources + local binding of intra-.so calls
+# (cf. NP1 -Bsymbolic on the runner). Output-only (GS; readback off).
+set(LTO_PCSX2_CORE ON CACHE BOOL "" FORCE)
+add_link_options(-Wl,-Bsymbolic)
 
 include(Pcsx2Utils)
 check_no_parenthesis_in_path()
