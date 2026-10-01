@@ -54,9 +54,13 @@ add_subdirectory("${GE1_PCSX2_ROOT}/3rdparty/libretro" "${CMAKE_BINARY_DIR}/3rdp
 add_subdirectory("${GE1_PCSX2_ROOT}/pcsx2" "${CMAKE_BINARY_DIR}/pcsx2")
 
 # CN1A: ARMSX2 2.7.2 has no GSCapture at all, so GSCaptureStub.cpp is no longer built.
-# GI1iOSStubs.cpp covers the IOKit disc sources, the curl downloader factory
-# and the Cocoa achievement chime, all excluded on iOS.
+# ARMSX2's AppleEmbeddedStubs.cpp (built by pcsx2/CMakeLists.txt only for its
+# libretro core) covers the IOKit disc sources, the curl downloader factory, the
+# Cocoa achievement chime and the iOS app-bridge hooks (ARMSX2_iOS*); the GS-only
+# libs have no app layer, so they take it too. GI1iOSStubs.cpp keeps the Discord
+# register stubs.
 target_sources(PCSX2 PRIVATE
+  "${GE1_PCSX2_ROOT}/pcsx2/Apple/AppleEmbeddedStubs.cpp"
   "${CMAKE_CURRENT_SOURCE_DIR}/GI1iOSStubs.cpp"
   "${CMAKE_CURRENT_SOURCE_DIR}/GI1CocoaTools.mm")
 
