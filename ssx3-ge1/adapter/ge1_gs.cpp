@@ -126,6 +126,10 @@ extern "C" GE1_API int ge1_gs_open(int blending_level)
     // GE4: Adreno sw-blend workaround (menu font static). Env-gated, default off.
     if (const char* bmix = std::getenv("GE1_ADRENO_BLEND_MIX"); bmix && std::strcmp(bmix, "1") == 0)
         config.AdrenoPreferBlendMix = true;
+    // GS10: PCSX2's per-game draw-buffering hack (GameIndex drawBuffering; SSX 3's
+    // 3-pass terrain interleave halves draws/passes, GS9). Output-only. Default off.
+    if (const char* db = std::getenv("GE1_DRAW_BUFFERING"); db && std::strcmp(db, "1") == 0)
+        config.UserHacks_DrawBuffering = true;
     // GI1: diagnostic fetch disable (matches the Simulator, which forces fetch
     // off because sim Metal rejects fetch pipelines). Default off.
     if (const char* nofetch = std::getenv("GE1_DISABLE_FETCH"); nofetch && std::strcmp(nofetch, "1") == 0)
