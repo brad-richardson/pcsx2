@@ -365,15 +365,14 @@ extern "C" GE1_API int ge1_gs_open(int blending_level)
             std::fprintf(stderr, "GE7: dstread=passbreak (explicit)\n");
         }
     }
-    // CN1-D: GE1_FEEDBACK_LOOP=1 (declared loop + our barriers) or =ordered (declared
-    // loop, driver ordering) replaces the GE7 copy/split road on a Vulkan device with
+    // CN1-D: GE1_FEEDBACK_LOOP=1 (declared loop + our barriers) replaces the
+    // GE7 copy/split road on a Vulkan device with
     // VK_EXT_attachment_feedback_loop_layout. GSDeviceVK resolves it (it owns the
     // extension list) and keeps the GE7 road where the extension is absent. Default off.
+    // The =ordered value (driver ordering) is gone: unverified on a8xx (CN1-D gap).
     if (const char* fl = std::getenv("GE1_FEEDBACK_LOOP"); fl && *fl && renderer == GSRendererType::VK) {
         if (std::strcmp(fl, "1") == 0)
             config.AdrenoFeedbackLoop = 1;
-        else if (std::strcmp(fl, "ordered") == 0)
-            config.AdrenoFeedbackLoop = 2;
     }
     // FX2: terrain glint (Cs*Ad + Cd, alpha masked) through fixed-function
     // DST_ALPHA on an RT-alpha-scaled target instead of a dst read. Output-only
