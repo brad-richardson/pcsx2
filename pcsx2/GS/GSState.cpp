@@ -4993,6 +4993,24 @@ void GSState::Transfer(const u8* mem, u32 size)
 							mem += sizeof(GIFPackedReg);
 							size--;
 						} while (path.StepReg() && size > 0 && path.reg != 0);
+
+						// The resume can end the tag or the chunk, and nothing below
+						// may run in either case. PATH2/PATH3 data can arrive split
+						// mid-tag (PATH2 in whatever pieces the VIF hands over), and
+						// PATH1 never resumes (it drops an unfinished tag at the
+						// bottom of this function).
+						// - nloop == 0: StepReg wrapped reg on the last loop, the tag
+						//   is done. The arms below would compute nloop * nreg == 0
+						//   registers of work, and the do-while arms walk 2^32
+						//   records off the packet for it. Take the next tag.
+						//   (ARMSX2 8164cefa8e.)
+						// - size == 0: the chunk ended inside the resume, with the tag
+						//   still open. The partial arm's do-while would run once
+						//   anyway, read a qword past the chunk and wrap size to
+						//   2^32 - 1. Keep the tag open in path state for the next
+						//   call. (GE9: GE1 SIGBUS on Tricky Elysium.)
+						if (path.nloop == 0 || size == 0)
+							break;
 					}
 
 					// all data available? usually is
