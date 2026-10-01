@@ -327,9 +327,8 @@ extern "C" GE1_API int ge1_gs_open(int blending_level)
             std::fprintf(stderr, "GP6: GE1_BACKTHREAD=%s has no ARMSX2 equivalent; back thread off\n", bt);
     }
     // GP2/GP3 on the ARMSX2 base: the fused vertex kick is ARMSX2's always-on
-    // kick, so GE1_VERTEX_KICK has nothing left to select.
-    if (const char* vk = std::getenv("GE1_VERTEX_KICK"); vk && *vk && std::strcmp(vk, "2") != 0)
-        std::fprintf(stderr, "GP3: GE1_VERTEX_KICK=%s ignored (ARMSX2 base: fused kick always on)\n", vk);
+    // kick. GE1_VERTEX_KICK is gone (was: =2 fused exact; =1 superseded, CU3).
+    // The Odin play env's GE1_VERTEX_KICK=2 line is inert.
 #ifdef __ANDROID__
     // Odin/Adreno default: preserve destination reads through texture barriers
     // while avoiding the broken framebuffer-fetch path. The safe probe stays
