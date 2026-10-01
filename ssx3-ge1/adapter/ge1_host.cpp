@@ -308,3 +308,30 @@ bool ge1_host_reserve_sw_code()
 	SysMemory::ReserveMemory();
 	return SysMemory::HasCodeMemory() && SysMemory::GetSWRec() != nullptr;
 }
+
+#ifdef __ANDROID__
+// CN1A: ARMSX2's JNI bridges live in its emucore native-lib.cpp, which the GE1 lib does not build
+// (there is no Java side). The core only reaches them as fallbacks (content:// opens, mkdir/fopen
+// denied on FUSE storage, pad rumble), so failing or doing nothing is the right answer here.
+#include "common/FileSystem.h"
+#include "pcsx2/Input/AndroidNativeRumble.h"
+
+int FileSystem::OpenFDFileContent(const char* filename)
+{
+	return -1;
+}
+
+bool FileSystem::CreateDirectoryViaJava(const char* path)
+{
+	return false;
+}
+
+bool FileSystem::CreateFileViaJava(const char* path)
+{
+	return false;
+}
+
+void Native::onPadRumble(int pad, int largeMotor, int smallMotor)
+{
+}
+#endif
