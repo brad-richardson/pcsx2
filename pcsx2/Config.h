@@ -1076,6 +1076,13 @@ struct Pcsx2Config
 		// Adapter env GE1_ADRENO_OVERONE=split sets this and keeps the per-batch
 		// split (the exact path); default false.
 		bool AdrenoOverOneSplit = false;
+		// CN1-D: take ARMSX2's declared-feedback-loop road (texelFetch of the live
+		// attachment in ATTACHMENT_FEEDBACK_LOOP_OPTIMAL; Turnip renders such a pass
+		// untiled) instead of the GE7 copy/split road, where the device exposes
+		// VK_EXT_attachment_feedback_loop_layout. 1 = keep our per-draw barriers
+		// (ARMSX2's a7xx road), 2 = trust the driver's ordering (no barriers; needs
+		// ARMSX2's patched Turnip). Adapter env GE1_FEEDBACK_LOOP=1|ordered; default 0.
+		u8 AdrenoFeedbackLoop = 0;
 		// GE7: AUTO default (Brad sign-off): split on Adreno, barrier road
 		// elsewhere. Resolved by GSDeviceVK::CheckFeatures from the actual GPU;
 		// other backends leave it unresolved (= barrier road). Adapter env

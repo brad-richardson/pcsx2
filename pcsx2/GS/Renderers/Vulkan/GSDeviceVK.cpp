@@ -4031,6 +4031,28 @@ GSSelfReadRoadDecision GSDeviceVK::ResolveSelfReadRoad()
 	road_inputs.override_texture_barriers = GSConfig.OverrideTextureBarriers;
 	// Harness-only (gsrunner -declare-feedback-loop); Off on every other run.
 	road_inputs.arm = static_cast<u8>(g_gs_measurement_overrides.self_read_arm);
+	// CN1-D: GE1_FEEDBACK_LOOP asks for ARMSX2's declared-loop road in place of the GE7 copy/split
+	// road (the arm a harness sets, with texture barriers allowed). The GE7 flags are cleared in
+	// GSConfig too, because GSRendererHW reads them per draw. No layout extension: GE7 stays.
+	if (GSConfig.AdrenoFeedbackLoop != 0)
+	{
+		if (m_optional_extensions.vk_ext_attachment_feedback_loop_layout)
+		{
+			road_inputs.arm = static_cast<u8>(
+				(GSConfig.AdrenoFeedbackLoop == 2) ? GSSelfReadArm::Declared : GSSelfReadArm::DeclaredKeepBarriers);
+			road_inputs.override_texture_barriers = 1;
+			GSConfig.OverrideTextureBarriers = 1;
+			GSConfig.AdrenoDstReadSplit = false;
+			GSConfig.AdrenoDstReadAuto = false;
+			GSConfig.AdrenoDstReadBreak = false;
+			std::fprintf(stderr, "CN1D: feedback_loop=%s (declared loop replaces the GE7 road)\n",
+				(GSConfig.AdrenoFeedbackLoop == 2) ? "ordered" : "barriers");
+		}
+		else
+		{
+			std::fprintf(stderr, "CN1D: feedback_loop requested, VK_EXT_attachment_feedback_loop_layout absent; GE7 road kept\n");
+		}
+	}
 	// ssx3 GE7: the split road. Explicit GE1_ADRENO_DSTREAD=split, or AUTO (Brad sign-off) on Adreno:
 	// PCI vendor 0x5143 = Qualcomm (every Qualcomm GPU is Adreno, and Turnip reports it too), with
 	// the device name as a fallback for odd driver reports. Explicit off/copy/passbreak bypass AUTO.
