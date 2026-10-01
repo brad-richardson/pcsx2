@@ -20,6 +20,8 @@
 #include <string>
 #include <vector>
 
+bool ge1_host_reserve_sw_code(); // ge1_host.cpp (CN1A)
+
 namespace {
 alignas(16) std::array<u8, 8192> s_priv{};
 std::vector<u32> s_pixels;
@@ -237,10 +239,23 @@ extern "C" GE1_API int ge1_gs_open(int blending_level)
 #else
     GSRendererType renderer = GSRendererType::VK;
 #endif
-#ifdef __APPLE__
     if (const char* want = std::getenv("GE1_RENDERER"); want && *want)
-        renderer = (std::strcmp(want, "metal") == 0) ? GSRendererType::Metal : GSRendererType::VK;
+    {
+        // CN1A: GE1_RENDERER=sw opens PCSX2's software renderer (CN2's pixel
+        // reference; it presents through the platform's preferred device, Metal
+        // on Apple, so GE1_GS_RESOURCES_DIR needs the metallibs there).
+        if (std::strcmp(want, "sw") == 0)
+            renderer = GSRendererType::SW;
+#ifdef __APPLE__
+        else
+            renderer = (std::strcmp(want, "metal") == 0) ? GSRendererType::Metal : GSRendererType::VK;
 #endif
+    }
+    if (renderer == GSRendererType::SW && !ge1_host_reserve_sw_code())
+    {
+        std::fprintf(stderr, "CN1A: SW renderer needs the SW-rec code region; SysMemory reservation failed\n");
+        return 0;
+    }
     config.Renderer = renderer;
     config.UpscaleMultiplier = 1.0f;
     config.AccurateBlendingUnit = static_cast<AccBlendLevel>(blending_level);

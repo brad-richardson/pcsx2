@@ -5,6 +5,7 @@
 #include "pcsx2/GS.h"
 #include "pcsx2/GameList.h"
 #include "pcsx2/Host.h"
+#include "pcsx2/Memory.h"
 #include "pcsx2/ImGui/FullscreenUI.h"
 #include "pcsx2/ImGui/ImGuiFullscreen.h"
 #include "pcsx2/ImGui/ImGuiManager.h"
@@ -184,11 +185,14 @@ void Host::SetFullscreen(bool enabled)
 {
 }
 
-void Host::OnCaptureStarted(const std::string& filename)
+// ARMSX2 2.7.2 achievement hooks (CN1A): no native notifications in GE1.
+bool Host::HasNativeAchievementNotifications()
 {
+	return false;
 }
 
-void Host::OnCaptureStopped()
+void Host::OnAchievementNotification(const char* key, float duration, const char* title,
+	const char* text, const char* image_path)
 {
 }
 
@@ -294,3 +298,13 @@ const char* InputManager::ConvertHostKeyboardCodeToIcon(u32 code)
 
 BEGIN_HOTKEY_LIST(g_host_hotkeys)
 END_HOTKEY_LIST()
+
+// CN1A (CN2's SW reference): GSRendererSW JITs its scanline drawers into SysMemory's SW-rec code
+// region (GSCodeReserve::ResetMemory takes SysMemory::GetSWRec()). The GE1 host never allocated
+// SysMemory, so the first SW draw faulted at SWrecOffset (CN0 §4). ReserveMemory() maps the data
+// and code arenas once (idempotent); only the SW renderer calls this, so HW opens are unchanged.
+bool ge1_host_reserve_sw_code()
+{
+	SysMemory::ReserveMemory();
+	return SysMemory::HasCodeMemory() && SysMemory::GetSWRec() != nullptr;
+}
