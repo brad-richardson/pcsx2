@@ -6995,9 +6995,19 @@ void GSDeviceVK::GE7SendSplitDraw(const GSHWDrawConfig& config, GSTextureVK* dra
 		const GSVector4i area =
 			has_bbox ? config.drawlist_bbox->at(n).rintersect(config.drawarea) : config.drawarea;
 		CopyRect(draw_rt, clone, area, area.left, area.top);
+		// CN1A fix: the copy leaves the clone in TransferDst, and BindDrawPipeline already
+		// applied the TFX descriptors with TFX_TEXTURE_RT unbound (DoRenderHW unbinds it when
+		// no single-snapshot clone was made); Draw() applies no state. So every batch sampled
+		// the null texture (dark terrain on the Mac, where ARMSX2's over-one blend promotion
+		// sends SSX 3's terrain passes here). Return the clone to ShaderReadOnly and flush the
+		// binding before each batch's draw.
+		PSSetShaderResource(2, clone, true);
+		if (config.tex_hazard == GSHWDrawConfig::TEX_HAZARD_RT)
+			PSSetShaderResource(0, clone, true);
 		OMSetRenderTargets(draw_rt, draw_ds, config.scissor,
 			static_cast<FeedbackLoopFlag>(pipe.feedback_loop_flags), rtsize);
 		BeginRenderPass(load_rp, m_current_render_pass_area);
+		ApplyTFXState();
 
 		const u32 count = config.drawlist->at(n) * indices_per_prim;
 		Draw(config, p, count);
