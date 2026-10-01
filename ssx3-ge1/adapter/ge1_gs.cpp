@@ -313,7 +313,8 @@ extern "C" GE1_API int ge1_gs_open(int blending_level)
     // split (our GP6 port is their code) as a plain on/off GSOptions::BackThread;
     // the inline/lockstep bisect rungs are gone. Unset or empty resolves to the
     // platform default (Android pipelined, BP1 Brad sign-off; Mac/iOS off); an
-    // explicit value wins: pipelined = on, off = off, inline/lockstep = off.
+    // explicit value wins: pipelined = on, off = off. The inline/lockstep
+    // bisect rungs are gone (were: off with a warning); unknown values are off.
     if (const char* bt = std::getenv("GE1_BACKTHREAD"); !bt || !*bt)
     {
 #ifdef __ANDROID__
@@ -323,8 +324,6 @@ extern "C" GE1_API int ge1_gs_open(int blending_level)
     else
     {
         config.BackThread = std::strcmp(bt, "pipelined") == 0;
-        if (std::strcmp(bt, "inline") == 0 || std::strcmp(bt, "lockstep") == 0)
-            std::fprintf(stderr, "GP6: GE1_BACKTHREAD=%s has no ARMSX2 equivalent; back thread off\n", bt);
     }
     // GP2/GP3 on the ARMSX2 base: the fused vertex kick is ARMSX2's always-on
     // kick. GE1_VERTEX_KICK is gone (was: =2 fused exact; =1 superseded, CU3).
