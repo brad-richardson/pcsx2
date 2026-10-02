@@ -79,6 +79,8 @@ namespace
 #endif
 
 #include <bit>
+#include <chrono>
+#include <cstdio>
 #include <limits>
 #include <mutex>
 #include <optional>
@@ -7908,7 +7910,10 @@ VkPipeline GSDeviceVK::CreateTFXPipeline(const PipelineSelector& p)
 	// Marked dirty after the create, not before: a precompile worker's create can straddle a flush
 	// on the GS thread, and a flag set before it would be cleared by that flush and the new entry
 	// never written.
+	const auto create_start = std::chrono::steady_clock::now();
 	VkPipeline pipeline = gpb.Create(m_device, g_vulkan_shader_cache->GetPipelineCache(false));
+	RecordTFXPipelineCreate(
+		static_cast<u64>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - create_start).count()));
 	g_vulkan_shader_cache->GetPipelineCache(true);
 	if (pipeline)
 	{
@@ -7939,6 +7944,11 @@ VkPipeline GSDeviceVK::GetTFXPipeline(const PipelineSelector& p)
 		{
 			m_tfx_pipelines.emplace(p, *precompiled);
 			RecordTFXPipelineKey(p);
+			if (m_selector_record_enabled.load(std::memory_order_relaxed))
+			{
+				std::lock_guard<std::mutex> lock(m_recorded_selectors_lock);
+				m_recorded_selectors.push_back(p);
+			}
 			return *precompiled;
 		}
 	}
@@ -7970,6 +7980,11 @@ VkPipeline GSDeviceVK::GetTFXPipeline(const PipelineSelector& p)
 	{
 		m_tfx_pipeline_compile_counter = 0;
 		g_vulkan_shader_cache->FlushPipelineCache();
+	}
+	if (m_selector_record_enabled.load(std::memory_order_relaxed))
+	{
+		std::lock_guard<std::mutex> lock(m_recorded_selectors_lock);
+		m_recorded_selectors.push_back(p);
 	}
 	return pipeline;
 }
@@ -8378,6 +8393,65 @@ void GSDeviceVK::RecordTFXPipelineKey(const PipelineSelector& p)
 		it->second.last_session = m_tfx_key_session;
 	else
 		m_recorded_tfx_keys.emplace(p, RecordedTFXKey{index, m_tfx_key_session});
+}
+
+void GSDeviceVK::RecordTFXPipelineCreate(u64 ns)
+{
+	m_tfx_pipelines_created.fetch_add(1, std::memory_order_relaxed);
+	m_tfx_pipeline_create_ns.fetch_add(ns, std::memory_order_relaxed);
+	if (ns >= 1000000)
+		m_tfx_slow_creates.fetch_add(1, std::memory_order_relaxed);
+	u64 prev = m_tfx_max_create_ns.load(std::memory_order_relaxed);
+	while (ns > prev && !m_tfx_max_create_ns.compare_exchange_weak(prev, ns, std::memory_order_relaxed))
+		;
+}
+
+void GSDeviceVK::RecordSPVCompile(u64 ns)
+{
+	m_spv_compiles.fetch_add(1, std::memory_order_relaxed);
+	m_spv_compile_ns.fetch_add(ns, std::memory_order_relaxed);
+}
+
+void GSDeviceVK::GetAndResetStallStats(u64 out[6])
+{
+	out[0] = m_tfx_slow_creates.exchange(0, std::memory_order_relaxed);
+	out[1] = m_tfx_max_create_ns.exchange(0, std::memory_order_relaxed);
+	out[2] = m_tex_upload_bytes.exchange(0, std::memory_order_relaxed);
+	out[3] = m_tex_uploads.exchange(0, std::memory_order_relaxed);
+	out[4] = m_tex_creates.exchange(0, std::memory_order_relaxed);
+	out[5] = m_tex_create_ns.exchange(0, std::memory_order_relaxed);
+}
+
+void GSDeviceVK::GetAndResetPipeStats(u64* tfx_pipelines, u64* tfx_ns, u64* spv_compiles, u64* spv_ns)
+{
+	const u64 got_tfx = m_tfx_pipelines_created.exchange(0, std::memory_order_relaxed);
+	const u64 got_tfx_ns = m_tfx_pipeline_create_ns.exchange(0, std::memory_order_relaxed);
+	const u64 got_spv = m_spv_compiles.exchange(0, std::memory_order_relaxed);
+	const u64 got_spv_ns = m_spv_compile_ns.exchange(0, std::memory_order_relaxed);
+	if (tfx_pipelines)
+		*tfx_pipelines = got_tfx;
+	if (tfx_ns)
+		*tfx_ns = got_tfx_ns;
+	if (spv_compiles)
+		*spv_compiles = got_spv;
+	if (spv_ns)
+		*spv_ns = got_spv_ns;
+}
+
+void GSDeviceVK::SetSelectorRecordEnabled(bool enabled)
+{
+	m_selector_record_enabled.store(enabled, std::memory_order_relaxed);
+}
+
+u32 GSDeviceVK::TakeRecordedSelectors(PipelineSelector* out, u32 capacity)
+{
+	if (!out || capacity == 0)
+		return 0;
+	std::lock_guard<std::mutex> lock(m_recorded_selectors_lock);
+	const u32 count = static_cast<u32>(std::min<size_t>(m_recorded_selectors.size(), capacity));
+	std::memcpy(out, m_recorded_selectors.data(), count * sizeof(PipelineSelector));
+	m_recorded_selectors.erase(m_recorded_selectors.begin(), m_recorded_selectors.begin() + count);
+	return count;
 }
 
 bool GSDeviceVK::FlushPipelineCache()
@@ -9385,6 +9459,27 @@ bool GSDeviceVK::DateCopyLive(const GSHWDrawConfig& config)
 	       m_date_copy.rt == config.rt && m_date_copy.ds == config.ds;
 }
 
+// GE7 Part 3: live counter - splits fired vs copy-road-only draws in split
+// mode. Cumulative; reported every 600 frames on stderr (logcat on Android).
+// Counting only - rendering is untouched.
+static u64 s_ge7_split_draws = 0;
+static u64 s_ge7_split_batches = 0;
+static u64 s_ge7_copy_draws = 0;
+static u64 s_ge7_nosplit_barrier = 0;
+
+static void GE7CountReport()
+{
+	static int s_ge7_last_report_frame = 0;
+	const int frame = g_perfmon.GetFrame();
+	if (frame - s_ge7_last_report_frame >= 600)
+	{
+		s_ge7_last_report_frame = frame;
+		std::fprintf(stderr, "GE7COUNT frame=%d split_draws=%llu split_batches=%llu copy_draws=%llu nosplit=%llu\n",
+			frame, (unsigned long long)s_ge7_split_draws, (unsigned long long)s_ge7_split_batches,
+			(unsigned long long)s_ge7_copy_draws, (unsigned long long)s_ge7_nosplit_barrier);
+	}
+}
+
 void GSDeviceVK::DoRenderHW(GSHWDrawConfig& config)
 {
 	// Mid-frame kick (see m_render_passes_since_submit in the header): while a
@@ -9566,6 +9661,8 @@ void GSDeviceVK::DoRenderHW(GSHWDrawConfig& config)
 	// GE7: passbreak mode orders barrier draws through pass breaks (tile store/load),
 	// keeping the barrier road's exact decisions.
 	const bool ge7_break = GSConfig.AdrenoDstReadBreak && m_features.texture_barrier;
+	// GE7 Part 3: live counter - set where the single-snapshot copy fires.
+	bool ge7_snapshot_taken = false;
 
 	// Destination Alpha Setup
 	const bool need_barrier = config.require_one_barrier ||
@@ -9704,6 +9801,9 @@ void GSDeviceVK::DoRenderHW(GSHWDrawConfig& config)
 		draw_rt_clone = static_cast<GSTextureVK*>(CreateTexture(rtsize.x, rtsize.y, 1, draw_rt->GetFormat(), true));
 		if (draw_rt_clone)
 		{
+			// GE7 Part 3: live counter - the single-snapshot copy fired.
+			if (GSConfig.AdrenoDstReadSplit)
+				ge7_snapshot_taken = true;
 			GL_PUSH("VK: Copy RT to temp texture {%d,%d %dx%d}",
 				config.drawarea.left, config.drawarea.top,
 				config.drawarea.width(), config.drawarea.height());
@@ -9970,6 +10070,22 @@ void GSDeviceVK::DoRenderHW(GSHWDrawConfig& config)
 			SendHWDraw(config, pipe.IsRTFeedbackLoop() ? draw_rt : nullptr, pipe.IsDepthFeedbackLoop() ? draw_ds : nullptr,
 				config.require_one_barrier, config.require_full_barrier);
 		}
+		// GE7 Part 3: live counter - split draws are counted inside
+		// GE7SendSplitDraw (both call sites); exactly one arm fires per
+		// dst-read draw here.
+		if (GSConfig.AdrenoDstReadSplit && !m_features.texture_barrier && !(ge7_full && draw_rt))
+		{
+			if (ge7_snapshot_taken)
+			{
+				s_ge7_copy_draws++;
+				GE7CountReport();
+			}
+			else if (config.require_one_barrier || config.require_full_barrier)
+			{
+				s_ge7_nosplit_barrier++;
+				GE7CountReport();
+			}
+		}
 	}
 
 	// blend second pass
@@ -10214,6 +10330,11 @@ void GSDeviceVK::GE7SendSplitDraw(const GSHWDrawConfig& config, GSTextureVK* dra
 		Draw(config);
 		return;
 	}
+
+	// GE7 Part 3: live counter - a per-batch split fired.
+	s_ge7_split_draws++;
+	s_ge7_split_batches += draw_list_size;
+	GE7CountReport();
 
 	// The texture-hazard sample area is read with arbitrary UVs, outside any one
 	// batch's bbox: snapshot it once up front like the D3D11 backend does.
