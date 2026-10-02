@@ -726,6 +726,7 @@ void GSreset(bool hardware_reset)
 		g_gs_renderer->DrainBackQueue();
 	}
 	g_gs_renderer->Reset(hardware_reset);
+	g_gs_renderer->ClearProbes(); // LT1b: untaken probe results (pending copies resolve or age out)
 }
 
 void GSgifSoftReset(u32 mask)
@@ -743,6 +744,32 @@ void GSInitAndReadFIFO(u8* mem, u32 size)
 	GL_PERF("Init and read FIFO %u qwc", size);
 	GSParseTarget()->InitReadFIFO(mem, size);
 	GSParseTarget()->ReadFIFO(mem, size);
+}
+
+void GSProbeRequest(u64 bitbltbuf, u64 trxpos, u64 trxreg, u64 ticket)
+{
+	GSBackQueue::ProbeRecord rec;
+	rec.blit.U64 = bitbltbuf;
+	rec.pos.U64 = trxpos;
+	rec.reg.U64 = trxreg;
+	rec.ticket = ticket;
+	GSParseTarget()->SubmitProbe(rec);
+}
+
+u32 GSProbeResolve(u64 ticket_lo, u64 ticket_hi)
+{
+	return g_gs_renderer ? g_gs_renderer->ResolveProbes(ticket_lo, ticket_hi) : 0;
+}
+
+u32 GSProbeTake(u64 ticket, u8* out, u32 bytes)
+{
+	return g_gs_renderer ? g_gs_renderer->TakeProbe(ticket, out, bytes) : 0;
+}
+
+void GSProbeStats(u64 out[8])
+{
+	for (int i = 0; i < 8; i++)
+		out[i] = g_gs_renderer ? g_gs_renderer->m_probe_stats[i] : 0;
 }
 
 void GSReadLocalMemoryUnsync(u8* mem, u32 qwc, u64 BITBLITBUF, u64 TRXPOS, u64 TRXREG)

@@ -966,6 +966,9 @@ void GSState::ExecRecordSlot(const GSBackQueue::RecordSlot& slot)
 		case RecordType::ReleasePayload:
 			ExecReleasePayloadRecord(*slot.As<ReleasePayloadRecord>());
 			break;
+		case RecordType::Probe:
+			ExecProbeRecord(*slot.As<ProbeRecord>());
+			break;
 		default:
 			ASSUME(0);
 	}
@@ -4690,6 +4693,90 @@ void GSState::InitReadFIFO(u8* mem, int len)
 
 		m_mem_target->m_mem.SaveBMP(s, m_env.BITBLTBUF.SBP, m_env.BITBLTBUF.SBW, m_env.BITBLTBUF.SPSM, r.right, r.bottom);
 	}
+}
+
+void GSState::SubmitProbe(const GSBackQueue::ProbeRecord& rec)
+{
+	GSState* const store = m_mem_target;
+	store->m_probe_stats[0]++;
+	// The probe's TRXDIR=1 packet was parsed just before this call, so m_env should already
+	// hold its registers; a mismatch means the caller's stream point is off (counted).
+	if (m_env.BITBLTBUF.SBP != rec.blit.SBP || m_env.BITBLTBUF.SBW != rec.blit.SBW ||
+		m_env.BITBLTBUF.SPSM != rec.blit.SPSM || m_env.TRXPOS.SSAX != rec.pos.SSAX ||
+		m_env.TRXPOS.SSAY != rec.pos.SSAY || m_env.TRXREG.RRW != rec.reg.RRW || m_env.TRXREG.RRH != rec.reg.RRH)
+		store->m_probe_stats[6]++;
+
+	// Same draw flush InitReadFIFO does before its readback (pending draws that touch the
+	// read rect must land first), against the probe's own registers.
+	const GIFRegBITBLTBUF saved_blit = m_env.BITBLTBUF;
+	const GIFRegTRXPOS saved_pos = m_env.TRXPOS;
+	const GIFRegTRXREG saved_reg = m_env.TRXREG;
+	m_env.BITBLTBUF = rec.blit;
+	m_env.TRXPOS = rec.pos;
+	m_env.TRXREG = rec.reg;
+	CheckWriteOverlap(false, true);
+	m_env.BITBLTBUF = saved_blit;
+	m_env.TRXPOS = saved_pos;
+	m_env.TRXREG = saved_reg;
+
+	if (m_back_records)
+		PushRecord(GSBackQueue::RecordType::Probe, rec);
+	else
+		store->ExecProbeRecord(rec);
+}
+
+void GSState::ExecProbeRecord(const GSBackQueue::ProbeRecord& rec)
+{
+	// Local memory is authoritative here (SW renderer): read the bytes now.
+	GIFRegBITBLTBUF blit = rec.blit;
+	GIFRegTRXPOS pos = rec.pos;
+	GIFRegTRXREG reg = rec.reg;
+	const int len = static_cast<int>(reg.RRW) * static_cast<int>(reg.RRH) *
+		GSLocalMemory::m_psm[blit.SPSM].trbpp / 8;
+	std::vector<u8> out(static_cast<size_t>(std::max(len, 0)));
+	if (len > 0)
+	{
+		int x = pos.SSAX, y = pos.SSAY;
+		m_mem.ReadImageX(x, y, out.data(), len, blit, pos, reg);
+	}
+	m_probe_stats[4]++;
+	StoreProbeResult(rec.ticket, std::move(out));
+}
+
+u32 GSState::ResolveProbes(u64 ticket_lo, u64 ticket_hi)
+{
+	(void)ticket_lo;
+	(void)ticket_hi;
+	return 0; // ExecProbeRecord already stored the result.
+}
+
+void GSState::StoreProbeResult(u64 ticket, std::vector<u8>&& bytes)
+{
+	const std::lock_guard lock(m_probe_mutex);
+	m_probe_results.emplace_back(ticket, std::move(bytes));
+}
+
+u32 GSState::TakeProbe(u64 ticket, u8* out, u32 bytes)
+{
+	const std::lock_guard lock(m_probe_mutex);
+	for (auto it = m_probe_results.begin(); it != m_probe_results.end(); ++it)
+	{
+		if (it->first != ticket)
+			continue;
+		const u32 n = std::min(bytes, static_cast<u32>(it->second.size()));
+		if (out && n)
+			std::memcpy(out, it->second.data(), n);
+		m_probe_results.erase(it);
+		m_probe_stats[2]++;
+		return n;
+	}
+	return 0;
+}
+
+void GSState::ClearProbes()
+{
+	const std::lock_guard lock(m_probe_mutex);
+	m_probe_results.clear();
 }
 
 // NOTE: called from outside MTGS
