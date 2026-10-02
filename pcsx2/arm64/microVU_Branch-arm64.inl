@@ -1082,6 +1082,12 @@ void mVU_XGKICK_(u32 addr)
 	{
 		gifUnit.TransferGSPacketData(GIF_TRANS_XGKICK, &vuRegs[1].Mem[addr], size, true);
 	}
+#ifdef PCSX2_RECOMPILER_TESTS
+	if (gif_test_hooks::g_path1_packet_sizes)
+		gif_test_hooks::g_path1_packet_sizes->push_back(size);
+	if (gif_test_hooks::g_path1_complete)
+		gif_test_hooks::g_path1_complete();
+#endif
 }
 
 // C helper: cycle-counted XGKICK transfer
@@ -1137,7 +1143,13 @@ void _vuXGKICKTransfermVU(bool flush)
 		VU1.xgkickdiff = 0x4000 - VU1.xgkickaddr;
 
 		if (VU1.xgkickendpacket && !VU1.xgkicksizeremaining)
+		{
+		#ifdef PCSX2_RECOMPILER_TESTS
+			if (gif_test_hooks::g_path1_complete)
+				gif_test_hooks::g_path1_complete();
+		#endif
 			VU1.xgkickenable = false;
+		}
 	}
 }
 
