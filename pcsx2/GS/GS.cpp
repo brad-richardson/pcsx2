@@ -93,6 +93,15 @@ static GSDeviceVK* GetVKDeviceForPW1()
 }
 #endif
 
+#ifdef __APPLE__
+static GSDevice* GetMTLDeviceForPW1()
+{
+	// GSDeviceMTL is ObjC++-only; GS.cpp talks to it through the
+	// GSMetalCPPAccessible.h bridge (ISH1).
+	return (GSCurrentRenderer == GSRendererType::Metal) ? g_gs_device.get() : nullptr;
+}
+#endif
+
 void GSFlushPipelineCache()
 {
 #ifdef ENABLE_VULKAN
@@ -120,11 +129,18 @@ void GSGetAndResetPipelineStats(u64* tfx_pipelines, u64* tfx_ns, u64* spv_compil
 
 u32 GSGetTFXSelectorSize()
 {
+// Renderer-specific: a binary can carry both the VK (MoltenVK) and Metal
+// paths, so size follows the live renderer, not the compile flags. Record
+// files are renderer-specific (VK 32-byte vs Metal 24-byte keys).
 #ifdef ENABLE_VULKAN
-	return static_cast<u32>(sizeof(GSDeviceVK::PipelineSelector));
-#else
-	return 0;
+	if (GetVKDeviceForPW1())
+		return static_cast<u32>(sizeof(GSDeviceVK::PipelineSelector));
 #endif
+#ifdef __APPLE__
+	if (GetMTLDeviceForPW1())
+		return MT_TFXSelectorSize();
+#endif
+	return 0;
 }
 
 void GSSetTFXSelectorRecord(bool enabled)
@@ -132,9 +148,14 @@ void GSSetTFXSelectorRecord(bool enabled)
 #ifdef ENABLE_VULKAN
 	if (GSDeviceVK* dev = GetVKDeviceForPW1())
 		dev->SetSelectorRecordEnabled(enabled);
-#else
-	(void)enabled;
+	else
 #endif
+#ifdef __APPLE__
+	if (GSDevice* dev = GetMTLDeviceForPW1())
+		MT_SetTFXSelectorRecord(dev, enabled);
+	else
+#endif
+		(void)enabled;
 }
 
 u32 GSTakeRecordedTFXSelectors(void* out, u32 capacity)
@@ -142,6 +163,10 @@ u32 GSTakeRecordedTFXSelectors(void* out, u32 capacity)
 #ifdef ENABLE_VULKAN
 	if (GSDeviceVK* dev = GetVKDeviceForPW1())
 		return dev->TakeRecordedSelectors(static_cast<GSDeviceVK::PipelineSelector*>(out), capacity);
+#endif
+#ifdef __APPLE__
+	if (GSDevice* dev = GetMTLDeviceForPW1())
+		return MT_TakeRecordedTFXSelectors(dev, out, capacity);
 #else
 	(void)out;
 	(void)capacity;
@@ -154,6 +179,12 @@ u32 GSPrewarmTFXPipelines(const void* selectors, u32 count)
 #ifdef ENABLE_VULKAN
 	if (GSDeviceVK* dev = GetVKDeviceForPW1())
 		return dev->PrewarmTFXPipelines(static_cast<const GSDeviceVK::PipelineSelector*>(selectors), count);
+#endif
+#ifdef __APPLE__
+	// ISH1: async on Metal (a background thread; returns keys scheduled, not
+	// yet built). The adapter's "prewarmed %u/%u" line reports scheduled/total.
+	if (GSDevice* dev = GetMTLDeviceForPW1())
+		return MT_PrewarmTFXPipelines(dev, selectors, count);
 #else
 	(void)selectors;
 	(void)count;

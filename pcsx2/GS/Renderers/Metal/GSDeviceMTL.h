@@ -42,8 +42,10 @@ using GSMTLView = NSView;
 #include <atomic>
 #include <memory>
 #include <mutex>
+#include <thread>
 #include <unordered_map>
 #include <utility>
+#include <vector>
 
 struct PipelineSelectorExtrasMTL
 {
@@ -314,6 +316,18 @@ public:
 	MRCOwned<id<MTLFunction>> m_hw_vs[6 << 3];
 	std::unordered_map<PSSelector, MRCOwned<id<MTLFunction>>> m_hw_ps;
 	std::unordered_map<PipelineSelectorMTL, MRCOwned<id<MTLRenderPipelineState>>> m_hw_pipeline;
+	// ISH1: async Metal TFX prewarm (GE1_TFX_PREWARM). The prewarm thread builds
+	// pipelines through BuildTFXPipeline. m_hw_cache_lock guards the two maps
+	// above (short critical sections only, so draw-path hits never wait behind a
+	// build); m_specialize_lock serializes function specialization + pipeline
+	// creation around the shared m_fn_constants. Lock order is
+	// m_specialize_lock -> m_hw_cache_lock, never the reverse.
+	std::mutex m_hw_cache_lock;
+	std::mutex m_specialize_lock;
+	std::atomic<bool> m_selector_record_enabled{false};
+	std::mutex m_recorded_selectors_lock;
+	std::vector<PipelineSelectorMTL> m_recorded_selectors;
+	std::thread m_prewarm_thread;
 
 	MRCOwned<MTLRenderPassDescriptor*> m_render_pass_desc[16];
 	MRCOwned<MTLRenderPassDescriptor*> m_full_rov_render_pass_desc;
@@ -517,6 +531,17 @@ public:
 
 	// MARK: Main Render Encoder operations
 	void MRESetHWPipelineState(GSHWDrawConfig::VSSelector vs, GSHWDrawConfig::PSSelector ps, GSHWDrawConfig::BlendState blend, GSHWDrawConfig::ColorMaskSelector cms);
+	/// Builds (or finds) the HW TFX pipeline for `sel`, inserting it into
+	/// m_hw_pipeline. Thread-safe: also runs on the prewarm thread. A draw that
+	/// misses while the prewarm thread builds the same key waits for that one
+	/// build or builds it inline; it never blocks on the whole prewarm list.
+	MRCOwned<id<MTLRenderPipelineState>> BuildTFXPipeline(const PipelineSelectorMTL& sel);
+	// ISH1: PW1 record/prewarm entry points (mirror the VK family). The record
+	// format is the raw 24-byte PipelineSelectorMTL key (MT_TFXSelectorSize),
+	// which already carries the PSSelector + pipeline bytes.
+	void SetSelectorRecordEnabled(bool enabled);
+	u32 TakeRecordedSelectors(PipelineSelectorMTL* out, u32 capacity);
+	u32 PrewarmTFXPipelines(const PipelineSelectorMTL* sels, u32 count);
 	void MRESetDSS(DepthStencilSelector sel);
 	void MRESetDSS(id<MTLDepthStencilState> dss);
 	void MRESetSampler(SamplerSelector sel);
