@@ -95,6 +95,15 @@ else()
 	add_subdirectory(pcsx2-vurunner EXCLUDE_FROM_ALL)
 endif()
 
+# AX4b (SG12): OM1 adapters with parameterized private inputs (OM1_REC_DIR,
+# OM1_CAPTURE_INCLUDE, OM1RT_WORKTREE/OM1RT_SRC, OM1_WORKTREE). Optional: a
+# plain configure without -DOM1_CAPTURE_INCLUDE skips them (no fatal error).
+# om1bench-adapter stays out: its only target needs generated guest code.
+if(DEFINED OM1_CAPTURE_INCLUDE)
+	add_subdirectory(om1-adapter EXCLUDE_FROM_ALL)
+	add_subdirectory(om1rt-adapter EXCLUDE_FROM_ALL)
+endif()
+
 # SDL3 / kmsdrm frontend (handheld target)
 if(UNIX AND NOT APPLE)
 	if(ENABLE_SDL_FRONTEND)

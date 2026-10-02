@@ -497,7 +497,7 @@ void mVUinit(microVU& mVU, uint vuIndex)
 // run, and at exit to restore the EE's FPCR.
 static void mVUemitLoadFPCR(const u64* addr)
 {
-	armAsm->Ldr(a64::x8, reinterpret_cast<u64>(addr)); // literal-pool load
+	armLoadImmAddr(a64::x8, addr); // literal-pool load (canonical under OM1)
 	armAsm->Ldr(a64::x9, a64::MemOperand(a64::x8));
 	armAsm->Msr(a64::FPCR, a64::x9);
 }
@@ -581,18 +581,18 @@ static void mVUdispatcherAB(mV)
 	// VE-03: all three pins come from the stub's literal pool (1 insn each)
 	// instead of movz/movk chains (3 each) — this stub is regenerated per
 	// process, so baking the addresses as data is safe.
-	armAsm->Ldr(gprVUState, reinterpret_cast<u64>(&mVU.regs()));
+	armLoadImmAddr(gprVUState, &mVU.regs());
 
 	// Pin gprMVUFlag (x24) = &mVU.macFlag[0]. Reaches statFlag / macFlag /
 	// clipFlag / neonCTemp / neonBackup via signed [+/-imm12] (see
 	// microVU_Misc-arm64.h). Lets every flag-touching FMAC drop the 3-insn
 	// abs-addr materialization down to a single ldr/str.
-	armAsm->Ldr(gprMVUFlag, reinterpret_cast<u64>(&mVU.macFlag[0]));
+	armLoadImmAddr(gprMVUFlag, &mVU.macFlag[0]);
 
 	// Pin gprMVUglob (x25) = &mVUglob. Every clamp / FTOI / ITOF / EATAN /
 	// SQRT et al. constant load goes via [gprMVUglob, #imm12] instead of
 	// materializing the global's absolute address.
-	armAsm->Ldr(gprMVUglob, reinterpret_cast<u64>(&mVUglob));
+	armLoadImmAddr(gprMVUglob, &mVUglob);
 
 	// Load VU-specific FPCR (round-toward-zero + FZ/DaZ) — only when needed.
 	// PS2 VU float ops require this rounding mode; the gating skips the
@@ -726,7 +726,7 @@ static void mVUdispatcherAB(mV)
 		"inline bounds check expects x86ptr/x86start/x86end adjacent");
 	static_assert(offsetof(microProgManager, x86end)   == offsetof(microProgManager, x86ptr) + 16,
 		"inline bounds check expects x86ptr/x86start/x86end adjacent");
-	armAsm->Ldr(a64::x8, reinterpret_cast<u64>(&mVU.prog.x86ptr)); // literal-pool load
+	armLoadImmAddr(a64::x8, &mVU.prog.x86ptr); // literal-pool load (canonical under OM1)
 	armAsm->Ldr(a64::x9,  a64::MemOperand(a64::x8));            // x86ptr
 	armAsm->Ldr(a64::x10, a64::MemOperand(a64::x8, 8));         // x86start
 	armAsm->Cmp(a64::x9, a64::x10);
@@ -751,7 +751,7 @@ static void mVUdispatcherAB(mV)
 	//
 	// VU1+THREAD_VU1 skips the math entirely — MTVU runs the dispatcher on
 	// the VU1 thread, where touching cpuRegs.cycle is wrong (matches C++).
-	armAsm->Ldr(a64::x8, reinterpret_cast<u64>(&EmuConfig.Speedhacks.EECycleSkip)); // literal
+	armLoadImmAddr(a64::x8, &EmuConfig.Speedhacks.EECycleSkip); // literal (canonical under OM1)
 	armAsm->Ldrb(a64::w11, a64::MemOperand(a64::x8));
 	armAsm->Cbz(a64::w11, &eeSkipDone);                         // EECycleSkip == 0 → skip
 
@@ -847,7 +847,7 @@ static void mVUdispatcherAB(mV)
 	// generation time instead.)
 	pxAssert(reinterpret_cast<const u8*>(&mVU.cycles) ==
 			 reinterpret_cast<const u8*>(&mVU.totalCycles) + 4);
-	armAsm->Ldr(a64::x8, reinterpret_cast<u64>(&mVU.totalCycles)); // literal-pool load
+	armLoadImmAddr(a64::x8, &mVU.totalCycles); // literal-pool load (canonical under OM1)
 	armAsm->Stp(a64::w1, a64::w1, a64::MemOperand(a64::x8));
 
 	armAsm->B(&gotHostEntry);
@@ -1196,7 +1196,14 @@ void mVUreset(microVU& mVU, bool resetReserve)
 	// unreachable (SM8650 OutRun 2006 core dumps, 2026-07-02).
 	const size_t cacheCapacity =
 		static_cast<size_t>(mVU.prog.x86end - mVU.cache) + (mVUcacheSafeZone * _1mb);
+	if (om1::CodegenForbidden()) // OM1 offline consumer: never compile
+	{
+		std::fprintf(stderr, "[om1] FATAL: mVUreset in no-codegen mode\n");
+		std::abort();
+	}
+	om1::OnReset(mVU.index); // OM1: generation bump (no-op unless recording)
 	armSetAsmPtr(mVU.cache, cacheCapacity, nullptr);
+	om1::EpisodeBegin(mVU.index, mVU.cache); // OM1: dispatcher/stub episode
 
 	mVUdispatcherAB(mVU);
 	mVUdispatcherCD(mVU);
@@ -1205,6 +1212,7 @@ void mVUreset(microVU& mVU, bool resetReserve)
 	mVUGenerateEndProgramFlagsHelper(mVU);
 	mVUGenerateCycleBreak(mVU);
 	mVUGenerateModelStubs(mVU);
+	om1::EpisodeEnd(mVU.index, armGetAsmPtr()); // OM1: end dispatcher episode
 
 	mVU.regs().nextBlockCycles = 0;
 	memset(&mVU.prog.lpState, 0, sizeof(mVU.prog.lpState));
@@ -2517,3 +2525,8 @@ bool SaveStateBase::vuJITFreeze()
 	Freeze(microVU1.prog.lpState);
 	return IsOkay();
 }
+
+//------------------------------------------------------------------
+// OM1 route-a capture recorder — same single-TU inclusion pattern.
+//------------------------------------------------------------------
+#include "microVU_OM1-arm64.inl"
