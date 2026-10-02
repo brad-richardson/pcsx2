@@ -2981,7 +2981,6 @@ bool GSDeviceVK::AllocatePreinitializedGPUBuffer(u32 size, VkBuffer* gpu_buffer,
 	return true;
 }
 
-
 std::vector<GSAdapterInfo> GSDeviceVK::GetAdapterInfo()
 {
 	GPUList gpus = EnumerateGPUs();
@@ -4071,7 +4070,49 @@ GSSelfReadRoadDecision GSDeviceVK::ResolveSelfReadRoad()
 	road_inputs.override_texture_barriers = GSConfig.OverrideTextureBarriers;
 	// Harness-only (gsrunner -declare-feedback-loop); Off on every other run.
 	road_inputs.arm = static_cast<u8>(g_gs_measurement_overrides.self_read_arm);
+	// CN1-D: GE1_FEEDBACK_LOOP asks for ARMSX2's declared-loop road in place of the GE7 copy/split
+	// road (the arm a harness sets, with texture barriers allowed). The GE7 flags are cleared in
+	// GSConfig too, because GSRendererHW reads them per draw. No layout extension: GE7 stays.
+	if (GSConfig.AdrenoFeedbackLoop != 0)
+	{
+		if (m_optional_extensions.vk_ext_attachment_feedback_loop_layout)
+		{
+			road_inputs.arm = static_cast<u8>(
+				(GSConfig.AdrenoFeedbackLoop == 2) ? GSSelfReadArm::Declared : GSSelfReadArm::DeclaredKeepBarriers);
+			road_inputs.override_texture_barriers = 1;
+			GSConfig.OverrideTextureBarriers = 1;
+			GSConfig.AdrenoDstReadSplit = false;
+			GSConfig.AdrenoDstReadAuto = false;
+			GSConfig.AdrenoDstReadBreak = false;
+			std::fprintf(stderr, "CN1D: feedback_loop=%s (declared loop replaces the GE7 road)\n",
+				(GSConfig.AdrenoFeedbackLoop == 2) ? "ordered" : "barriers");
+		}
+		else
+		{
+			std::fprintf(stderr, "CN1D: feedback_loop requested, VK_EXT_attachment_feedback_loop_layout absent; GE7 road kept\n");
+		}
+	}
+	// ssx3 GE7: the split road. Explicit GE1_ADRENO_DSTREAD=split, or AUTO (Brad sign-off) on Adreno:
+	// PCI vendor 0x5143 = Qualcomm (every Qualcomm GPU is Adreno, and Turnip reports it too), with
+	// the device name as a fallback for odd driver reports. Explicit off/copy/passbreak bypass AUTO.
+	const bool ge7_auto = GSConfig.AdrenoDstReadAuto && !GSConfig.AdrenoDstReadSplit && !GSConfig.AdrenoDstReadBreak;
+	const bool ge7_adreno = m_device_properties.vendorID == 0x5143 ||
+							std::strstr(m_device_properties.deviceName, "Adreno") != nullptr;
+	road_inputs.copy_split_requested = GSConfig.AdrenoDstReadSplit;
+	road_inputs.copy_split_auto_adreno = ge7_auto && ge7_adreno;
 	const GSSelfReadRoadDecision road = DecideSelfReadRoad(road_inputs);
+	if (ge7_auto)
+	{
+		if (road.road == GSSelfReadRoad::CopySplit)
+		{
+			GSConfig.AdrenoDstReadSplit = true;
+			std::fprintf(stderr, "GE7: dstread=split (auto: Adreno)\n");
+		}
+		else
+		{
+			std::fprintf(stderr, "GE7: dstread=off (auto: non-Adreno %s)\n", m_device_properties.deviceName);
+		}
+	}
 
 	// Before anything that can create an image, a descriptor layout or a render pass, because each
 	// of those bakes the spelling in permanently.
@@ -6607,7 +6648,6 @@ bool GSDeviceVK::CompilePresentPipelines()
 
 	return true;
 }
-
 
 bool GSDeviceVK::CompileInterlacePipelines()
 {
@@ -9194,7 +9234,6 @@ bool GSDeviceVK::ApplyUtilityState(bool already_execed)
 		}
 	}
 
-
 	ApplyBaseState(flags, cmdbuf);
 	return true;
 }
@@ -9520,8 +9559,18 @@ void GSDeviceVK::DoRenderHW(GSHWDrawConfig& config)
 		}
 	}
 
+	// GE7: split mode serves an overlapping draw per primitive batch with a fresh RT
+	// copy each (the D3D11 multidraw_fb_copy servicing). A batch is internally
+	// non-overlapping, so every batch blending against the accumulated result is exact.
+	const bool ge7_full = GSConfig.AdrenoDstReadSplit && !m_features.texture_barrier &&
+	                      config.require_full_barrier && config.drawlist && !config.drawlist->empty();
+	// GE7: passbreak mode orders barrier draws through pass breaks (tile store/load),
+	// keeping the barrier road's exact decisions.
+	const bool ge7_break = GSConfig.AdrenoDstReadBreak && m_features.texture_barrier;
+
 	// Destination Alpha Setup
-	const bool need_barrier = config.require_one_barrier || (config.require_full_barrier && m_features.texture_barrier);
+	const bool need_barrier = config.require_one_barrier ||
+	                          (config.require_full_barrier && (m_features.texture_barrier || ge7_full));
 	switch (config.destination_alpha)
 	{
 		case GSHWDrawConfig::DestinationAlphaMode::Off: // No setup
@@ -9650,7 +9699,7 @@ void GSDeviceVK::DoRenderHW(GSHWDrawConfig& config)
 		}
 	}
 
-	if (draw_rt && config.road.clone_rt)
+	if (draw_rt && config.road.clone_rt && !ge7_full)
 	{
 		// Requires a copy of the RT.
 		draw_rt_clone = static_cast<GSTextureVK*>(CreateTexture(rtsize.x, rtsize.y, 1, draw_rt->GetFormat(), true));
@@ -9736,6 +9785,29 @@ void GSDeviceVK::DoRenderHW(GSHWDrawConfig& config)
 
 	OMSetRenderTargets(draw_rt, draw_ds, config.scissor, static_cast<FeedbackLoopFlag>(pipe.feedback_loop_flags), rtsize);
 
+	// GE7: StencilOne DATE draws in passbreak mode need a stencil-storing render pass
+	// from the very first begin: the TFX table never stores stencil, so the first
+	// break's End would discard the stencil clear. Force a fresh begin for them.
+	const bool ge7_keep_stencil = ge7_break &&
+	                              config.destination_alpha == GSHWDrawConfig::DestinationAlphaMode::StencilOne &&
+	                              pipe.ds && m_features.stencil_buffer;
+	auto ge7_stencil_rp = [&](VkAttachmentLoadOp rt_load, VkAttachmentLoadOp ds_load,
+	                          VkAttachmentLoadOp stencil_load) {
+		const VkFormat rrt = !pipe.rt ? VK_FORMAT_UNDEFINED :
+		                     (pipe.ps.colclip_hw ? LookupNativeFormat(GSTexture::Format::ColorClip) :
+		                                           LookupNativeFormat(GSTexture::Format::Color));
+		const VkFormat rds = !pipe.ds ? VK_FORMAT_UNDEFINED : LookupNativeFormat(GSTexture::Format::DepthStencil);
+		return GetRenderPass(rrt, rds,
+			rrt != VK_FORMAT_UNDEFINED ? rt_load : VK_ATTACHMENT_LOAD_OP_DONT_CARE,
+			rrt != VK_FORMAT_UNDEFINED ? VK_ATTACHMENT_STORE_OP_STORE : VK_ATTACHMENT_STORE_OP_DONT_CARE,
+			rds != VK_FORMAT_UNDEFINED ? ds_load : VK_ATTACHMENT_LOAD_OP_DONT_CARE,
+			rds != VK_FORMAT_UNDEFINED ? VK_ATTACHMENT_STORE_OP_STORE : VK_ATTACHMENT_STORE_OP_DONT_CARE,
+			stencil_load, VK_ATTACHMENT_STORE_OP_STORE, pipe.IsRTFeedbackLoop(),
+			pipe.IsTestingAndSamplingDepth());
+	};
+	if (ge7_keep_stencil && InRenderPass())
+		EndRenderPass();
+
 	// Begin render pass if new target or out of the area.
 	if (!InRenderPass())
 	{
@@ -9748,9 +9820,11 @@ void GSDeviceVK::DoRenderHW(GSHWDrawConfig& config)
 			rt_op = VK_ATTACHMENT_LOAD_OP_LOAD;
 		if (pipe.IsDepthFeedbackLoop() && ds_op == VK_ATTACHMENT_LOAD_OP_DONT_CARE)
 			ds_op = VK_ATTACHMENT_LOAD_OP_LOAD;
-		const VkRenderPass rp = GetTFXRenderPass(pipe.rt, pipe.ds, pipe.ps.colclip_hw,
-			config.destination_alpha == GSHWDrawConfig::DestinationAlphaMode::Stencil, pipe.IsRTFeedbackLoop(),
-			pipe.IsTestingAndSamplingDepth(), rt_op, ds_op);
+		const VkRenderPass rp = ge7_keep_stencil ?
+			ge7_stencil_rp(rt_op, ds_op, VK_ATTACHMENT_LOAD_OP_DONT_CARE) :
+			GetTFXRenderPass(pipe.rt, pipe.ds, pipe.ps.colclip_hw,
+				config.destination_alpha == GSHWDrawConfig::DestinationAlphaMode::Stencil, pipe.IsRTFeedbackLoop(),
+				pipe.IsTestingAndSamplingDepth(), rt_op, ds_op);
 		const bool is_clearing_rt = (rt_op == VK_ATTACHMENT_LOAD_OP_CLEAR || ds_op == VK_ATTACHMENT_LOAD_OP_CLEAR);
 
 		// Only draw to the active area of the colclip hw target. Except when depth is cleared, we need to use the full
@@ -9828,6 +9902,31 @@ void GSDeviceVK::DoRenderHW(GSHWDrawConfig& config)
 	if (!date_image || colclip_rt)
 		UploadHWDrawVerticesAndIndices(config);
 
+	// GE7: passbreak mode re-begins the pass between batches. The refresh render pass
+	// matches the open one but with LOAD ops. Stencil must also be stored and
+	// loaded: StencilOne DATE draws clear stencil once and then test (and zero) it
+	// across batches, and the TFX table never stores stencil. Hoisted here because
+	// the alpha pass mutates pipe.ps; both passes refresh with the open pass's key.
+	const bool ge7_need_refresh = ge7_break && (config.require_one_barrier || config.require_full_barrier ||
+	                                            config.alpha_second_pass.require_one_barrier ||
+	                                            config.alpha_second_pass.require_full_barrier);
+	VkRenderPass ge7_refresh_rp = VK_NULL_HANDLE;
+	if (ge7_need_refresh)
+	{
+		if (ge7_keep_stencil)
+		{
+			ge7_refresh_rp = ge7_stencil_rp(VK_ATTACHMENT_LOAD_OP_LOAD, VK_ATTACHMENT_LOAD_OP_LOAD,
+				VK_ATTACHMENT_LOAD_OP_LOAD);
+		}
+		else
+		{
+			ge7_refresh_rp = GetTFXRenderPass(pipe.rt, pipe.ds, pipe.ps.colclip_hw,
+				config.destination_alpha == GSHWDrawConfig::DestinationAlphaMode::Stencil,
+				pipe.IsRTFeedbackLoop(), pipe.IsTestingAndSamplingDepth(), VK_ATTACHMENT_LOAD_OP_LOAD,
+				VK_ATTACHMENT_LOAD_OP_LOAD);
+		}
+	}
+
 	// now we can do the actual draw
 	if (config.colormask.logic_op != GSAlphaBitLogicOp::Off)
 	{
@@ -9860,9 +9959,18 @@ void GSDeviceVK::DoRenderHW(GSHWDrawConfig& config)
 	}
 	else if (BindDrawPipeline(pipe))
 	{
-		DeclareDrawFeedbackLoop(config, pipe);
-		SendHWDraw(config, pipe.IsRTFeedbackLoop() ? draw_rt : nullptr, pipe.IsDepthFeedbackLoop() ? draw_ds : nullptr,
-			config.require_one_barrier, config.require_full_barrier);
+		if (ge7_full && draw_rt)
+			GE7SendSplitDraw(config, draw_rt, draw_ds, rtsize);
+		else if (ge7_break && (config.require_one_barrier || config.require_full_barrier))
+			GE7SendBreakDraw(config, pipe.IsRTFeedbackLoop() ? draw_rt : nullptr,
+				pipe.IsDepthFeedbackLoop() ? draw_ds : nullptr, config.require_one_barrier,
+				config.require_full_barrier, ge7_refresh_rp);
+		else
+		{
+			DeclareDrawFeedbackLoop(config, pipe);
+			SendHWDraw(config, pipe.IsRTFeedbackLoop() ? draw_rt : nullptr, pipe.IsDepthFeedbackLoop() ? draw_ds : nullptr,
+				config.require_one_barrier, config.require_full_barrier);
+		}
 	}
 
 	// blend second pass
@@ -9897,9 +10005,23 @@ void GSDeviceVK::DoRenderHW(GSHWDrawConfig& config)
 		pipe.bs = config.blend;
 		if (BindDrawPipeline(pipe))
 		{
-			DeclareDrawFeedbackLoop(config, pipe);
-			SendHWDraw(config, pipe.IsRTFeedbackLoop() ? draw_rt : nullptr, pipe.IsDepthFeedbackLoop() ? draw_ds : nullptr,
-				config.alpha_second_pass.require_one_barrier, config.alpha_second_pass.require_full_barrier);
+			const bool ge7_alpha_split = GSConfig.AdrenoDstReadSplit && !m_features.texture_barrier &&
+			                             config.alpha_second_pass.require_full_barrier && config.drawlist &&
+			                             !config.drawlist->empty() && draw_rt != nullptr;
+			if (ge7_alpha_split)
+				GE7SendSplitDraw(config, draw_rt, draw_ds, rtsize);
+			else if (ge7_break && (config.alpha_second_pass.require_one_barrier ||
+			                       config.alpha_second_pass.require_full_barrier))
+				GE7SendBreakDraw(config, pipe.IsRTFeedbackLoop() ? draw_rt : nullptr,
+					pipe.IsDepthFeedbackLoop() ? draw_ds : nullptr, config.alpha_second_pass.require_one_barrier,
+					config.alpha_second_pass.require_full_barrier, ge7_refresh_rp);
+			else
+			{
+				DeclareDrawFeedbackLoop(config, pipe);
+				SendHWDraw(config, pipe.IsRTFeedbackLoop() ? draw_rt : nullptr,
+					pipe.IsDepthFeedbackLoop() ? draw_ds : nullptr, config.alpha_second_pass.require_one_barrier,
+					config.alpha_second_pass.require_full_barrier);
+			}
 		}
 	}
 
@@ -10074,6 +10196,125 @@ void GSDeviceVK::DeclareDrawFeedbackLoop(const GSHWDrawConfig& config, const Pip
 		vkCmdSetAttachmentFeedbackLoopEnableEXT(GetCurrentCommandBuffer(), writes.values[i]);
 	if (aspects != 0)
 		m_loop_declared_in_pass = true;
+}
+
+void GSDeviceVK::GE7SendSplitDraw(const GSHWDrawConfig& config, GSTextureVK* draw_rt, GSTextureVK* draw_ds,
+	const GSVector2i& rtsize)
+{
+	// Mirror of the D3D11 multidraw_fb_copy servicing: each non-overlapping
+	// primitive batch reads a fresh RT copy holding all earlier batches' writes.
+	// Callers guarantee split mode, no texture barriers, a non-empty drawlist, and draw_rt.
+	const u32 indices_per_prim = config.indices_per_prim;
+	const u32 draw_list_size = static_cast<u32>(config.drawlist->size());
+	const bool has_bbox = config.drawlist_bbox && config.drawlist_bbox->size() == draw_list_size;
+
+	GSTextureVK* clone = static_cast<GSTextureVK*>(CreateTexture(rtsize.x, rtsize.y, 1, draw_rt->GetFormat(), true));
+	if (!clone)
+	{
+		Console.Warning("VK: GE7 failed to allocate split-draw RT clone; drawing unsplit.");
+		Draw(config);
+		return;
+	}
+
+	// The texture-hazard sample area is read with arbitrary UVs, outside any one
+	// batch's bbox: snapshot it once up front like the D3D11 backend does.
+	if (config.tex_hazard == GSHWDrawConfig::TEX_HAZARD_RT)
+		CopyRect(draw_rt, clone, config.samplearea, config.samplearea.left, config.samplearea.top);
+
+	PSSetShaderResource(2, clone, true);
+	if (config.tex_hazard == GSHWDrawConfig::TEX_HAZARD_RT)
+		PSSetShaderResource(0, clone, true);
+
+	// LOAD pass matching the open one (same targets and flags); the original
+	// pass's clear/discard load ops must not re-run between batches.
+	const PipelineSelector& pipe = m_pipeline_selector;
+	const VkRenderPass load_rp = GetTFXRenderPass(pipe.rt, pipe.ds, pipe.ps.colclip_hw,
+		config.destination_alpha == GSHWDrawConfig::DestinationAlphaMode::Stencil, pipe.IsRTFeedbackLoop(),
+		pipe.IsTestingAndSamplingDepth(), VK_ATTACHMENT_LOAD_OP_LOAD, VK_ATTACHMENT_LOAD_OP_LOAD);
+
+	for (u32 n = 0, p = 0; n < draw_list_size; n++)
+	{
+		const GSVector4i area =
+			has_bbox ? config.drawlist_bbox->at(n).rintersect(config.drawarea) : config.drawarea;
+		CopyRect(draw_rt, clone, area, area.left, area.top);
+		// CN1A fix: the copy leaves the clone in TransferDst, and BindDrawPipeline already
+		// applied the TFX descriptors with TFX_TEXTURE_RT unbound (DoRenderHW unbinds it when
+		// no single-snapshot clone was made); Draw() applies no state. So every batch sampled
+		// the null texture (dark terrain on the Mac, where ARMSX2's over-one blend promotion
+		// sends SSX 3's terrain passes here). Return the clone to ShaderReadOnly and flush the
+		// binding before each batch's draw.
+		PSSetShaderResource(2, clone, true);
+		if (config.tex_hazard == GSHWDrawConfig::TEX_HAZARD_RT)
+			PSSetShaderResource(0, clone, true);
+		OMSetRenderTargets(draw_rt, draw_ds, config.scissor,
+			static_cast<FeedbackLoopFlag>(pipe.feedback_loop_flags), rtsize);
+		BeginRenderPass(load_rp, m_current_render_pass_area);
+		ApplyTFXState();
+
+		const u32 count = config.drawlist->at(n) * indices_per_prim;
+		Draw(config, p, count);
+		p += count;
+	}
+
+	Recycle(clone);
+}
+
+void GSDeviceVK::GE7SendBreakDraw(const GSHWDrawConfig& config, GSTextureVK* draw_rt, GSTextureVK* draw_ds,
+	bool one_barrier, bool full_barrier, VkRenderPass refresh_rp)
+{
+	if (!one_barrier && !full_barrier)
+	{
+		Draw(config);
+		return;
+	}
+
+	VkDependencyFlags barrier_flags = GetFeedbackBarrierDependencyFlags();
+	std::array<VkImageMemoryBarrier, 2> barriers;
+	if (draw_rt)
+		barriers[0] = GetColorBufferFeedbackBarrier(draw_rt);
+	if (draw_ds)
+		barriers[1] = GetDepthStencilBufferFeedbackBarrier(draw_ds);
+
+	// Order each batch through a tile store/load pass break (real memory) AND the
+	// usual in-pass barrier: the break syncs tile memory the barrier cannot reach,
+	// the barrier invalidates caches the break does not.
+	const auto BreakAndBarrier = [&]() {
+		EndRenderPass();
+		BeginRenderPass(refresh_rp, m_current_render_pass_area);
+		if (draw_rt)
+		{
+			vkCmdPipelineBarrier(GetCurrentCommandBuffer(), VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
+				VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, barrier_flags, 0, nullptr, 0, nullptr, 1, &barriers[0]);
+		}
+		if (draw_ds)
+		{
+			vkCmdPipelineBarrier(GetCurrentCommandBuffer(),
+				VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT | VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT,
+				VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, barrier_flags, 0, nullptr, 0, nullptr, 1, &barriers[1]);
+		}
+	};
+
+	if (full_barrier)
+	{
+		pxAssert(config.drawlist && !config.drawlist->empty());
+
+		const u32 indices_per_prim = config.indices_per_prim;
+		const u32 draw_list_size = static_cast<u32>(config.drawlist->size());
+
+		for (u32 n = 0, p = 0; n < draw_list_size; n++)
+		{
+			BreakAndBarrier();
+
+			const u32 count = config.drawlist->at(n) * indices_per_prim;
+			Draw(config, p, count);
+			p += count;
+		}
+
+		return;
+	}
+
+	BreakAndBarrier();
+	Draw(config);
 }
 
 void GSDeviceVK::SendHWDraw(const GSHWDrawConfig& config, GSTextureVK* draw_rt, GSTextureVK* draw_ds,

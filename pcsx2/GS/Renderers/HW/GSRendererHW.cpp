@@ -25,6 +25,8 @@
 #include "common/StringUtil.h"
 #include <bit>
 #include <limits>
+#include <cstdio>
+#include <cstdlib>
 
 using PS_ATST  = GSShader::PS_ATST;
 using PS_AFAIL = GSShader::PS_AFAIL;
@@ -7108,6 +7110,11 @@ void GSRendererHW::DetermineVSConfig(GSTextureCache::Target* rt, float rtscale, 
 void GSRendererHW::DetermineBarriers(GSTextureCache::Target* rt, GSTextureCache::Source* tex)
 {
 	const GSDevice::FeatureSupport& features = g_gs_device->Features();
+	// GE7: split mode keeps the full-barrier decision on the copy road. The Vulkan
+	// backend serves each non-overlapping primitive batch with a fresh RT copy (the
+	// D3D11 multidraw_fb_copy servicing), which is exact where a single pre-draw
+	// snapshot is not: overlapping primitives within one draw.
+	const bool split = GSConfig.AdrenoDstReadSplit && !features.feedback_loops();
 
 	if (features.framebuffer_fetch)
 	{
@@ -7138,23 +7145,32 @@ void GSRendererHW::DetermineBarriers(GSTextureCache::Target* rt, GSTextureCache:
 	pxAssert(!m_conf.require_full_barrier || !m_conf.ps.colclip_hw);
 
 	// Swap full barrier for one barrier when there's no overlap, or a shuffle.
-	if (features.feedback_loops() && m_conf.require_full_barrier && (m_prim_overlap == PRIM_OVERLAP_NO || m_conf.ps.shuffle || m_channel_shuffle))
+	if ((features.feedback_loops() || split) && m_conf.require_full_barrier && (m_prim_overlap == PRIM_OVERLAP_NO || m_conf.ps.shuffle || m_channel_shuffle))
 	{
 		m_conf.require_full_barrier = false;
 		m_conf.require_one_barrier = true;
 	}
-	else if (!features.feedback_loops())
+	else if (split && m_conf.require_full_barrier &&
+	         (m_conf.ps.IsFeedbackLoopDepth() || m_conf.alpha_second_pass.ps.IsFeedbackLoopDepth()))
+	{
+		// Depth reads on the copy road come from a pre-draw depth-as-RT snapshot,
+		// which per-batch RT copies do not refresh: stay on the single copy.
+		m_conf.require_full_barrier = false;
+		m_conf.require_one_barrier = true;
+	}
+	else if (!features.feedback_loops() && !split)
 	{
 		// These shouldn't be enabled if texture barriers aren't supported, make sure they are off.
 		m_conf.require_full_barrier = false;
 	}
 
-	if (m_conf.require_full_barrier && features.feedback_loops())
+	if (m_conf.require_full_barrier && (features.feedback_loops() || split))
 	{
 		ComputeDrawlistGetSize(rt->m_scale);
 		m_conf.drawlist = &m_drawlist;
 		m_conf.drawlist_bbox = &m_drawlist_bbox;
 	}
+
 }
 
 void GSRendererHW::EmulateDither()
@@ -7642,7 +7658,8 @@ void GSRendererHW::EmulateTextureShuffleAndFbmask(GSTextureCache::Target* rt, GS
 			   have been invalidated before subsequent Draws are executed.
 			 */
 			// No blending so hit unsafe path.
-			if (!PRIM->ABE || !(~ff_fbmask & ~zero_fbmask & 0x7) || !features.feedback_loops())
+			// GE7: split mode takes the full-barrier decision (served per-batch by copies).
+			if (!PRIM->ABE || !(~ff_fbmask & ~zero_fbmask & 0x7) || !(features.feedback_loops() || GSConfig.AdrenoDstReadSplit))
 			{
 				GL_INS("HW: FBMASK Unsafe SW emulated fb_mask:%x on %d bits format", m_cached_ctx.FRAME.FBMSK,
 					(m_conf.ps.dst_fmt == GSLocalMemory::PSM_FMT_16) ? 16 : 32);
@@ -8760,13 +8777,19 @@ void GSRendererHW::EmulateBlending(int rt_alpha_min, int rt_alpha_max, DATEOptio
 			// full barrier, so this only ever loosens a draw proven safe, never a doubtful one.
 			const bool promoted_by_over_one_only = blend_mix_alpha_over_one && !blend_requires_barrier &&
 			                                       !prefer_sw_blend && !free_blend && !force_sw_blending;
-			const bool promoted_safe = promoted_by_over_one_only && no_prim_overlap;
+			// CN1-C: the GE7 split road serves a full barrier with an RT copy and a pass break per
+			// batch. Unless GE1_ADRENO_OVERONE=split, an over-one-only promotion there keeps the
+			// one-snapshot read a GPU without barriers gets (the promotion already left out
+			// PRIM_OVERLAP_YES on such GPUs).
+			const bool ge7_overone_one_copy = GSConfig.AdrenoDstReadSplit && !features.feedback_loops() &&
+			                                  !GSConfig.AdrenoOverOneSplit && m_prim_overlap != PRIM_OVERLAP_YES;
+			const bool promoted_safe = promoted_by_over_one_only && (no_prim_overlap || ge7_overone_one_copy);
 
 			// No need to set a_masked bit for blend_ad_alpha_masked case
 			const bool blend_non_recursive_one_barrier = blend_non_recursive && blend_ad_alpha_masked;
 			if (blend_non_recursive_one_barrier)
 				m_conf.require_one_barrier |= true;
-			else if (features.feedback_loops() && !promoted_safe)
+			else if ((features.feedback_loops() || GSConfig.AdrenoDstReadSplit) && !promoted_safe)
 				m_conf.require_full_barrier |= !blend_non_recursive;
 			else
 				m_conf.require_one_barrier |= !blend_non_recursive;
@@ -9952,7 +9975,8 @@ __ri void GSRendererHW::HandleTextureHazards(const GSTextureCache::Target* rt, c
 		if (rt && m_conf.tex == m_conf.rt)
 		{
 			m_conf.tex_hazard = GSHWDrawConfig::TEX_HAZARD_RT;
-			if (m_prim_overlap == PRIM_OVERLAP_NO || src_empty || m_channel_shuffle || !g_gs_device->Features().feedback_loops())
+			// GE7: split mode takes the full-barrier decision (served per-batch by copies).
+			if (m_prim_overlap == PRIM_OVERLAP_NO || src_empty || m_channel_shuffle || !(g_gs_device->Features().feedback_loops() || GSConfig.AdrenoDstReadSplit))
 				m_conf.require_one_barrier = true;
 			else
 				m_conf.require_full_barrier = true;
@@ -12890,7 +12914,8 @@ std::size_t GSRendererHW::ComputeDrawlistGetSize(float scale)
 {
 	if (m_drawlist.empty())
 	{
-		const bool save_bbox = !g_gs_device->Features().texture_barrier && g_gs_device->Features().multidraw_fb_copy;
+		const bool save_bbox = !g_gs_device->Features().texture_barrier &&
+		                       (g_gs_device->Features().multidraw_fb_copy || GSConfig.AdrenoDstReadSplit);
 		GetPrimitiveOverlapDrawlist(true, save_bbox, scale);
 	}
 	return m_drawlist.size();
