@@ -8389,6 +8389,11 @@ void GSDeviceVK::GetAndResetStallStats(u64 out[6])
 	out[5] = m_tex_create_ns.exchange(0, std::memory_order_relaxed);
 }
 
+bool GSDeviceVK::FlushPipelineCache()
+{
+	return g_vulkan_shader_cache ? g_vulkan_shader_cache->FlushPipelineCache() : false;
+}
+
 void GSDeviceVK::GetAndResetPipeStats(u64* tfx_pipelines, u64* tfx_ns, u64* spv_compiles, u64* spv_ns)
 {
 	const u64 got_tfx = m_tfx_pipelines_created.exchange(0, std::memory_order_relaxed);
@@ -8419,11 +8424,6 @@ u32 GSDeviceVK::TakeRecordedSelectors(PipelineSelector* out, u32 capacity)
 	std::memcpy(out, m_recorded_selectors.data(), count * sizeof(PipelineSelector));
 	m_recorded_selectors.erase(m_recorded_selectors.begin(), m_recorded_selectors.begin() + count);
 	return count;
-}
-
-bool GSDeviceVK::FlushPipelineCache()
-{
-	return g_vulkan_shader_cache ? g_vulkan_shader_cache->FlushPipelineCache() : false;
 }
 
 u32 GSDeviceVK::PrewarmTFXPipelines(const PipelineSelector* sels, u32 count)
