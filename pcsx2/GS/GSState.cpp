@@ -5177,6 +5177,16 @@ void GSState::Transfer(const u8* mem, u32 size)
 						// hackfix), so a PATH1 tag never resumes across calls.
 						if (path.nloop == 0)
 							break;
+
+						// The chunk can also end inside the resume, mid-record or on
+						// a record boundary with loops still to come (PATH2 data
+						// arrives in whatever pieces the VIF hands over). Then size
+						// is 0 with the tag still open, and the partial arm below
+						// would run once anyway -- its do-while reads a qword past
+						// the chunk and wraps size to 2^32 - 1. Keep the tag open in
+						// path state for the next call instead.
+						if (size == 0)
+							break;
 					}
 
 					// all data available? usually is
