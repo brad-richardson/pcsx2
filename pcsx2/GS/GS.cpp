@@ -101,18 +101,6 @@ void GSFlushPipelineCache()
 #endif
 }
 
-u32 GSPrewarmTFXPipelines(const void* selectors, u32 count)
-{
-#ifdef ENABLE_VULKAN
-	if (GSDeviceVK* dev = GetVKDeviceForPW1())
-		return dev->PrewarmTFXPipelines(static_cast<const GSDeviceVK::PipelineSelector*>(selectors), count);
-#else
-	(void)selectors;
-	(void)count;
-#endif
-	return 0;
-}
-
 void GSGetAndResetPipelineStats(u64* tfx_pipelines, u64* tfx_ns, u64* spv_compiles, u64* spv_ns)
 {
 	u64 got_tfx = 0, got_tfx_ns = 0, got_spv = 0, got_spv_ns = 0;
@@ -157,6 +145,18 @@ u32 GSTakeRecordedTFXSelectors(void* out, u32 capacity)
 #else
 	(void)out;
 	(void)capacity;
+#endif
+	return 0;
+}
+
+u32 GSPrewarmTFXPipelines(const void* selectors, u32 count)
+{
+#ifdef ENABLE_VULKAN
+	if (GSDeviceVK* dev = GetVKDeviceForPW1())
+		return dev->PrewarmTFXPipelines(static_cast<const GSDeviceVK::PipelineSelector*>(selectors), count);
+#else
+	(void)selectors;
+	(void)count;
 #endif
 	return 0;
 }
@@ -1443,6 +1443,7 @@ void GSReleaseExportIOSurface(void* iosurface)
 		MT_ReleaseExportIOSurface(g_gs_device.get(), iosurface);
 }
 #endif
+
 #ifdef _WIN32
 
 void* GSAllocateWrappedMemory(size_t size, size_t repeat)

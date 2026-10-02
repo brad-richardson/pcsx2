@@ -4112,6 +4112,7 @@ void GSState::FlushPrim()
 
 		// The consumer releases the node after the tail runs.
 		PushRecord(GSBackQueue::RecordType::Draw, rec);
+
 		// GSC_IRem clears SCANMSK in the parse environment at the start of the draw, and on a
 		// single object that clear lasts until the game writes SCANMSK again. On the split the
 		// hook clears the back's installed copy, which the next record overwrites, so repeat it
