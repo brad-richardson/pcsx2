@@ -91,6 +91,9 @@ public:
 
 	bool SaveSnapshotToMemory(u32 window_width, u32 window_height, bool apply_aspect, bool crop_borders,
 		u32* width, u32* height, std::vector<u32>* pixels);
+#ifdef __APPLE__
+	bool ExportSnapshotToIOSurface(void* iosurface, u32 width, u32 height, GSExportIOSurfaceDoneFn done, void* ctx);
+#endif
 
 	// False if a snapshot is already queued and this request was dropped.
 	bool QueueSnapshot(const std::string& path, const u32 gsdump_frames);
