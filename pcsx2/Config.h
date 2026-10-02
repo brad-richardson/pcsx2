@@ -1057,6 +1057,15 @@ struct Pcsx2Config
 		GSBilinearDirtyMode UserHacks_BilinearHack = GSBilinearDirtyMode::Automatic;
 		TriFiltering TriFilter = DEFAULT_TRILINEAR_FILTERING_MODE;
 		s8 OverrideTextureBarriers = -1;
+		/// UR1: GE1 export-path output filters (the snapshot/AHB/IOSurface
+		/// exports, which do GE1's final scale). ExportCAS sharpens the frame
+		/// with PCSX2's CAS (sharpen-only, CAS_Sharpness) before the scale;
+		/// ExportSharpBilinear nearest-prescales to the smallest integer
+		/// multiple covering the output, then bilinear-downsamples (PCSX2's
+		/// "Bilinear (Sharp)"). Adapter env GE1_CAS / PS2X_PRESENT_FILTER=sharp.
+		/// Not persisted.
+		bool ExportCAS = false;
+		bool ExportSharpBilinear = false;
 		GSDepthFeedbackMode DepthFeedbackMode = GSDepthFeedbackMode::Auto;
 		/// GS multi-threading: a front thread parses GIF data while a back thread draws. The setting,
 		/// as the user or the game database asked for it; stored as the integer "GSBackThreadMode",
