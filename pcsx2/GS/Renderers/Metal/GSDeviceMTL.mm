@@ -2640,6 +2640,16 @@ MRCOwned<id<MTLRenderPipelineState>> GSDeviceMTL::BuildTFXPipeline(const Pipelin
 	[pdesc setDepthAttachmentPixelFormat:extras.has_depth ? MTLPixelFormatDepth32Float_Stencil8 : MTLPixelFormatInvalid];
 	[pdesc setStencilAttachmentPixelFormat:extras.has_stencil ? MTLPixelFormatDepth32Float_Stencil8 : MTLPixelFormatInvalid];
 	color.writeMask = extras.writemask;
+	// ISH1: blend effectiveness from the recorded extras (bit-exact with the
+	// old blend.IsEffective(cms): writemask carries cms's wr/wg/wb/wa bits).
+	GSHWDrawConfig::BlendState blend_state;
+	blend_state.enable = extras.blend_enable;
+	blend_state.src_factor = extras.src_factor;
+	blend_state.dst_factor = extras.dst_factor;
+	blend_state.src_factor_alpha = extras.src_factor_alpha;
+	blend_state.dst_factor_alpha = extras.dst_factor_alpha;
+	GSHWDrawConfig::ColorMaskSelector cms;
+	cms.key = extras.writemask;
 	if (primid_tracking_init)
 	{
 		color.blendingEnabled = YES;
@@ -2648,7 +2658,7 @@ MRCOwned<id<MTLRenderPipelineState>> GSDeviceMTL::BuildTFXPipeline(const Pipelin
 		color.destinationRGBBlendFactor = MTLBlendFactorOne;
 		color.writeMask = MTLColorWriteMaskRed;
 	}
-	else if (blend.IsEffective(cms))
+	else if (blend_state.IsEffective(cms))
 	{
 		color.blendingEnabled = YES;
 		color.rgbBlendOperation = ConvertBlendOp(extras.blend_op);
