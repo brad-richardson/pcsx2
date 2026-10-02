@@ -879,6 +879,10 @@ public:
 	void EnableExtendedStats(bool enabled) override;
 	std::vector<std::string> GetExtendedStats() const override;
 
+	// PW1: pipeline-cache pre-warm surface for the GE1 adapter. GS thread only.
+	bool FlushPipelineCache();
+	u32 PrewarmTFXPipelines(const PipelineSelector* sels, u32 count);
+
 	void PushDebugGroup(const char* fmt, ...) override;
 	void PopDebugGroup() override;
 	void PushDrawLabel(const std::string_view label) override;
