@@ -4,6 +4,7 @@
 #include "ReadbackSpinManager.h"
 
 #include <algorithm>
+#include <cstdlib> // OM1 iOS: SDK headers lack the transitive include
 
 static bool EventIsReadback(const ReadbackSpinManager::Event& event)
 {
