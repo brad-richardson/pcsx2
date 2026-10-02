@@ -2648,6 +2648,63 @@ TEST(GsKickKernel, TagFinishedByTheMidRecordResumeIsNotDispatched)
 	}
 }
 
+// A packet split mid-tag, where a chunk ends before the tag does.
+//
+// PATH2 data reaches Transfer in whatever pieces the VIF hands over (DIRECT /
+// DIRECTHL), so a chunk can end anywhere inside a PACKED tag: in the middle of
+// a record, or on a record boundary with loops still to come. The resume loop
+// then stops with size == 0 and nloop > 0, and nothing below it may run: the
+// partial arm is `do { ...; size--; } while (path.StepReg() && size > 0)`,
+// whose first pass would read a qword past the chunk and wrap size to 2^32 - 1,
+// walking off the end of the packet. The tag stays open in path state for the
+// next call, which is what the GIF does with a packet that arrives in pieces.
+//
+// Fed one, two and three qwords per call, every layout and a plain A+D tag in
+// between, and compared against the same packet in one call.
+TEST(GsKickKernel, ChunkEndingInsideTheResumeKeepsTheTagOpen)
+{
+	u32 seed = 9950;
+	const LayoutCase* cases[] = {&kNopTriple40, &kNopTriple52, &kPairSTQ, &kPairUV, &kPairRGBAQ, &kUvTriple};
+	for (const LayoutCase* lc : cases)
+	{
+		for (u32 prim : {GS_TRIANGLESTRIP, GS_SPRITE})
+		{
+			for (bool fuse : {false, true})
+			{
+				if (fuse && !KickProbe::LayoutShipsForDyn(lc->layout, prim))
+					continue;
+
+				const std::vector<VertexSpec> verts = MakeStream(9, AdcPattern::None, seed++);
+				const std::vector<GIFPackedReg> packet = BuildPacket(*lc, verts, 4, true);
+				const u32 qwords = static_cast<u32>(packet.size());
+
+				for (u32 chunk : {1u, 2u, 3u})
+				{
+					SCOPED_TRACE(::testing::Message()
+					             << lc->name << " prim=" << prim << " fuse=" << fuse << " chunk=" << chunk);
+
+					const DrawBufferingGuard guard(false);
+					const AutoFlushGuard af_guard(GSHWAutoFlushLevel::Disabled);
+
+					auto run = [&](u32 step) {
+						auto p = MakeProbe(KickSetup{}, prim, true);
+						SeedLatchedState(*p);
+						if (!fuse)
+							p->UnpublishLayoutHandlers();
+						for (u32 at = 0; at < qwords; at += step)
+							p->FeedPacketPath3(packet.data() + at, std::min(step, qwords - at));
+						return p;
+					};
+
+					auto whole = run(qwords);
+					auto split = run(chunk);
+					ExpectSameKickResult(*whole, *split);
+				}
+			}
+		}
+	}
+}
+
 TEST(GsKickKernel, LayoutsMatchThroughTransfer)
 {
 	u32 seed = 9700;
