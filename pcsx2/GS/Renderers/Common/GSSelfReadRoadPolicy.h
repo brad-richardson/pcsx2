@@ -77,6 +77,11 @@ enum class GSSelfReadRoad : u8
 	InPassBarrier,
 	/// Read the live attachment; the driver orders it and no barrier is emitted.
 	InPassOrdered,
+	/// ssx3 GE7: the Copy road, plus overlapping full-barrier draws split into non-overlapping
+	/// primitive batches with a fresh copy of the target between them (the D3D11
+	/// multidraw_fb_copy servicing, GSDeviceVK::GE7SendSplitDraw). Exact where one pre-draw
+	/// snapshot is not. Publishes the same bits as Copy (no texture barriers, no in-tile read).
+	CopySplit,
 };
 
 enum class GSSelfReadSpelling : u8
@@ -142,6 +147,14 @@ struct GSSelfReadRoadInputs
 
 	/// GSMeasurementOverrides::self_read_arm, as GSSelfReadArm. Off on every run but a harness's.
 	u8 arm = static_cast<u8>(GSSelfReadArm::Off);
+
+	/// ssx3 GE7: GE1_ADRENO_DSTREAD=split (GSConfig.AdrenoDstReadSplit set by the GE1 adapter).
+	bool copy_split_requested = false;
+
+	/// ssx3 GE7 AUTO (Brad sign-off): GE1_ADRENO_DSTREAD unset/auto (GSConfig.AdrenoDstReadAuto)
+	/// on an Adreno part (PCI vendor 0x5143, or "Adreno" in the device name; Turnip reports
+	/// both). Exactly where the pre-ARMSX2 GE1 lib's AUTO picked split.
+	bool copy_split_auto_adreno = false;
 };
 
 struct GSSelfReadRoadDecision
@@ -207,6 +220,15 @@ struct GSSelfReadRoadDecision
 constexpr GSSelfReadRoadDecision DecideSelfReadRoad(const GSSelfReadRoadInputs& in)
 {
 	GSSelfReadRoadDecision d;
+
+	// ssx3 GE7: the split road outranks every other entrance, as the GE1 AUTO did (it forced texture
+	// barriers off on any Adreno, whatever the driver). Off unless the GE1 adapter asks for it.
+	if (in.copy_split_requested || in.copy_split_auto_adreno)
+	{
+		d.road = GSSelfReadRoad::CopySplit;
+		d.spelling = GSSelfReadSpelling::Clone;
+		return d;
+	}
 
 	const bool arm_requested = (in.arm != static_cast<u8>(GSSelfReadArm::Off));
 	// An explicit OverrideTextureBarriers=0 wins over the arm and the driver facts: it is the way
@@ -278,7 +300,8 @@ constexpr GSSelfReadRoadDecision DecideSelfReadRoad(const GSSelfReadRoadInputs& 
 constexpr GSSelfReadRoad GSSelfReadRoadFromPublishedBits(
 	bool in_tile_read, bool texture_barrier, bool declared_loop_orders_overlap)
 {
-	// No in-pass read is legal at all: the target is cloned per feedback draw.
+	// No in-pass read is legal at all: the target is cloned per feedback draw. (CopySplit publishes
+	// the same bits; its per-batch copies are invisible here, and it costs at least what Copy does.)
 	if (!texture_barrier)
 		return GSSelfReadRoad::Copy;
 
@@ -330,6 +353,8 @@ constexpr const char* GSSelfReadRoadName(const GSSelfReadRoadDecision& d)
 	{
 		case GSSelfReadRoad::Copy:
 			return "copy (clone the target per feedback draw)";
+		case GSSelfReadRoad::CopySplit:
+			return "copy, overlapping draws split per primitive batch (ssx3 GE7)";
 		case GSSelfReadRoad::InPassBarrier:
 			if (d.spelling != GSSelfReadSpelling::FeedbackLoopLayout)
 				return "in-pass, barrier-ordered, input attachment";
@@ -349,6 +374,19 @@ constexpr const char* GSSelfReadRoadName(const GSSelfReadRoadDecision& d)
 			           "in-pass, driver-ordered, declared feedback loop (experiment key)";
 	}
 }
+
+// --- ssx3 GE7 split road. ------------------------------------------------------------------------
+static_assert(DecideSelfReadRoad({.copy_split_auto_adreno = true}).road == GSSelfReadRoad::CopySplit);
+static_assert(DecideSelfReadRoad({.copy_split_requested = true}).road == GSSelfReadRoad::CopySplit);
+// Outranks the driver facts and the arm, and never declares a loop or reads in tile.
+static_assert(!DecideSelfReadRoad({.in_tile_read_available = true, .layout_road_available = true,
+					.roaa_available = true, .driver_orders_declared_loop = true,
+					.arm = static_cast<u8>(GSSelfReadArm::Declared), .copy_split_auto_adreno = true})
+				   .texture_barrier);
+static_assert(!DecideSelfReadRoad({.in_tile_read_available = true, .layout_road_available = true,
+					.roaa_available = true, .driver_orders_declared_loop = true, .copy_split_auto_adreno = true})
+				   .loop_declared);
+static_assert(GSSelfReadRoadFromPublishedBits(false, false, false) == GSSelfReadRoad::Copy);
 
 // --- The arm off, on every device shape we ship to. ---------------------------------------------
 //

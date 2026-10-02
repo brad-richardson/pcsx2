@@ -1045,6 +1045,10 @@ struct Pcsx2Config
 		GSBilinearDirtyMode UserHacks_BilinearHack = GSBilinearDirtyMode::Automatic;
 		TriFiltering TriFilter = DEFAULT_TRILINEAR_FILTERING_MODE;
 		s8 OverrideTextureBarriers = -1;
+		// GE4: Adreno workaround. Non-overlapping sw-blend draws read dst through a
+		// single feedback-loop barrier chunk, which returns garbage on Adreno 830
+		// (menu font static). Prefer the hw blend-mix path for mixable equations.
+		bool AdrenoPreferBlendMix = false;
 		/// UR1: GE1 export-path output filters (the snapshot/AHB/IOSurface
 		/// exports, which do GE1's final scale). ExportCAS sharpens the frame
 		/// with PCSX2's CAS (sharpen-only, CAS_Sharpness) before the scale;
@@ -1054,6 +1058,38 @@ struct Pcsx2Config
 		/// Not persisted.
 		bool ExportCAS = false;
 		bool ExportSharpBilinear = false;
+		// GE7: exact destination reads on Adreno. Copy road (no in-pass reads,
+		// which return garbage on Adreno 830) plus splitting overlapping sw-blend
+		// draws into non-overlapping batches with a fresh RT copy between them
+		// (mirrors the D3D11 multidraw_fb_copy servicing). Adapter env
+		// GE1_ADRENO_DSTREAD=split, default off.
+		bool AdrenoDstReadSplit = false;
+		// GE7: keep the barrier road's decisions (sw blending everywhere) but order
+		// each dst-read draw/group through a tile store/load pass break (real
+		// memory) instead of the in-pass barrier the Adreno driver mis-executes.
+		// Adapter env GE1_ADRENO_DSTREAD=passbreak, default off.
+		bool AdrenoDstReadBreak = false;
+		// CN1-C: on the GE7 split road, a draw promoted to sw blend only by the
+		// over-one blend-mix rule whose overlap is UNKNOWN takes one pre-draw RT
+		// copy (require_one_barrier, ARMSX2's own arm for GPUs without barriers)
+		// instead of the per-batch split (~2x Odin GPU on SSX 3's terrain).
+		// Adapter env GE1_ADRENO_OVERONE=split sets this and keeps the per-batch
+		// split (the exact path); default false.
+		bool AdrenoOverOneSplit = false;
+		// CN1-D: take ARMSX2's declared-feedback-loop road (texelFetch of the live
+		// attachment in ATTACHMENT_FEEDBACK_LOOP_OPTIMAL; Turnip renders such a pass
+		// untiled) instead of the GE7 copy/split road, where the device exposes
+		// VK_EXT_attachment_feedback_loop_layout. 1 = keep our per-draw barriers
+		// (ARMSX2's a7xx road), 2 = trust the driver's ordering (no barriers; needs
+		// ARMSX2's patched Turnip). Adapter env GE1_FEEDBACK_LOOP=1|ordered; default 0.
+		u8 AdrenoFeedbackLoop = 0;
+		// GE7: AUTO default (Brad sign-off): split on Adreno, barrier road
+		// elsewhere. Resolved by GSDeviceVK::CheckFeatures from the actual GPU;
+		// other backends leave it unresolved (= barrier road). Adapter env
+		// GE1_ADRENO_DSTREAD unset/empty/auto; explicit off/split/copy/passbreak
+		// bypass it. Default false: upstream PCSX2 without the adapter is
+		// unaffected.
+		bool AdrenoDstReadAuto = false;
 		GSDepthFeedbackMode DepthFeedbackMode = GSDepthFeedbackMode::Auto;
 		/// GS multi-threading: a front thread parses GIF data while a back thread draws. The setting,
 		/// as the user or the game database asked for it; stored as the integer "GSBackThreadMode",
