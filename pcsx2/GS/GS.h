@@ -129,6 +129,8 @@ bool GSHasDisplayWindow();
 void GSResizeDisplayWindow(u32 width, u32 height, float scale);
 void GSUpdateDisplayWindow();
 void GSSetVSyncMode(GSVSyncMode mode, bool allow_present_throttle);
+// GE1 offline replay timing hook; keeps the adapter on the GS.h surface.
+float GSGetAndResetAccumulatedGPUTime();
 
 GSRendererType GSGetCurrentRenderer();
 bool GSIsHardwareRenderer();
@@ -159,6 +161,14 @@ void GSUpdateConfig(const Pcsx2Config::GSOptions& new_config);
 void GSSetSoftwareRendering(bool software_renderer, GSInterlaceMode new_interlace);
 bool GSSaveSnapshotToMemory(u32 window_width, u32 window_height, bool apply_aspect, bool crop_borders,
 	u32* width, u32* height, std::vector<u32>* pixels);
+#ifdef __ANDROID__
+struct AHardwareBuffer;
+// GE1 Android platform seam: copy the composed GS image into an imported AHB.
+// 1=exported, 0=no composed frame yet, -1=export failed.
+int GSExportSnapshotToAHB(AHardwareBuffer* buffer, u32 width, u32 height, u64* fence_counter);
+void GSWaitExportFence(u64 fence_counter);
+void GSReleaseExportAHB(AHardwareBuffer* buffer);
+#endif
 #ifdef __APPLE__
 // GI1 iOS platform seam: GPU copy of the composed GS image into an
 // IOSurface-backed sink (BGRA). 1=export queued (done(ctx, ok) then fires
