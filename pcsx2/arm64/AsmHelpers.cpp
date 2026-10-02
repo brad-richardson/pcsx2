@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: GPL-3.0
 
 #include "arm64/AsmHelpers.h"
+#include "../../om1/om1_hooks.h" // OM1: Active() gate for canonical call sites
 
 #include "common/Assertions.h"
 #include "common/BitUtils.h"
@@ -263,10 +264,27 @@ void armEmitJmp(const void* ptr, bool force_inline)
 
 	if (use_blr)
 	{
-		if (armAddressRecorder)
-			armAddressRecorder->OnAbsoluteTarget(ptr);
-		armAsm->Mov(RXVIXLSCRATCH, reinterpret_cast<uintptr_t>(ptr));
-		armAsm->Br(RXVIXLSCRATCH);
+		if (armAddressRecorder && om1::Active())
+		{
+			// OM1 capture: fixed-width canonical form with a reported site.
+			const u64 v = reinterpret_cast<uintptr_t>(ptr);
+			{
+				vixl::ExactAssemblyScope guard(armAsm, 16);
+				armAsm->movz(RXVIXLSCRATCH, v & 0xFFFF, 0);
+				armAsm->movk(RXVIXLSCRATCH, (v >> 16) & 0xFFFF, 16);
+				armAsm->movk(RXVIXLSCRATCH, (v >> 32) & 0xFFFF, 32);
+				armAsm->movk(RXVIXLSCRATCH, (v >> 48) & 0xFFFF, 48);
+			}
+			armAddressRecorder->OnAbsoluteCallSite(armGetCurrentCodePointer() - 16, ptr, false);
+			armAsm->Br(RXVIXLSCRATCH);
+		}
+		else
+		{
+			if (armAddressRecorder)
+				armAddressRecorder->OnAbsoluteTarget(ptr);
+			armAsm->Mov(RXVIXLSCRATCH, reinterpret_cast<uintptr_t>(ptr));
+			armAsm->Br(RXVIXLSCRATCH);
+		}
 	}
 	else
 	{
@@ -311,10 +329,27 @@ void armEmitCall(const void* ptr, bool force_inline)
 
 	if (use_blr)
 	{
-		if (armAddressRecorder)
-			armAddressRecorder->OnAbsoluteTarget(ptr);
-		armAsm->Mov(RXVIXLSCRATCH, reinterpret_cast<uintptr_t>(ptr));
-		armAsm->Blr(RXVIXLSCRATCH);
+		if (armAddressRecorder && om1::Active())
+		{
+			// OM1 capture: fixed-width canonical form with a reported site.
+			const u64 v = reinterpret_cast<uintptr_t>(ptr);
+			{
+				vixl::ExactAssemblyScope guard(armAsm, 16);
+				armAsm->movz(RXVIXLSCRATCH, v & 0xFFFF, 0);
+				armAsm->movk(RXVIXLSCRATCH, (v >> 16) & 0xFFFF, 16);
+				armAsm->movk(RXVIXLSCRATCH, (v >> 32) & 0xFFFF, 32);
+				armAsm->movk(RXVIXLSCRATCH, (v >> 48) & 0xFFFF, 48);
+			}
+			armAddressRecorder->OnAbsoluteCallSite(armGetCurrentCodePointer() - 16, ptr, true);
+			armAsm->Blr(RXVIXLSCRATCH);
+		}
+		else
+		{
+			if (armAddressRecorder)
+				armAddressRecorder->OnAbsoluteTarget(ptr);
+			armAsm->Mov(RXVIXLSCRATCH, reinterpret_cast<uintptr_t>(ptr));
+			armAsm->Blr(RXVIXLSCRATCH);
+		}
 	}
 	else
 	{
@@ -325,6 +360,14 @@ void armEmitCall(const void* ptr, bool force_inline)
 		if (armAddressRecorder)
 			armAddressRecorder->OnDirectBranch(armGetCurrentCodePointer() - 4, ptr, true);
 	}
+}
+
+void armLoadImmAddr(const vixl::aarch64::Register& reg, const void* addr)
+{
+	if (om1::Active())
+		armMoveAddressToReg(reg, addr); // canonical + reported to the recorder
+	else
+		armAsm->Ldr(reg, reinterpret_cast<u64>(addr));
 }
 
 void armEmitCbnz(const vixl::aarch64::Register& reg, const void* ptr)
