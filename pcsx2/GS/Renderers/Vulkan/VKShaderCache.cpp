@@ -22,6 +22,7 @@
 #include "fmt/format.h"
 #include "shaderc/shaderc.h"
 
+#include <chrono>
 #include <cstring>
 #include <memory>
 
@@ -694,7 +695,15 @@ std::optional<VKShaderCache::SPIRVCodeVector> VKShaderCache::GetShaderSPV(u32 ty
 		Console.Error("Vulkan: cached SPIR-V is not SPIR-V, recompiling");
 	}
 
+	const auto compile_start = std::chrono::steady_clock::now();
 	std::optional<SPIRVCodeVector> spv = CompileShaderToSPV(type, shader_code, GSConfig.UseDebugDevice);
+	// PW1: account the shaderc compile (cache misses only) on the VK device.
+	if (spv.has_value())
+	{
+		if (GSDeviceVK* dev = GSDeviceVK::GetInstance())
+			dev->RecordSPVCompile(static_cast<u64>(
+				std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - compile_start).count()));
+	}
 	if (spv.has_value() && m_spirv_store.IsWritable())
 		m_spirv_store.Insert(key, spv->data(), spv->size() * sizeof(SPIRVCodeType));
 	return spv;

@@ -7928,6 +7928,28 @@ __ri u32 GSRendererHW::EmulateChannelShuffle(GSTextureCache::Target* src, bool t
 	return true;
 }
 
+// FX2: cumulative counters for GE1_ADRENO_AD_ACCU=rta, reported every 600
+// frames on stderr (logcat on Android). kind 0 = hit on a target that gets
+// scaled now, 1 = hit on an already-scaled target, 2 = glint-shaped draw kept
+// on today's path because its target can't be scaled. Counting only.
+u64 g_fx2_rta_scale_copies = 0;
+u64 g_fx2_rta_unscale_copies = 0;
+static void FX2Count(int kind)
+{
+	static u64 s_fx2_count[3] = {};
+	static int s_fx2_last_report_frame = 0;
+	s_fx2_count[kind]++;
+	const int frame = g_perfmon.GetFrame();
+	if (frame - s_fx2_last_report_frame >= 600)
+	{
+		s_fx2_last_report_frame = frame;
+		std::fprintf(stderr, "FX2COUNT frame=%d hit_scale=%llu hit_scaled=%llu fallback=%llu rta_scale=%llu rta_unscale=%llu\n",
+			frame, (unsigned long long)s_fx2_count[0], (unsigned long long)s_fx2_count[1],
+			(unsigned long long)s_fx2_count[2], (unsigned long long)g_fx2_rta_scale_copies,
+			(unsigned long long)g_fx2_rta_unscale_copies);
+	}
+}
+
 void GSRendererHW::EmulateBlending(int rt_alpha_min, int rt_alpha_max, DATEOptions& date_options,
 	GSTextureCache::Target* rt, bool can_scale_rt_alpha, bool& new_rt_alpha_scale)
 {
