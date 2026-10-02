@@ -4196,6 +4196,25 @@ void GSDeviceVK::ResolveFeatureTable()
 	// does it through GpuProfileDetector::SetForcedBugs, which is already folded into the profile
 	// by the time this reads it.
 	m_features.broken_blend_constant = GetMobileDriverProfile().HasBug(DriverBug::BrokenBlendConstant);
+#ifdef __ANDROID__
+	// ssx3 TU4: GE1_VK_TURNIP=1 loads our bundled Turnip (Mesa fork ssx3, TU3), where the stale blend
+	// constant is fixed at the root (TU3 class A, 9932ef49bf3). There the reroute is the bug: AFIX
+	// becomes ONE_MINUS_SRC1_*, which that Turnip misrenders in sysmem passes (TU3 class B), and
+	// Tricky Merqury City's full-screen AFIX pass loses its destination (black scene). So the
+	// constant road is the default on the bundled Turnip; GE1_BLEND_CONST_SRC1=1 keeps the reroute,
+	// =0 turns it off on any driver.
+	if (m_features.broken_blend_constant)
+	{
+		const char* src1 = std::getenv("GE1_BLEND_CONST_SRC1");
+		const char* turnip = std::getenv("GE1_VK_TURNIP");
+		const bool bundled_turnip = turnip && std::strcmp(turnip, "1") == 0;
+		const bool keep = (src1 && *src1) ? std::strcmp(src1, "0") != 0 : !bundled_turnip;
+		if (!keep)
+			m_features.broken_blend_constant = false;
+		Console.WriteLn("VK: TU4 blend constant road = %s (GE1_BLEND_CONST_SRC1=%s, bundled Turnip=%d)",
+			keep ? "src1 (ARMSX2 reroute)" : "api constant", src1 ? src1 : "unset", bundled_turnip ? 1 : 0);
+	}
+#endif
 
 	// Use D32F depth instead of D32S8 when we have framebuffer fetch.
 	m_features.stencil_buffer &= !m_features.framebuffer_fetch;

@@ -8107,7 +8107,25 @@ void GSRendererHW::EmulateBlending(int rt_alpha_min, int rt_alpha_max, DATEOptio
 	// the one this draw makes with its framebuffer mask on. See ResolveHeldAlphaMask().
 	const bool held_one_barrier =
 		GSDrawAlphaMask::OneBarrierWithHeldMask(m_conf.require_one_barrier, m_held_alpha_mask.fbmask != 0);
-	if (blend_ad_alpha_masked && ((is_basic_blend || (COLCLAMP.CLAMP == 0) || held_one_barrier)))
+	// FX2: (Cs - 0)*Ad + Cd with alpha masked (SSX 3 terrain glint, blend index 0211)
+	// on the copy road: the dst read only fetches Ad, which the hardware blender
+	// reads for free as DST_ALPHA once the target's alpha is scaled (Ad*255/128.25).
+	// Skip the a_masked sw blend so the no-sw path below takes rta_correction and
+	// {DST_ALPHA, ONE, ADD}. Only when the target is or can be RT-alpha-scaled;
+	// never the BLEND_HW3 colour compensation.
+	bool fx2_ad_accu = false;
+	if (GSConfig.AdrenoAdAccuRta && blend_ad_alpha_masked && is_basic_blend &&
+		m_conf.ps.blend_a == 0 && m_conf.ps.blend_b == 2 && m_conf.ps.blend_d == 1 &&
+		COLCLAMP.CLAMP && !m_draw_env->PABE.PABE && !m_cached_ctx.TEST.DATE && !m_conf.ps.fbmask &&
+		!m_conf.ps.dither && !features.texture_barrier && !held_one_barrier &&
+		!m_conf.require_full_barrier && !m_conf.ps.IsFeedbackLoopDepth() && !GSConfig.UseDebugBlend)
+	{
+		fx2_ad_accu = can_scale_rt_alpha || new_rt_alpha_scale;
+		FX2Count(fx2_ad_accu ? (new_rt_alpha_scale ? 1 : 0) : 2);
+	}
+	if (fx2_ad_accu)
+		blend_ad_alpha_masked = false;
+	else if (blend_ad_alpha_masked && ((is_basic_blend || (COLCLAMP.CLAMP == 0) || held_one_barrier)))
 	{
 		// Swap Ad with As for hw blend.
 		m_conf.ps.a_masked = 1;
@@ -8268,7 +8286,18 @@ void GSRendererHW::EmulateBlending(int rt_alpha_min, int rt_alpha_max, DATEOptio
 			// no gate at all, which is the arm measured correct on all six.
 			sw_blending |= blend_mix_alpha_over_one && (barriers_supported || m_prim_overlap != PRIM_OVERLAP_YES);
 			// Do not run BLEND MIX if sw blending is already present, it's less accurate.
-			blend_mix &= !sw_blending;
+			// GE4: Adreno drivers return garbage for the single-chunk feedback dst read
+			// of non-overlapping draws. Divert mixable equations to hw blend-mix (no dst
+			// read, no barrier) instead of pure sw blend. Excludes non-recursive (already
+			// barrier-free), depth feedback, and PABE, which interact with the mix path.
+			{
+				const bool ge4_divert_to_mix = GSConfig.AdrenoPreferBlendMix && blend_mix && no_prim_overlap &&
+			                                     !blend_non_recursive && !m_conf.ps.IsFeedbackLoopDepth() && !PABE;
+				if (ge4_divert_to_mix)
+					sw_blending = false;
+				else
+					blend_mix &= !sw_blending;
+			}
 			sw_blending |= blend_mix;
 			[[fallthrough]];
 		case AccBlendLevel::Minimum:
@@ -8369,6 +8398,18 @@ void GSRendererHW::EmulateBlending(int rt_alpha_min, int rt_alpha_max, DATEOptio
 		color_dest_blend = false;
 		accumulation_blend = false;
 		blend_mix = false;
+		color_dest_blend2 = false;
+		blend_zero_to_one_range = false;
+	}
+
+	// FX2: pure hw blend. On an already-scaled target whose conservative alpha
+	// range exceeds 128 the High-level check above would still pick sw blending.
+	if (fx2_ad_accu)
+	{
+		sw_blending = false;
+		accumulation_blend = false;
+		blend_mix = false;
+		color_dest_blend = false;
 		color_dest_blend2 = false;
 		blend_zero_to_one_range = false;
 	}
