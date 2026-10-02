@@ -119,6 +119,9 @@ GSDeviceMTL::GSDeviceMTL()
 
 GSDeviceMTL::~GSDeviceMTL()
 {
+	// ISH1: in case Destroy() never ran (or a second open re-armed prewarm).
+	if (m_prewarm_thread.joinable())
+		m_prewarm_thread.join();
 	// m_ds_as_rt_texture is owned if the device has memoryless textures
 	if (m_dev.features.memoryless_textures)
 		[m_ds_as_rt_texture release];
@@ -1812,6 +1815,10 @@ bool GSDeviceMTL::Create(GSVSyncMode vsync_mode, bool allow_present_throttle)
 
 void GSDeviceMTL::Destroy()
 { @autoreleasepool {
+	// ISH1: the prewarm thread uses m_dev/m_fn_constants/the maps; join it
+	// before tearing any of them down.
+	if (m_prewarm_thread.joinable())
+		m_prewarm_thread.join();
 	FlushEncoders();
 	DestroyShaderChain();
 	std::lock_guard<std::mutex> guard(m_backref->first);
@@ -2489,12 +2496,35 @@ void GSDeviceMTL::MRESetHWPipelineState(GSHWDrawConfig::VSSelector vssel, GSHWDr
 		return;
 	m_current_render.pipeline_sel = fullsel;
 	m_current_render.has.pipeline_sel = true;
-	auto idx = m_hw_pipeline.find(fullsel);
-	if (idx != m_hw_pipeline.end())
+	MRCOwned<id<MTLRenderPipelineState>> pipeline;
 	{
-		[m_current_render.encoder setRenderPipelineState:idx->second];
-		return;
+		std::lock_guard<std::mutex> lock(m_hw_cache_lock);
+		auto idx = m_hw_pipeline.find(fullsel);
+		if (idx != m_hw_pipeline.end())
+			pipeline = idx->second;
 	}
+	if (!pipeline)
+		pipeline = BuildTFXPipeline(fullsel);
+
+	[m_current_render.encoder setRenderPipelineState:pipeline];
+}
+
+// ISH1: the former MRESetHWPipelineState miss path, extracted verbatim so the
+// prewarm thread builds bit-identical pipelines. Serialized against other
+// builds by m_specialize_lock (shared m_fn_constants); the maps are only
+// touched under m_hw_cache_lock.
+MRCOwned<id<MTLRenderPipelineState>> GSDeviceMTL::BuildTFXPipeline(const PipelineSelectorMTL& sel)
+{
+	std::lock_guard<std::mutex> slock(m_specialize_lock);
+	{
+		std::lock_guard<std::mutex> clock(m_hw_cache_lock);
+		auto idx = m_hw_pipeline.find(sel);
+		if (idx != m_hw_pipeline.end())
+			return idx->second;
+	}
+	const GSHWDrawConfig::VSSelector vssel = sel.vs;
+	const GSHWDrawConfig::PSSelector pssel = sel.ps;
+	const PipelineSelectorExtrasMTL extras = sel.extras;
 
 	bool primid_tracking_init = pssel.date == 1 || pssel.date == 2;
 
@@ -2506,12 +2536,13 @@ void GSDeviceMTL::MRESetHWPipelineState(GSHWDrawConfig::VSSelector vssel, GSHWDr
 	id<MTLFunction> vs = m_hw_vs[vssel_mtl.key];
 
 	id<MTLFunction> ps;
-	auto idx2 = m_hw_ps.find(pssel);
-	if (idx2 != m_hw_ps.end())
 	{
-		ps = idx2->second;
+		std::lock_guard<std::mutex> clock(m_hw_cache_lock);
+		auto idx2 = m_hw_ps.find(pssel);
+		if (idx2 != m_hw_ps.end())
+			ps = idx2->second;
 	}
-	else
+	if (!ps)
 	{
 		// af_in_src1 reroutes a fixed (AFIX) blend factor through the second fragment output, for a
 		// driver whose blend constant is broken. Only the Vulkan shader implements it, and only
@@ -2591,7 +2622,10 @@ void GSDeviceMTL::MRESetHWPipelineState(GSHWDrawConfig::VSSelector vssel, GSHWDr
 		bool eft = pssel.HasColorROV() && !pssel.HasDepthROV() && !pssel.HasDepthOutput();
 		auto newps = LoadShader(eft ? @"ps_main_rov_eft" : @"ps_main");
 		ps = newps;
-		m_hw_ps.insert(std::make_pair(pssel, std::move(newps)));
+		{
+			std::lock_guard<std::mutex> clock(m_hw_cache_lock);
+			m_hw_ps.insert(std::make_pair(pssel, std::move(newps)));
+		}
 	}
 
 	MRCOwned<MTLRenderPipelineDescriptor*> pdesc = MRCTransfer([MTLRenderPipelineDescriptor new]);
@@ -2637,8 +2671,18 @@ void GSDeviceMTL::MRESetHWPipelineState(GSHWDrawConfig::VSSelector vssel, GSHWDr
 	NSString* pname = [NSString stringWithFormat:@"HW Render %x.%llx.%llx.%x", vssel_mtl.key, pssel.key_hi, pssel.key_lo, extras.fullkey];
 	auto pipeline = MakePipeline(pdesc, vs, ps, pname);
 
-	[m_current_render.encoder setRenderPipelineState:pipeline];
-	m_hw_pipeline.insert(std::make_pair(fullsel, std::move(pipeline)));
+	{
+		std::lock_guard<std::mutex> clock(m_hw_cache_lock);
+		auto res = m_hw_pipeline.emplace(sel, pipeline);
+		if (!res.second)
+			return res.first->second;
+		if (m_selector_record_enabled.load(std::memory_order_relaxed))
+		{
+			std::lock_guard<std::mutex> rlock(m_recorded_selectors_lock);
+			m_recorded_selectors.push_back(sel);
+		}
+	}
+	return pipeline;
 }
 
 void GSDeviceMTL::MRESetDSS(DepthStencilSelector sel)
@@ -2647,6 +2691,78 @@ void GSDeviceMTL::MRESetDSS(DepthStencilSelector sel)
 		return;
 	[m_current_render.encoder setDepthStencilState:m_dss_hw[sel.key]];
 	m_current_render.depth_sel = sel;
+}
+
+// ISH1: PW1 record/prewarm entry points (mirror the VK family; the record
+// format is the raw PipelineSelectorMTL key).
+void GSDeviceMTL::SetSelectorRecordEnabled(bool enabled)
+{
+	m_selector_record_enabled.store(enabled, std::memory_order_relaxed);
+}
+
+u32 GSDeviceMTL::TakeRecordedSelectors(PipelineSelectorMTL* out, u32 capacity)
+{
+	if (!out || capacity == 0)
+		return 0;
+	std::lock_guard<std::mutex> lock(m_recorded_selectors_lock);
+	const u32 count = static_cast<u32>(std::min<size_t>(m_recorded_selectors.size(), capacity));
+	std::memcpy(out, m_recorded_selectors.data(), count * sizeof(PipelineSelectorMTL));
+	m_recorded_selectors.erase(m_recorded_selectors.begin(), m_recorded_selectors.begin() + count);
+	return count;
+}
+
+u32 GSDeviceMTL::PrewarmTFXPipelines(const PipelineSelectorMTL* sels, u32 count)
+{
+	if (!sels || count == 0)
+		return 0;
+	// Snapshot the missing keys: the caller's buffer may vanish, and keys the
+	// draw path built since need no work.
+	std::vector<PipelineSelectorMTL> keys;
+	{
+		std::lock_guard<std::mutex> clock(m_hw_cache_lock);
+		for (u32 i = 0; i < count; i++)
+		{
+			if (m_hw_pipeline.find(sels[i]) == m_hw_pipeline.end())
+				keys.push_back(sels[i]);
+		}
+	}
+	if (keys.empty())
+		return 0;
+	// One prewarm at a time; the adapter calls this once per GS open.
+	if (m_prewarm_thread.joinable())
+		m_prewarm_thread.join();
+	const u32 scheduled = static_cast<u32>(keys.size());
+	m_prewarm_thread = std::thread([this, keys = std::move(keys)]() mutable {
+		@autoreleasepool
+		{
+			for (const PipelineSelectorMTL& key : keys)
+				BuildTFXPipeline(key);
+		}
+	});
+	return scheduled;
+}
+
+// ISH1: C++ bridge for GS.cpp (GSDeviceMTL.h is ObjC++-only).
+u32 MT_TFXSelectorSize()
+{
+	return static_cast<u32>(sizeof(PipelineSelectorMTL));
+}
+
+void MT_SetTFXSelectorRecord(GSDevice* dev, bool enabled)
+{
+	static_cast<GSDeviceMTL*>(dev)->SetSelectorRecordEnabled(enabled);
+}
+
+u32 MT_TakeRecordedTFXSelectors(GSDevice* dev, void* out, u32 capacity)
+{
+	return static_cast<GSDeviceMTL*>(dev)->TakeRecordedSelectors(
+		static_cast<PipelineSelectorMTL*>(out), capacity);
+}
+
+u32 MT_PrewarmTFXPipelines(GSDevice* dev, const void* sels, u32 count)
+{
+	return static_cast<GSDeviceMTL*>(dev)->PrewarmTFXPipelines(
+		static_cast<const PipelineSelectorMTL*>(sels), count);
 }
 
 void GSDeviceMTL::MRESetDSS(id<MTLDepthStencilState> dss)
