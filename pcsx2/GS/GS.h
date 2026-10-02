@@ -75,6 +75,15 @@ void GSclose();
 void GSgifSoftReset(u32 mask);
 void GSwriteCSR(u32 csr);
 void GSInitAndReadFIFO(u8* mem, u32 size);
+// LT1b: ticketed asynchronous local->host probes (PS2X lagF). Request at the probe's
+// stream point (right after its TRXDIR=1 packet); resolve at VSync for tickets whose
+// records have executed (the VSync drain guarantees it for earlier requests); take
+// returns the bytes once (0 = not resolved). Stats: see GSState::m_probe_stats.
+#define GS_HAS_PROBE_API 1
+void GSProbeRequest(u64 bitbltbuf, u64 trxpos, u64 trxreg, u64 ticket);
+u32 GSProbeResolve(u64 ticket_lo, u64 ticket_hi);
+u32 GSProbeTake(u64 ticket, u8* out, u32 bytes);
+void GSProbeStats(u64 out[8]);
 void GSReadLocalMemoryUnsync(u8* mem, u32 qwc, u64 BITBLITBUF, u64 TRXPOS, u64 TRXREG);
 void GSgifTransfer(const u8* mem, u32 size);
 void GSgifTransfer1(u8* mem, u32 addr);

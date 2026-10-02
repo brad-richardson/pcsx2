@@ -4745,6 +4745,196 @@ void GSTextureCache::DiscardPendingDownloads()
 	m_async_download_texture_pool.clear();
 }
 
+void GSTextureCache::ProbeRequest(const GSBackQueue::ProbeRecord& rec, const GSLocalMemory& mem, std::array<u64, 8>& stats)
+{
+	ProbeDownload pd;
+	pd.ticket = rec.ticket;
+	pd.blit = rec.blit;
+	pd.pos = rec.pos;
+	pd.reg = rec.reg;
+
+	const u32 bp = rec.blit.SBP;
+	const u32 bw = rec.blit.SBW;
+	const u32 psm = rec.blit.SPSM;
+	const GSVector4i r(rec.pos.SSAX, rec.pos.SSAY, rec.pos.SSAX + rec.reg.RRW, rec.pos.SSAY + rec.reg.RRH);
+
+	// 1. The local-memory pages the read touches, as they stand at this stream point
+	// (ReadImageX's fallback for every byte the GPU copy below doesn't cover).
+	const u32 start_page = GSLocalMemory::GetStartBlockAddress(bp, bw, psm, r) / GS_BLOCKS_PER_PAGE;
+	const u32 end_page = GSLocalMemory::GetEndBlockAddress(bp, bw, psm, r) / GS_BLOCKS_PER_PAGE;
+	pd.first_page = start_page % GS_MAX_PAGES;
+	pd.page_count = std::min<u32>((end_page >= start_page ? end_page - start_page : 0) + 1, GS_MAX_PAGES);
+	pd.pages.resize(static_cast<size_t>(pd.page_count) * GS_PAGE_SIZE);
+	for (u32 i = 0; i < pd.page_count; i++)
+		std::memcpy(&pd.pages[static_cast<size_t>(i) * GS_PAGE_SIZE],
+			mem.vm8() + static_cast<size_t>((pd.first_page + i) % GS_MAX_PAGES) * GS_PAGE_SIZE, GS_PAGE_SIZE);
+
+	// 2. The target that holds those pixels: depth first (what InvalidateLocalMem tries
+	// first for 32-bit reads), then colour; most recently used first.
+	Target* t = nullptr;
+	const u32 rbpp = GSLocalMemory::m_psm[psm].bpp;
+	for (int type : {DepthStencil, RenderTarget})
+	{
+		if (type == DepthStencil && GSConfig.UserHacks_DisableDepthSupport)
+			continue;
+		for (Target* cand : m_dst[type])
+		{
+			if (GSLocalMemory::m_psm[cand->m_TEX0.PSM].bpp != rbpp || !GSUtil::HasSharedBits(psm, cand->m_TEX0.PSM) ||
+				!cand->Overlaps(bp, bw, psm, r))
+				continue;
+			t = cand;
+			break;
+		}
+		if (t)
+			break;
+	}
+
+	// Only the 32-bit-storage formats the probe uses take the GPU path (Read(Target)'s
+	// first case); anything else, or CPU-side-newer (dirty) data, reads local memory.
+	bool gpu = t && (t->m_TEX0.PSM == PSMCT32 || t->m_TEX0.PSM == PSMCT24 || t->m_TEX0.PSM == PSMZ32 ||
+						t->m_TEX0.PSM == PSMZ24);
+	GSVector4i targetr = GSVector4i::zero();
+	if (gpu)
+	{
+		// Whole pages around the read, in the target's own coordinates: pages map 1:1
+		// between same-depth formats even when the block swizzle inside them differs.
+		const GSVector2i pgs = GSLocalMemory::m_psm[psm].pgs;
+		const GSVector4i page_rect(r.x & ~(pgs.x - 1), r.y & ~(pgs.y - 1), (r.z + pgs.x - 1) & ~(pgs.x - 1),
+			(r.w + pgs.y - 1) & ~(pgs.y - 1));
+		targetr = TranslateAlignedRectByPage(t, bp & ~((1 << 5) - 1), psm, bw, page_rect, true)
+					  .rintersect(t->GetUnscaledRect());
+		if (targetr.rempty())
+			gpu = false;
+		else if (!t->m_dirty.empty() && !t->m_dirty.GetTotalRect(t->m_TEX0, t->m_unscaled_size).rintersect(targetr).rempty())
+			gpu = false;
+	}
+	const u32 write_mask = gpu ? ((t->m_valid_rgb ? 0x00FFFFFFu : 0) | (t->m_valid_alpha_low ? 0x0F000000u : 0) |
+									 (t->m_valid_alpha_high ? 0xF0000000u : 0)) :
+								 0u;
+	if (gpu && write_mask != 0)
+	{
+		const bool is_depth = (t->m_type == DepthStencil);
+		const GSTexture::Format fmt = is_depth ? GSTexture::Format::UInt32 : GSTexture::Format::Color;
+		const ShaderConvert ps_shader = is_depth ? ShaderConvert::DEPTH32_TO_32_BITS :
+								   (t->m_rt_alpha_scale ? ShaderConvert::RTA_DECORRECTION : ShaderConvert::COPY);
+		const GSVector4 src(GSVector4(targetr) * GSVector4(t->m_scale) / GSVector4(t->m_texture->GetSize()).xyxy());
+		const GSVector4i drc(0, 0, targetr.width(), targetr.height());
+		const bool direct_read = (t->m_type == RenderTarget && t->m_scale == 1.0f && ps_shader == ShaderConvert::COPY);
+
+		std::unique_ptr<GSDownloadTexture> dl;
+		{
+			const std::lock_guard lock(m_probe_mutex);
+			for (auto it = m_probe_texture_pool.begin(); it != m_probe_texture_pool.end(); ++it)
+			{
+				if ((*it)->GetFormat() != fmt)
+					continue;
+				dl = std::move(*it);
+				m_probe_texture_pool.erase(it);
+				break;
+			}
+		}
+		if (PrepareDownloadTexture(drc.z, drc.w, fmt, &dl) && dl)
+		{
+			g_gs_device->FlushBeforeReadback();
+			bool copied = true;
+			if (direct_read)
+			{
+				dl->CopyFromTexture(drc, t->m_texture, targetr, 0, true);
+			}
+			else if (GSTexture* tmp = g_gs_device->CreateRenderTarget(drc.z, drc.w, fmt, false))
+			{
+				g_gs_device->StretchRect(t->m_texture, src, tmp, GSVector4(drc), ps_shader, Nearest);
+				dl->CopyFromTexture(drc, tmp, drc, 0, true);
+				g_gs_device->Recycle(tmp);
+			}
+			else
+			{
+				copied = false;
+			}
+			if (copied)
+			{
+				pd.tex0 = t->m_TEX0;
+				pd.target_rect = targetr;
+				pd.drc = drc;
+				pd.write_mask = write_mask;
+				pd.texture = std::move(dl);
+			}
+		}
+	}
+	stats[pd.texture ? 3 : 4]++;
+
+	const std::lock_guard lock(m_probe_mutex);
+	m_probe_downloads.push_back(std::move(pd));
+}
+
+u32 GSTextureCache::ResolveProbes(u64 ticket_hi, std::vector<std::pair<u64, std::vector<u8>>>& out, std::array<u64, 8>& stats)
+{
+	std::deque<ProbeDownload> ready;
+	{
+		const std::lock_guard lock(m_probe_mutex);
+		while (!m_probe_downloads.empty() && m_probe_downloads.front().ticket < ticket_hi)
+		{
+			ready.push_back(std::move(m_probe_downloads.front()));
+			m_probe_downloads.pop_front();
+		}
+	}
+	if (ready.empty())
+		return 0;
+	if (!m_probe_scratch)
+		m_probe_scratch = std::make_unique<GSLocalMemory>();
+	GSLocalMemory& scratch = *m_probe_scratch;
+
+	u32 resolved = 0;
+	for (ProbeDownload& pd : ready)
+	{
+		for (u32 i = 0; i < pd.page_count; i++)
+			std::memcpy(scratch.vm8() + static_cast<size_t>((pd.first_page + i) % GS_MAX_PAGES) * GS_PAGE_SIZE,
+				&pd.pages[static_cast<size_t>(i) * GS_PAGE_SIZE], GS_PAGE_SIZE);
+
+		if (pd.texture)
+		{
+			if (!pd.texture->Poll())
+			{
+				stats[5]++;
+				pd.texture->Flush();
+			}
+			if (pd.texture->Map(pd.drc))
+			{
+				const GSOffset off = scratch.GetOffset(pd.tex0.TBP0, pd.tex0.TBW, pd.tex0.PSM);
+				scratch.WritePixel32(const_cast<u8*>(pd.texture->GetMapPointer()), pd.texture->GetMapPitch(), off,
+					pd.target_rect, pd.write_mask);
+				pd.texture->Unmap();
+			}
+		}
+
+		const int len = static_cast<int>(pd.reg.RRW) * static_cast<int>(pd.reg.RRH) *
+			GSLocalMemory::m_psm[pd.blit.SPSM].trbpp / 8;
+		std::vector<u8> bytes(static_cast<size_t>(std::max(len, 0)));
+		if (len > 0)
+		{
+			int x = pd.pos.SSAX, y = pd.pos.SSAY;
+			scratch.ReadImageX(x, y, bytes.data(), len, pd.blit, pd.pos, pd.reg);
+		}
+		out.emplace_back(pd.ticket, std::move(bytes));
+		resolved++;
+
+		if (pd.texture)
+		{
+			const std::lock_guard lock(m_probe_mutex);
+			if (m_probe_texture_pool.size() < 16)
+				m_probe_texture_pool.push_back(std::move(pd.texture));
+		}
+	}
+	return resolved;
+}
+
+void GSTextureCache::DiscardProbes()
+{
+	const std::lock_guard lock(m_probe_mutex);
+	m_probe_downloads.clear();
+	m_probe_texture_pool.clear();
+}
+
 /*void GSTextureCache::InvalidateContainedTargets(u32 start_bp, u32 end_bp, u32 write_psm, u32 write_bw)
 {
 	const bool preserve_alpha = (GSLocalMemory::m_psm[write_psm].trbpp == 24);

@@ -10,6 +10,7 @@
 
 #include <array>
 #include <deque>
+#include <mutex>
 #include <unordered_set>
 #include <utility>
 #include <limits>
@@ -524,6 +525,30 @@ protected:
 	std::deque<PendingDownload> m_pending_downloads;
 	std::vector<std::unique_ptr<GSDownloadTexture>> m_async_download_texture_pool;
 
+	// LT1b: ticketed asynchronous probes (lagF). Each entry holds the local-memory pages
+	// the read touches (copied at the probe's stream point) plus an optional GPU copy of the
+	// covering target region; ResolveProbes overlays the copy onto the pages in a scratch
+	// local memory and runs ReadImageX there. Back thread pushes, MTGS resolves.
+	struct ProbeDownload
+	{
+		u64 ticket = 0;
+		GIFRegBITBLTBUF blit = {};
+		GIFRegTRXPOS pos = {};
+		GIFRegTRXREG reg = {};
+		GIFRegTEX0 tex0 = {};
+		GSVector4i target_rect = {};
+		GSVector4i drc = {};
+		u32 write_mask = 0;
+		u32 first_page = 0;
+		u32 page_count = 0;
+		std::vector<u8> pages;
+		std::unique_ptr<GSDownloadTexture> texture; // null: local memory only
+	};
+	std::mutex m_probe_mutex;
+	std::deque<ProbeDownload> m_probe_downloads;
+	std::vector<std::unique_ptr<GSDownloadTexture>> m_probe_texture_pool;
+	std::unique_ptr<GSLocalMemory> m_probe_scratch;
+
 	Source* CreateSource(const GIFRegTEX0& TEX0, const GIFRegTEXA& TEXA, const GIFRegCLAMP& CLAMP, Target* t, int x_offset, int y_offset, const GSVector2i* lod, const GSVector4i* src_range, GSTexture* gpu_clut, SourceRegion region, bool force_temporary = false);
 
 	bool PreloadTarget(GIFRegTEX0 TEX0, const GSVector2i& size, const GSVector2i& valid_size, bool is_frame,
@@ -608,6 +633,13 @@ public:
 	void ProcessPendingDownloads();
 	/// Drops every queued asynchronous download (mode change, target flush, reset).
 	void DiscardPendingDownloads();
+	/// LT1b: queue one ticketed probe (back thread, at the probe's stream point). stats as
+	/// GSState::m_probe_stats ([3] gpu copies, [4] local-memory only).
+	void ProbeRequest(const GSBackQueue::ProbeRecord& rec, const GSLocalMemory& mem, std::array<u64, 8>& stats);
+	/// LT1b: resolve every queued probe with ticket < ticket_hi into out (MTGS thread, after a
+	/// drain). Polls each copy; an unfinished one is flushed (a fence wait, counted in stats[5]).
+	u32 ResolveProbes(u64 ticket_hi, std::vector<std::pair<u64, std::vector<u8>>>& out, std::array<u64, 8>& stats);
+	void DiscardProbes();
 	void RemoveAll(bool sources, bool targets, bool hash_cache);
 
 	/// Says the renderer has just been reset: the targets are gone and local memory may have been
