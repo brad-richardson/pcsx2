@@ -983,6 +983,26 @@ public:
 	void Read(u8* mem, int len);
 	void InitReadFIFO(u8* mem, int len);
 
+	// LT1b: asynchronous, ticketed local->host probes (PS2X lagF). SubmitProbe runs
+	// on the parse object at the probe's stream point (flushes overlapping draws the
+	// way InitReadFIFO does, then queues a PROBE record or executes it inline).
+	// ExecProbeRecord runs on the authoritative object: this base version reads
+	// local memory at once (exact for the SW renderer); GSRendererHW queues a GPU
+	// copy instead. ResolveProbes/TakeProbe run on the MTGS thread; resolve only
+	// tickets whose records already executed (the caller resolves at VSync, after
+	// SubmitVsync's drain). Results live in a mutex-guarded table until taken.
+	void SubmitProbe(const GSBackQueue::ProbeRecord& rec);
+	virtual void ExecProbeRecord(const GSBackQueue::ProbeRecord& rec);
+	virtual u32 ResolveProbes(u64 ticket_lo, u64 ticket_hi);
+	u32 TakeProbe(u64 ticket, u8* out, u32 bytes);
+	void StoreProbeResult(u64 ticket, std::vector<u8>&& bytes);
+	void ClearProbes();
+	// [0] requests [1] resolved [2] taken [3] gpu copies [4] mem-only (no target /
+	// dirty / unsupported PSM) [5] fence waits at resolve [6] env mismatches at submit
+	std::array<u64, 8> m_probe_stats = {};
+	std::mutex m_probe_mutex;
+	std::vector<std::pair<u64, std::vector<u8>>> m_probe_results;
+
 	void SoftReset(u32 mask);
 	void WriteCSR(u32 csr) { m_regs->CSR.U32[1] = csr; }
 	void ReadFIFO(u8* mem, int size);

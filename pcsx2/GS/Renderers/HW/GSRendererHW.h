@@ -488,6 +488,9 @@ public:
 	void InvalidateVideoMem(const GIFRegBITBLTBUF& BITBLTBUF, const GSVector4i& r) override;
 	void InvalidateLocalMem(const GIFRegBITBLTBUF& BITBLTBUF, const GSVector4i& r, bool clut = false) override;
 	void Move() override;
+	// LT1b: GPU-copy probes through the texture cache (GSState.h).
+	void ExecProbeRecord(const GSBackQueue::ProbeRecord& rec) override;
+	u32 ResolveProbes(u64 ticket_lo, u64 ticket_hi) override;
 	void Draw() override;
 
 	/// One-line PS2-level description of the draw about to be issued: primitive type,

@@ -275,6 +275,19 @@ namespace GSBackQueue
 		DrawPrivRegs priv;
 	};
 
+	// LT1b: one asynchronous local->host probe (PS2X lagF). The executor
+	// snapshots the local-memory pages the read touches and queues a GPU copy
+	// of the covering target region at this exact point in the record stream;
+	// GSProbeResolve later reconstructs the bytes ReadImageX would return.
+	// Never touches m_mem, the TC's read state or the asynchronous shadow.
+	struct ProbeRecord
+	{
+		GIFRegBITBLTBUF blit;
+		GIFRegTRXPOS pos;
+		GIFRegTRXREG reg;
+		u64 ticket;
+	};
+
 	// ------------------------------------------------------------------
 	// GV7-1: the front->back SPSC ring.
 	// ------------------------------------------------------------------
@@ -289,6 +302,7 @@ namespace GSBackQueue
 		Vsync,
 		Draw,
 		ReleasePayload,
+		Probe, // LT1b
 	};
 
 	// Single-producer/single-consumer ring. Producer = the MTGS ("front") thread,
@@ -526,6 +540,7 @@ namespace GSBackQueue
 	static_assert(std::is_trivially_copyable_v<VsyncRecord>);
 	static_assert(std::is_trivially_copyable_v<DrawRecord>);
 	static_assert(std::is_trivially_copyable_v<ReleasePayloadRecord>);
+	static_assert(std::is_trivially_copyable_v<ProbeRecord>);
 
 	using RecordRing = SpscRing<RecordSlot, 512>;
 

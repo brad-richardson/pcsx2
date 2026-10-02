@@ -2662,6 +2662,22 @@ void GSRendererHW::InvalidateLocalMem(const GIFRegBITBLTBUF& BITBLTBUF, const GS
 	}
 }
 
+void GSRendererHW::ExecProbeRecord(const GSBackQueue::ProbeRecord& rec)
+{
+	g_texture_cache->ProbeRequest(rec, m_mem, m_probe_stats);
+}
+
+u32 GSRendererHW::ResolveProbes(u64 ticket_lo, u64 ticket_hi)
+{
+	(void)ticket_lo;
+	std::vector<std::pair<u64, std::vector<u8>>> out;
+	const u32 n = g_texture_cache->ResolveProbes(ticket_hi, out, m_probe_stats);
+	for (auto& [ticket, bytes] : out)
+		StoreProbeResult(ticket, std::move(bytes));
+	m_probe_stats[1] += n;
+	return n;
+}
+
 void GSRendererHW::Move()
 {
 	if (m_mv && m_mv(*this))
