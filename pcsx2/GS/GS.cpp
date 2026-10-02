@@ -79,6 +79,13 @@ float GSGetAndResetAccumulatedGPUTime()
 	return g_gs_device ? g_gs_device->GetAndResetAccumulatedGPUTime() : -1.0f;
 }
 
+float GSGetAndResetBackThreadMs()
+{
+	if (!g_gs_renderer || !g_gs_renderer->IsBackThreadRunning())
+		return -1.0f;
+	return g_gs_renderer->TakeBackThreadBusyMs();
+}
+
 #ifdef ENABLE_VULKAN
 static GSDeviceVK* GetVKDeviceForPW1()
 {
@@ -104,6 +111,64 @@ u32 GSPrewarmTFXPipelines(const void* selectors, u32 count)
 	(void)count;
 #endif
 	return 0;
+}
+
+void GSGetAndResetPipelineStats(u64* tfx_pipelines, u64* tfx_ns, u64* spv_compiles, u64* spv_ns)
+{
+	u64 got_tfx = 0, got_tfx_ns = 0, got_spv = 0, got_spv_ns = 0;
+#ifdef ENABLE_VULKAN
+	if (GSDeviceVK* dev = GetVKDeviceForPW1())
+		dev->GetAndResetPipeStats(&got_tfx, &got_tfx_ns, &got_spv, &got_spv_ns);
+#endif
+	if (tfx_pipelines)
+		*tfx_pipelines = got_tfx;
+	if (tfx_ns)
+		*tfx_ns = got_tfx_ns;
+	if (spv_compiles)
+		*spv_compiles = got_spv;
+	if (spv_ns)
+		*spv_ns = got_spv_ns;
+}
+
+u32 GSGetTFXSelectorSize()
+{
+#ifdef ENABLE_VULKAN
+	return static_cast<u32>(sizeof(GSDeviceVK::PipelineSelector));
+#else
+	return 0;
+#endif
+}
+
+void GSSetTFXSelectorRecord(bool enabled)
+{
+#ifdef ENABLE_VULKAN
+	if (GSDeviceVK* dev = GetVKDeviceForPW1())
+		dev->SetSelectorRecordEnabled(enabled);
+#else
+	(void)enabled;
+#endif
+}
+
+u32 GSTakeRecordedTFXSelectors(void* out, u32 capacity)
+{
+#ifdef ENABLE_VULKAN
+	if (GSDeviceVK* dev = GetVKDeviceForPW1())
+		return dev->TakeRecordedSelectors(static_cast<GSDeviceVK::PipelineSelector*>(out), capacity);
+#else
+	(void)out;
+	(void)capacity;
+#endif
+	return 0;
+}
+
+void GSGetAndResetStallStats(u64 out[6])
+{
+	for (int i = 0; i < 6; i++)
+		out[i] = 0;
+#ifdef ENABLE_VULKAN
+	if (GSDeviceVK* dev = GetVKDeviceForPW1())
+		dev->GetAndResetStallStats(out);
+#endif
 }
 
 bool GSIsHardwareRenderer()
