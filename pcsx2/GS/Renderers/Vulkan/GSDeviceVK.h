@@ -906,14 +906,13 @@ public:
 	void EnableExtendedStats(bool enabled) override;
 	std::vector<std::string> GetExtendedStats() const override;
 
-	// PW1: pipeline-cache pre-warm accounting + selector record (GS thread only).
+	// PW1: pipeline-cache pre-warm surface for the GE1 adapter. GS thread only.
 	void RecordTFXPipelineCreate(u64 ns);
 	void RecordSPVCompile(u64 ns);
+	bool FlushPipelineCache();
 	void GetAndResetPipeStats(u64* tfx_pipelines, u64* tfx_ns, u64* spv_compiles, u64* spv_ns);
 	void SetSelectorRecordEnabled(bool enabled);
 	u32 TakeRecordedSelectors(PipelineSelector* out, u32 capacity);
-	// PW1: pipeline-cache pre-warm surface for the GE1 adapter. GS thread only.
-	bool FlushPipelineCache();
 	u32 PrewarmTFXPipelines(const PipelineSelector* sels, u32 count);
 	// SH1: texture upload / creation accounting (any thread; relaxed atomics).
 	void RecordTextureUpload(u64 bytes)
