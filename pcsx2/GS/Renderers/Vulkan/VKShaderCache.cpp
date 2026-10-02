@@ -162,6 +162,39 @@ void dyn_shaderc::Close()
 	X(shaderc_result_get_compilation_status)
 
 // TODO: NOT thread safe, yet.
+#if defined(__ANDROID__)
+// Android bundles shaderc into GE1's GS library. Use the same direct-loader
+// platform path as ARMSX2; the desktop oracle keeps PCSX2's dynamic loader.
+namespace dyn_shaderc
+{
+	static bool Open();
+	static void Close();
+	static shaderc_compiler_t s_compiler = nullptr;
+#define ADD_FUNC(F) static constexpr auto F = ::F;
+	SHADERC_FUNCTIONS(ADD_FUNC)
+#undef ADD_FUNC
+} // namespace dyn_shaderc
+
+bool dyn_shaderc::Open()
+{
+	if (s_compiler)
+		return true;
+	s_compiler = shaderc_compiler_initialize();
+	if (!s_compiler)
+		return false;
+	std::atexit(&dyn_shaderc::Close);
+	return true;
+}
+
+void dyn_shaderc::Close()
+{
+	if (s_compiler)
+	{
+		shaderc_compiler_release(s_compiler);
+		s_compiler = nullptr;
+	}
+}
+#else
 namespace dyn_shaderc
 {
 	static bool Open();
@@ -240,6 +273,7 @@ void dyn_shaderc::Close()
 
 	s_library.Close();
 }
+#endif
 
 #undef SHADERC_FUNCTIONS
 #undef SHADERC_INIT_FUNCTIONS
