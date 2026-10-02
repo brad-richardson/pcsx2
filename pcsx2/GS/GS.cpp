@@ -79,6 +79,33 @@ float GSGetAndResetAccumulatedGPUTime()
 	return g_gs_device ? g_gs_device->GetAndResetAccumulatedGPUTime() : -1.0f;
 }
 
+#ifdef ENABLE_VULKAN
+static GSDeviceVK* GetVKDeviceForPW1()
+{
+	return (GSCurrentRenderer == GSRendererType::VK) ? static_cast<GSDeviceVK*>(g_gs_device.get()) : nullptr;
+}
+#endif
+
+void GSFlushPipelineCache()
+{
+#ifdef ENABLE_VULKAN
+	if (GSDeviceVK* dev = GetVKDeviceForPW1())
+		dev->FlushPipelineCache();
+#endif
+}
+
+u32 GSPrewarmTFXPipelines(const void* selectors, u32 count)
+{
+#ifdef ENABLE_VULKAN
+	if (GSDeviceVK* dev = GetVKDeviceForPW1())
+		return dev->PrewarmTFXPipelines(static_cast<const GSDeviceVK::PipelineSelector*>(selectors), count);
+#else
+	(void)selectors;
+	(void)count;
+#endif
+	return 0;
+}
+
 bool GSIsHardwareRenderer()
 {
 	// Null gets flagged as hw.
