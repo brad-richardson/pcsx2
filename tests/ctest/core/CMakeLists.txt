@@ -44,7 +44,7 @@ add_subdirectory(ipu)
 
 
 set(multi_isa_sources
-	GS/swizzle_test_main.cpp
+	gs_swizzle_test_main.cpp
 )
 
 target_link_libraries(core_test PUBLIC

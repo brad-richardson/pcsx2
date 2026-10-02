@@ -145,7 +145,12 @@ elseif("${CMAKE_SYSTEM_PROCESSOR}" STREQUAL "arm64" OR "${CMAKE_SYSTEM_PROCESSOR
        "${CMAKE_OSX_ARCHITECTURES}" STREQUAL "arm64")
 	message(STATUS "Building for ARM64.")
 	set(ARCH_ARM64 TRUE)
-	if(APPLE)
+	if(IOS)
+		# GI1 (CN1A: kept for the GS-only iOS libs, which use this file rather than the
+		# iOS app tree's copy): A12 baseline; an M1 baseline lets clang fold hash/CRC
+		# chains into eor3, which SIGILLs on A12.
+		add_compile_options("-mcpu=apple-a12")
+	elseif(APPLE)
 		# Min spec is an M1. +crypto because -march is the flag clang resolves
 		# the feature set from here, and armv8.4-a alone leaves the crypto
 		# extension off: 3rdparty/lzma's AesOpt.c then fails to compile its
@@ -464,7 +469,7 @@ endif()
 # MacOS-specific things
 #-------------------------------------------------------------------------------
 
-if(NOT CMAKE_GENERATOR MATCHES "Xcode")
+if(NOT CMAKE_GENERATOR MATCHES "Xcode" AND NOT IOS)
 	# Assume Xcode builds aren't being used for distribution
 	# Helpful because Xcode builds don't build multiple metallibs for different macOS versions
 	# Also helpful because Xcode's interactive shader debugger requires apps be built for the latest macOS
