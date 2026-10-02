@@ -291,6 +291,15 @@ public:
 	MRCOwned<id<MTLRenderPipelineState>> m_fxaa_pipeline;
 	MRCOwned<id<MTLRenderPipelineState>> m_shadeboost_pipeline;
 	MRCOwned<id<MTLRenderPipelineState>> m_imgui_pipeline;
+	// GI1: RGBA->BGRA COPY into IOSurface-backed targets (vs_convert/ps_copy).
+	MRCOwned<id<MTLRenderPipelineState>> m_iosurface_copy_pipeline;
+	struct IOSurfaceExport
+	{
+		u32 width = 0, height = 0;
+		MRCOwned<id<MTLTexture>> texture;
+		std::unique_ptr<GSTextureMTL> wrapper;
+	};
+	std::unordered_map<void*, IOSurfaceExport> m_export_surfaces;
 
 	id<MTLRenderPipelineState> GetConvertPipeline(ShaderConvertSelector shader) const
 	{
@@ -405,6 +414,14 @@ public:
 	void FlushEncoders();
 	/// Flush pending operations and spins the GPU for a download.
 	void FlushEncodersForReadback();
+	/// GI1: render the composed source into a BGRA IOSurface-backed target
+	/// (vs_convert/ps_copy) and fire done(ctx, ok) exactly once from the
+	/// command buffer's completion handler. The surface must stay alive
+	/// until done fires.
+	bool CopySnapshotToIOSurface(GSTexture* source, void* iosurface, u32 width, u32 height, u32 pad_x, u32 pad_y,
+		GSExportIOSurfaceDoneFn done, void* ctx);
+	/// GI1: drop the cached wrapper for a surface (call before releasing it).
+	void ReleaseExportIOSurface(void* iosurface);
 	/// End current render pass without flushing
 	void EndRenderPass();
 	/// Prepare to begin a new render pass

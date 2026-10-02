@@ -1305,6 +1305,20 @@ bool GSSaveSnapshotToMemory(u32 window_width, u32 window_height, bool apply_aspe
 		width, height, pixels);
 }
 
+#ifdef __APPLE__
+int GSExportSnapshotToIOSurface(void* iosurface, u32 width, u32 height, GSExportIOSurfaceDoneFn done, void* ctx)
+{
+	if (!g_gs_renderer || !g_gs_device || !g_gs_device->GetCurrent() || !iosurface || !done)
+		return 0;
+	return g_gs_renderer->ExportSnapshotToIOSurface(iosurface, width, height, done, ctx) ? 1 : -1;
+}
+
+void GSReleaseExportIOSurface(void* iosurface)
+{
+	if (g_gs_device && GSCurrentRenderer == GSRendererType::Metal)
+		MT_ReleaseExportIOSurface(g_gs_device.get(), iosurface);
+}
+#endif
 #ifdef _WIN32
 
 void* GSAllocateWrappedMemory(size_t size, size_t repeat)
