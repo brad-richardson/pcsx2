@@ -8347,6 +8347,27 @@ void GSDeviceVK::RecordTFXPipelineKey(const PipelineSelector& p)
 		m_recorded_tfx_keys.emplace(p, RecordedTFXKey{index, m_tfx_key_session});
 }
 
+bool GSDeviceVK::FlushPipelineCache()
+{
+	return g_vulkan_shader_cache ? g_vulkan_shader_cache->FlushPipelineCache() : false;
+}
+
+u32 GSDeviceVK::PrewarmTFXPipelines(const PipelineSelector* sels, u32 count)
+{
+	if (!sels)
+		return 0;
+	u32 created = 0;
+	for (u32 i = 0; i < count; i++)
+	{
+		if (m_tfx_pipelines.find(sels[i]) == m_tfx_pipelines.end())
+		{
+			if (GetTFXPipeline(sels[i]) != VK_NULL_HANDLE)
+				created++;
+		}
+	}
+	return created;
+}
+
 bool GSDeviceVK::BindDrawPipeline(const PipelineSelector& p)
 {
 	VkPipeline pipeline = GetTFXPipeline(p);
