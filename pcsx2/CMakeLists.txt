@@ -1908,6 +1908,11 @@ if (APPLE)
 			${COREMEDIA_LIBRARY}
 		)
 	endif()
+	# GI1 (CN1A port): the async IOSurface export needs IOSurface + CoreVideo on
+	# macOS and iOS alike.
+	find_library(IOSURFACE_LIBRARY IOSurface)
+	find_library(COREVIDEO_LIBRARY CoreVideo)
+	target_link_libraries(PCSX2_FLAGS INTERFACE ${IOSURFACE_LIBRARY} ${COREVIDEO_LIBRARY})
 	# Weak-link MetalFX so older OS versions still load. Skip it where the SDK
 	# does not carry the framework at all - the iOS simulator and tvOS (see
 	# PCSX2_HAS_METALFX in GSDeviceMTL.h) - because linking it there fails with

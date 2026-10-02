@@ -7,6 +7,7 @@
 #include <algorithm>
 #include <cctype>
 #include <cstdio>
+#include <cstdlib> // OM1 iOS: SDK headers lack the transitive include
 #include <cstring>
 
 #ifdef _MSC_VER
