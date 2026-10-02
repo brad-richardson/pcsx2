@@ -84,6 +84,10 @@ namespace
 #include <optional>
 #include <sstream>
 #include <utility>
+#ifdef __ANDROID__
+#include <android/hardware_buffer.h>
+#include <vulkan/vulkan_android.h>
+#endif
 
 // Tweakables
 enum : u32
@@ -530,6 +534,14 @@ bool GSDeviceVK::SelectDeviceExtensions(ExtensionList* extension_list, bool enab
 		if (!SupportsExtension(extension_name, true))
 			return false;
 	}
+#ifdef __ANDROID__
+	if (const char* export_ahb = std::getenv("GE1_GS_AHB_EXPORT"); export_ahb && std::strcmp(export_ahb, "1") == 0)
+	{
+		if (!SupportsExtension(VK_ANDROID_EXTERNAL_MEMORY_ANDROID_HARDWARE_BUFFER_EXTENSION_NAME, true) ||
+			!SupportsExtension(VK_EXT_QUEUE_FAMILY_FOREIGN_EXTENSION_NAME, true))
+			return false;
+	}
+#endif
 
 	// Optional now (was required). Enabled when present; CreateDevice decides
 	// whether to actually use it (never on Mali — driver bug) or fall back.
@@ -3132,6 +3144,14 @@ void GSDeviceVK::Destroy()
 		ExecuteCommandBuffer(false);
 		WaitForGPUIdle();
 	}
+#ifdef __ANDROID__
+	for (const auto& [buffer, image] : m_export_images)
+	{
+		vkDestroyImage(m_device, image.image, nullptr);
+		vkFreeMemory(m_device, image.memory, nullptr);
+	}
+	m_export_images.clear();
+#endif
 
 	m_swap_chain.reset();
 
@@ -4699,6 +4719,126 @@ void GSDeviceVK::DoCopyRect(GSTexture* sTex, GSTexture* dTex, const GSVector4i& 
 
 	dTexVK->SetState(GSTexture::State::Dirty);
 }
+
+#ifdef __ANDROID__
+bool GSDeviceVK::CopySnapshotToAHB(GSTexture* source, AHardwareBuffer* buffer, u32 width, u32 height, u32 pad_x, u32 pad_y, u64* fence_counter)
+{
+	auto fail = [](const char* why) { std::fprintf(stderr, "GE1 AHB export: %s\n", why); return false; };
+	if (!source || !buffer || !fence_counter || !m_device || pad_x + source->GetWidth() > width || pad_y + source->GetHeight() > height)
+		return fail("invalid source, device, or dimensions");
+	AHardwareBuffer_Desc desc = {};
+	AHardwareBuffer_describe(buffer, &desc);
+	if (desc.width != width || desc.height != height || desc.format != AHARDWAREBUFFER_FORMAT_R8G8B8A8_UNORM)
+		return fail("AHB dimensions or RGBA8 format mismatch");
+	auto found = m_export_images.find(buffer);
+	if (found == m_export_images.end())
+	{
+		auto get_props = reinterpret_cast<PFN_vkGetAndroidHardwareBufferPropertiesANDROID>(
+			vkGetDeviceProcAddr(m_device, "vkGetAndroidHardwareBufferPropertiesANDROID"));
+		if (!get_props)
+			return fail("vkGetAndroidHardwareBufferPropertiesANDROID unavailable");
+		VkAndroidHardwareBufferFormatPropertiesANDROID format = {
+			VK_STRUCTURE_TYPE_ANDROID_HARDWARE_BUFFER_FORMAT_PROPERTIES_ANDROID};
+		VkAndroidHardwareBufferPropertiesANDROID props = {
+			VK_STRUCTURE_TYPE_ANDROID_HARDWARE_BUFFER_PROPERTIES_ANDROID, &format};
+		if (get_props(m_device, buffer, &props) != VK_SUCCESS || !props.memoryTypeBits ||
+			format.format != VK_FORMAT_R8G8B8A8_UNORM)
+			return fail("AHB Vulkan properties or RGBA8 format mismatch");
+		ExportImage image;
+		image.width = width;
+		image.height = height;
+		VkExternalMemoryImageCreateInfo ext = {VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_IMAGE_CREATE_INFO};
+		ext.handleTypes = VK_EXTERNAL_MEMORY_HANDLE_TYPE_ANDROID_HARDWARE_BUFFER_BIT_ANDROID;
+		VkImageCreateInfo ii = {VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO, &ext};
+		ii.imageType = VK_IMAGE_TYPE_2D;
+		ii.format = VK_FORMAT_R8G8B8A8_UNORM;
+		ii.extent = {width, height, 1};
+		ii.mipLevels = 1;
+		ii.arrayLayers = 1;
+		ii.samples = VK_SAMPLE_COUNT_1_BIT;
+		ii.tiling = VK_IMAGE_TILING_OPTIMAL;
+		ii.usage = VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
+		ii.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+		if (vkCreateImage(m_device, &ii, nullptr, &image.image) != VK_SUCCESS)
+			return fail("vkCreateImage failed");
+		VkImportAndroidHardwareBufferInfoANDROID imp = {VK_STRUCTURE_TYPE_IMPORT_ANDROID_HARDWARE_BUFFER_INFO_ANDROID};
+		imp.buffer = buffer;
+		VkMemoryDedicatedAllocateInfo dedicated = {VK_STRUCTURE_TYPE_MEMORY_DEDICATED_ALLOCATE_INFO, &imp};
+		dedicated.image = image.image;
+		VkMemoryAllocateInfo mai = {VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, &dedicated};
+		mai.allocationSize = props.allocationSize;
+		mai.memoryTypeIndex = static_cast<u32>(__builtin_ctz(props.memoryTypeBits));
+		if (vkAllocateMemory(m_device, &mai, nullptr, &image.memory) != VK_SUCCESS ||
+			vkBindImageMemory(m_device, image.image, image.memory, 0) != VK_SUCCESS)
+		{
+			if (image.memory) vkFreeMemory(m_device, image.memory, nullptr);
+			vkDestroyImage(m_device, image.image, nullptr);
+			return fail("AHB memory allocation or bind failed");
+		}
+		found = m_export_images.emplace(buffer, image).first;
+	}
+	ExportImage& image = found->second;
+	if (image.width != width || image.height != height)
+		return fail("cached AHB dimensions changed");
+	EndRenderPass();
+	auto* src = static_cast<GSTextureVK*>(source);
+	src->CommitClear();
+	src->SetUseFenceCounter(GetCurrentFenceCounter());
+	src->TransitionToLayout(GSTextureVK::Layout::TransferSrc);
+	const VkCommandBuffer cmd = GetCurrentCommandBuffer();
+	VkImageMemoryBarrier acquire = {VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
+	acquire.srcAccessMask = 0;
+	acquire.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+	acquire.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+	acquire.newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+	acquire.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+	acquire.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+	acquire.image = image.image;
+	acquire.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+	vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
+		0, 0, nullptr, 0, nullptr, 1, &acquire);
+	if (pad_x || pad_y || source->GetWidth() != width || source->GetHeight() != height)
+	{
+		VkClearColorValue black = {{0.f, 0.f, 0.f, 1.f}};
+		vkCmdClearColorImage(cmd, image.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &black, 1, &acquire.subresourceRange);
+		VkImageMemoryBarrier ordered = acquire;
+		ordered.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+		ordered.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+		vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
+			0, 0, nullptr, 0, nullptr, 1, &ordered);
+	}
+	VkImageCopy copy = {};
+	copy.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+	copy.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+	copy.dstOffset = {static_cast<s32>(pad_x), static_cast<s32>(pad_y), 0};
+	copy.extent = {static_cast<u32>(source->GetWidth()), static_cast<u32>(source->GetHeight()), 1};
+	vkCmdCopyImage(cmd, src->GetImage(), src->GetVkLayout(), image.image,
+		VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &copy);
+	VkImageMemoryBarrier release = acquire;
+	release.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+	release.dstAccessMask = 0;
+	release.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+	release.newLayout = VK_IMAGE_LAYOUT_GENERAL;
+	release.srcQueueFamilyIndex = m_graphics_queue_family_index;
+	release.dstQueueFamilyIndex = VK_QUEUE_FAMILY_FOREIGN_EXT;
+	vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,
+		0, 0, nullptr, 0, nullptr, 1, &release);
+	*fence_counter = GetCurrentFenceCounter();
+	ExecuteCommandBuffer(WaitType::None); // the adapter queues after this fence completes
+	return !m_last_submit_failed || fail("GS Vulkan command submission failed");
+}
+
+void GSDeviceVK::ReleaseExportAHB(AHardwareBuffer* buffer)
+{
+	auto found = m_export_images.find(buffer);
+	if (found == m_export_images.end())
+		return;
+	WaitForGPUIdle();
+	vkDestroyImage(m_device, found->second.image, nullptr);
+	vkFreeMemory(m_device, found->second.memory, nullptr);
+	m_export_images.erase(found);
+}
+#endif
 
 void GSDeviceVK::DoStretchRect(GSTexture* sTex, const GSVector4& sRect, GSTexture* dTex, const GSVector4& dRect,
 	ShaderConvertSelector shader, Filter filter)
