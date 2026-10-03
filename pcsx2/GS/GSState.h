@@ -474,6 +474,9 @@ protected:
 	// (shift, aa1); 6 = routing excludes the kernel (noroute).
 	void GKV1Note(u32 prim, u32 count, int path, int shift, bool aa1_expand, int force_reason);
 	void GKV1NoteSeam(u32 verts);
+	// GKV1 lane knob (GE1_GKV1_SHIFT0=1): route shift-0 grids through the
+	// kernel in keep-all mode. Default off (exact current behavior).
+	static bool GKV1Shift0Kernel();
 	// Which (prim, layout) pairs stage 3c instantiates a fused handler for.
 	//
 	// NOT every pair that could exist. A pair costs its handler, its staged loop,
