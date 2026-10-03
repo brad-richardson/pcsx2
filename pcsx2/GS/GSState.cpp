@@ -2260,6 +2260,186 @@ static constexpr bool KickKernelCarriesPrim()
 	return prim == GS_TRIANGLESTRIP || prim == GS_TRIANGLELIST || prim == GS_SPRITE;
 }
 
+// GKV1 census (lane branch only; GE1_GKV1_STATS=1 enables). Cumulative
+// counters + a periodic stderr dump. Relaxed atomics: the frontend can run on
+// the GsWorker and MTVU-GIF threads; torn reads only blur a histogram bin.
+namespace
+{
+	bool GKV1Enabled()
+	{
+		static int cached = -1;
+		if (cached < 0)
+		{
+			const char* e = std::getenv("GE1_GKV1_STATS");
+			cached = (e && e[0] == '1') ? 1 : 0;
+		}
+		return cached == 1;
+	}
+
+	struct GKV1Counters
+	{
+		std::atomic<u64> notes{0};
+		std::atomic<u64> kernel_b{0}, kernel_v{0};
+		std::atomic<u64> legacy_b{0}, legacy_v{0};
+		std::atomic<u64> staged_b{0}, staged_v{0};
+		std::atomic<u64> arma_b{0}, arma_v{0};
+		std::atomic<u64> r_prim_b[8]{}, r_prim_v[8]{};
+		std::atomic<u64> r_short_b{0}, r_short_v{0};
+		std::atomic<u64> r_knob_b{0}, r_knob_v{0};
+		std::atomic<u64> r_cull_b{0}, r_cull_v{0};
+		std::atomic<u64> r_aa1_b{0}, r_aa1_v{0};
+		std::atomic<u64> r_noroute_b{0}, r_noroute_v{0};
+		std::atomic<u64> seam_b{0}, seam_v{0};
+		// Last-dump snapshot for the delta section.
+		u64 d_kernel_v = 0, d_legacy_v = 0, d_staged_v = 0, d_arma_v = 0;
+		u64 d_short_v = 0, d_knob_v = 0, d_cull_v = 0, d_aa1_v = 0, d_noroute_v = 0, d_seam_v = 0;
+		u64 d_prim_v[8] = {};
+	};
+
+	GKV1Counters& GKV1State()
+	{
+		static GKV1Counters s;
+		return s;
+	}
+
+	void GKV1Dump()
+	{
+		GKV1Counters& s = GKV1State();
+		const u64 kernel_b = s.kernel_b.load(), kernel_v = s.kernel_v.load();
+		const u64 legacy_b = s.legacy_b.load(), legacy_v = s.legacy_v.load();
+		const u64 staged_b = s.staged_b.load(), staged_v = s.staged_v.load();
+		const u64 arma_b = s.arma_b.load(), arma_v = s.arma_v.load();
+		u64 prim_v[8];
+		for (int i = 0; i < 8; i++)
+			prim_v[i] = s.r_prim_v[i].load();
+		const u64 short_v = s.r_short_v.load(), knob_v = s.r_knob_v.load();
+		const u64 cull_v = s.r_cull_v.load(), aa1_v = s.r_aa1_v.load();
+		const u64 noroute_v = s.r_noroute_v.load(), seam_v = s.seam_v.load();
+		std::fprintf(stderr,
+			"[gkv1] n=%llu kernel b=%llu v=%llu (+%llu) legacy b=%llu v=%llu (+%llu) "
+			"staged b=%llu v=%llu (+%llu) armA b=%llu v=%llu (+%llu) | "
+			"fb prim0-7v=%llu/%llu/%llu/%llu/%llu/%llu/%llu/%llu short=%llu (+%llu) knob=%llu (+%llu) "
+			"cull=%llu (+%llu) aa1=%llu (+%llu) noroute=%llu (+%llu) | "
+			"seam b=%llu v=%llu (+%llu)\n",
+			(unsigned long long)s.notes.load(),
+			(unsigned long long)kernel_b, (unsigned long long)kernel_v, (unsigned long long)(kernel_v - s.d_kernel_v),
+			(unsigned long long)legacy_b, (unsigned long long)legacy_v, (unsigned long long)(legacy_v - s.d_legacy_v),
+			(unsigned long long)staged_b, (unsigned long long)staged_v, (unsigned long long)(staged_v - s.d_staged_v),
+			(unsigned long long)arma_b, (unsigned long long)arma_v, (unsigned long long)(arma_v - s.d_arma_v),
+			(unsigned long long)prim_v[0], (unsigned long long)prim_v[1], (unsigned long long)prim_v[2],
+			(unsigned long long)prim_v[3], (unsigned long long)prim_v[4], (unsigned long long)prim_v[5],
+			(unsigned long long)prim_v[6], (unsigned long long)prim_v[7],
+			(unsigned long long)short_v, (unsigned long long)(short_v - s.d_short_v),
+			(unsigned long long)knob_v, (unsigned long long)(knob_v - s.d_knob_v),
+			(unsigned long long)cull_v, (unsigned long long)(cull_v - s.d_cull_v),
+			(unsigned long long)aa1_v, (unsigned long long)(aa1_v - s.d_aa1_v),
+			(unsigned long long)noroute_v, (unsigned long long)(noroute_v - s.d_noroute_v),
+			(unsigned long long)s.seam_b.load(), (unsigned long long)seam_v,
+			(unsigned long long)(seam_v - s.d_seam_v));
+		s.d_kernel_v = kernel_v;
+		s.d_legacy_v = legacy_v;
+		s.d_staged_v = staged_v;
+		s.d_arma_v = arma_v;
+		s.d_short_v = short_v;
+		s.d_knob_v = knob_v;
+		s.d_cull_v = cull_v;
+		s.d_aa1_v = aa1_v;
+		s.d_noroute_v = noroute_v;
+		s.d_seam_v = seam_v;
+	}
+} // namespace
+
+// path: 0 kernel, 1 legacy, 2 staged, 3 autoflush-noroute arm. force_reason:
+// 0 = classify (prim / short / knob / aa1 / cull), 6 = routing excludes kernel.
+void GSState::GKV1Note(u32 prim, u32 count, int path, int shift, bool aa1_expand, int force_reason)
+{
+	if (!GKV1Enabled())
+		return;
+	GKV1Counters& s = GKV1State();
+	const u64 n = s.notes.fetch_add(1) + 1;
+	if (path == 0)
+	{
+		s.kernel_b.fetch_add(1);
+		s.kernel_v.fetch_add(count);
+	}
+	else if (path == 1)
+	{
+		s.legacy_b.fetch_add(1);
+		s.legacy_v.fetch_add(count);
+	}
+	else if (path == 2)
+	{
+		s.staged_b.fetch_add(1);
+		s.staged_v.fetch_add(count);
+	}
+	else
+	{
+		s.arma_b.fetch_add(1);
+		s.arma_v.fetch_add(count);
+	}
+	if (path != 0)
+	{
+		const bool carried = (prim == GS_TRIANGLESTRIP || prim == GS_TRIANGLELIST || prim == GS_SPRITE);
+		if (force_reason == 6)
+		{
+			s.r_noroute_b.fetch_add(1);
+			s.r_noroute_v.fetch_add(count);
+		}
+		else if (!carried)
+		{
+			if (prim < 8)
+			{
+				s.r_prim_b[prim].fetch_add(1);
+				s.r_prim_v[prim].fetch_add(count);
+			}
+		}
+		else if (count < GSVertexKickKernel::kMinKernelVertices)
+		{
+			s.r_short_b.fetch_add(1);
+			s.r_short_v.fetch_add(count);
+		}
+		else if (!s_fused_kick_use_kernel)
+		{
+			s.r_knob_b.fetch_add(1);
+			s.r_knob_v.fetch_add(count);
+		}
+		else if (aa1_expand)
+		{
+			s.r_aa1_b.fetch_add(1);
+			s.r_aa1_v.fetch_add(count);
+		}
+		else
+		{
+			s.r_cull_b.fetch_add(1);
+			s.r_cull_v.fetch_add(count);
+		}
+		(void)shift;
+	}
+	if ((n & 8191) == 0)
+		GKV1Dump();
+}
+
+void GSState::GKV1NoteSeam(u32 verts)
+{
+	if (!GKV1Enabled())
+		return;
+	GKV1Counters& s = GKV1State();
+	s.seam_b.fetch_add(1);
+	s.seam_v.fetch_add(verts);
+}
+
+// Computes (shift, aa1) from the current members and records one batch. Only
+// valid inside GSState member functions (reads PRIM, m_cull_grid).
+#define GKV1_NOTE(prim_, count_, path_, reason_) \
+	do { \
+		if (GKV1Enabled()) { \
+			const int gkv1_pc_ = GSUtil::GetPrimClass(prim_); \
+			const bool gkv1_aa1_ = PRIM->AA1 && IsCoverageAlphaSupported(); \
+			const int gkv1_sh_ = (gkv1_pc_ == GS_SPRITE_CLASS) ? m_cull_grid.sprite_shift : m_cull_grid.shift; \
+			GKV1Note((prim_), (count_), (path_), gkv1_sh_, gkv1_aa1_, (reason_)); \
+		} \
+	} while (0)
+
 template <u32 prim, GSVertexKernels::PackedLayout layout, bool auto_flush>
 constexpr GSState::GIFPackedRegHandlerC GSState::LayoutHandlerOrNull()
 {
@@ -2510,6 +2690,7 @@ void GSState::KickPackedBatchKernel(const GIFPackedReg* RESTRICT r, u32 count)
 			if (!cull_ok)
 			{
 				const u32 run = std::min<u32>(count - k, GSVertexKickKernel::kChunkVertices);
+				GKV1NoteSeam(run);
 				KickPackedStagedRun<prim, layout>(r + k * stride, run);
 				k += run;
 				snapshot_done = false;
@@ -2533,6 +2714,7 @@ void GSState::KickPackedBatchKernel(const GIFPackedReg* RESTRICT r, u32 count)
 			{
 				KickPackedOneLegacy<prim, layout>(r + k * stride, uvfog, depth_clamp);
 			}
+			GKV1NoteSeam(1);
 			k++;
 			snapshot_done = (!overlap_active && snapshot_pending && fills);
 			continue;
@@ -2565,6 +2747,7 @@ void GSState::KickPackedBatchKernel(const GIFPackedReg* RESTRICT r, u32 count)
 			{
 				KickPackedOneLegacy<prim, layout>(r + k * stride, uvfog, depth_clamp);
 			}
+			GKV1NoteSeam(1);
 			k++;
 			snapshot_done = false;
 			continue;
@@ -2595,6 +2778,7 @@ void GSState::KickPackedBatchKernel(const GIFPackedReg* RESTRICT r, u32 count)
 			int tex_layer = 0;
 			if (IsAutoFlushDraw(prim, tex_layer))
 			{
+				GKV1NoteSeam(chunk);
 				KickPackedStagedRun<prim, layout>(r + k * stride, chunk);
 				k += chunk;
 				// A staged kick can flush, which restores an environment and can
@@ -2693,6 +2877,7 @@ void GSState::GIFPackedRegHandlerSTQRGBAXYZF2(const GIFPackedReg* RESTRICT r, u3
 			r += 3;
 		}
 
+		GKV1_NOTE(prim, size / 3, 3, 6);
 		m_q = r[-3].STQ.Q; // remember the last one, STQ outputs this to the temp Q each time
 		return;
 	}
@@ -2722,6 +2907,7 @@ void GSState::GIFPackedRegHandlerSTQRGBAXYZF2(const GIFPackedReg* RESTRICT r, u3
 				r += 3;
 			}
 
+			GKV1_NOTE(prim, size / 3, 2, 0);
 			m_q = r[-3].STQ.Q; // remember the last one, STQ outputs this to the temp Q each time
 			return;
 		}
@@ -2733,18 +2919,29 @@ void GSState::GIFPackedRegHandlerSTQRGBAXYZF2(const GIFPackedReg* RESTRICT r, u3
 	{
 		if (s_fused_kick_use_kernel && count >= GSVertexKickKernel::kMinKernelVertices &&
 			KickKernelApplies<prim>())
+		{
+			GKV1_NOTE(prim, count, 0, 0);
 			KickPackedBatchKernel<prim, GSVertexKernels::PackedLayout::TripleXYZF2, auto_flush>(r, count);
+		}
 		else if constexpr (auto_flush)
+		{
+			GKV1_NOTE(prim, count, 2, 0);
 			KickPackedStagedRun<prim, GSVertexKernels::PackedLayout::TripleXYZF2>(r, count);
+		}
 		else
+		{
+			GKV1_NOTE(prim, count, 1, 0);
 			KickPackedBatchLegacy<prim, GSVertexKernels::PackedLayout::TripleXYZF2>(r, count);
+		}
 	}
 	else if constexpr (auto_flush)
 	{
+		GKV1_NOTE(prim, count, 2, 0);
 		KickPackedStagedRun<prim, GSVertexKernels::PackedLayout::TripleXYZF2>(r, count);
 	}
 	else
 	{
+		GKV1_NOTE(prim, count, 1, 0);
 		KickPackedBatchLegacy<prim, GSVertexKernels::PackedLayout::TripleXYZF2>(r, count);
 	}
 
@@ -2787,6 +2984,7 @@ void GSState::GIFPackedRegHandlerSTQRGBAXYZ2(const GIFPackedReg* RESTRICT r, u32
 			r += 3;
 		}
 
+		GKV1_NOTE(prim, size / 3, 3, 6);
 		m_q = r[-3].STQ.Q; // remember the last one, STQ outputs this to the temp Q each time
 		return;
 	}
@@ -2819,6 +3017,7 @@ void GSState::GIFPackedRegHandlerSTQRGBAXYZ2(const GIFPackedReg* RESTRICT r, u32
 				r += 3;
 			}
 
+			GKV1_NOTE(prim, size / 3, 2, 0);
 			m_q = r[-3].STQ.Q; // remember the last one, STQ outputs this to the temp Q each time
 			return;
 		}
@@ -2830,18 +3029,29 @@ void GSState::GIFPackedRegHandlerSTQRGBAXYZ2(const GIFPackedReg* RESTRICT r, u32
 	{
 		if (s_fused_kick_use_kernel && count >= GSVertexKickKernel::kMinKernelVertices &&
 			KickKernelApplies<prim>())
+		{
+			GKV1_NOTE(prim, count, 0, 0);
 			KickPackedBatchKernel<prim, GSVertexKernels::PackedLayout::TripleXYZ2, auto_flush>(r, count);
+		}
 		else if constexpr (auto_flush)
+		{
+			GKV1_NOTE(prim, count, 2, 0);
 			KickPackedStagedRun<prim, GSVertexKernels::PackedLayout::TripleXYZ2>(r, count);
+		}
 		else
+		{
+			GKV1_NOTE(prim, count, 1, 0);
 			KickPackedBatchLegacy<prim, GSVertexKernels::PackedLayout::TripleXYZ2>(r, count);
+		}
 	}
 	else if constexpr (auto_flush)
 	{
+		GKV1_NOTE(prim, count, 2, 6);
 		KickPackedStagedRun<prim, GSVertexKernels::PackedLayout::TripleXYZ2>(r, count);
 	}
 	else
 	{
+		GKV1_NOTE(prim, count, 1, 0);
 		KickPackedBatchLegacy<prim, GSVertexKernels::PackedLayout::TripleXYZ2>(r, count);
 	}
 
@@ -2964,6 +3174,7 @@ void GSState::GIFPackedRegHandlerLayout(const GIFPackedReg* RESTRICT r, u32 size
 			// state, so the run stays on the staged loop. It still loses the
 			// per-qword dispatch and the two indirect handler calls a vertex,
 			// which is what stage 3c option (a) is.
+			GKV1_NOTE(prim, n, 2, 6);
 			KickPackedStagedRun<prim, layout>(rest, n);
 		}
 		else
@@ -2978,6 +3189,7 @@ void GSState::GIFPackedRegHandlerLayout(const GIFPackedReg* RESTRICT r, u32 size
 				if (s_fused_kick_use_kernel && n >= GSVertexKickKernel::kMinKernelVertices &&
 					KickKernelApplies<prim>())
 				{
+					GKV1_NOTE(prim, n, 0, 0);
 					KickPackedBatchKernel<prim, layout, auto_flush>(rest, n);
 					kicked = true;
 				}
@@ -2986,9 +3198,15 @@ void GSState::GIFPackedRegHandlerLayout(const GIFPackedReg* RESTRICT r, u32 size
 			if (!kicked)
 			{
 				if constexpr (auto_flush)
+				{
+					GKV1_NOTE(prim, n, 2, 0);
 					KickPackedStagedRun<prim, layout>(rest, n);
+				}
 				else
+				{
+					GKV1_NOTE(prim, n, 1, 0);
 					KickPackedBatchLegacy<prim, layout>(rest, n);
+				}
 			}
 		}
 	}
