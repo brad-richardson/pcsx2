@@ -468,6 +468,12 @@ protected:
 	template<u32 prim, GSVertexKernels::PackedLayout layout> void KickPackedStagedRun(const GIFPackedReg* RESTRICT r, u32 count);
 	template<u32 prim, GSVertexKernels::PackedLayout layout> void KickPackedOneLegacy(const GIFPackedReg* RESTRICT rv, u64 uvfog, GSLimit24BitDepth depth_clamp);
 	template<u32 prim> bool KickKernelApplies();
+	// GKV1 census (lane branch only): per-batch two-pass vs legacy + fallback
+	// reason. No-op unless GE1_GKV1_STATS=1. paths: 0 kernel, 1 legacy,
+	// 2 staged, 3 autoflush-noroute arm. force_reason 0 = classify from
+	// (shift, aa1); 6 = routing excludes the kernel (noroute).
+	void GKV1Note(u32 prim, u32 count, int path, int shift, bool aa1_expand, int force_reason);
+	void GKV1NoteSeam(u32 verts);
 	// Which (prim, layout) pairs stage 3c instantiates a fused handler for.
 	//
 	// NOT every pair that could exist. A pair costs its handler, its staged loop,
