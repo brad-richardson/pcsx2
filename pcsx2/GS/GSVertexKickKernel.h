@@ -120,6 +120,14 @@ namespace GSVertexKickKernel
 		// per-prim decision: without draw buffering the heuristic that reads the
 		// rect returns at its first line and the accumulation is dead work.
 		bool track_native_rect;
+		// GKV1 lane knob (GE1_GKV1_SHIFT0): keep-all mode for shift-0 grids
+		// (non-power-of-two upscales, e.g. 2.5x). The scalar band test is a
+		// native-width interior test the legacy path does not run at shift 0
+		// (CullGridEmpty returns 0 there), so pass two skips it and applies the
+		// shipped empty-bbox test to the computed bbox instead. Outcodes, the
+		// coincident-degenerate test, bbox rounding and rect accumulation are
+		// unchanged. Appended last so every field above keeps its offset.
+		bool shift0_keepall = false;
 	};
 
 	// The buffer cursor is NOT marshalled. Every field of it -- head, tail, next,
@@ -444,6 +452,9 @@ namespace GSVertexKickKernel
 	//   * the scalar-outcode cull applies -- the prim's class has a cull grid and
 	//     there is no AA1 expansion -- so the decision is the band/outcode pair and
 	//     the accepted-prim bbox takes whichever rounding inv.grid names;
+	//     GKV1 exception: under GE1_GKV1_SHIFT0 a shift-0 class enters in keep-all
+	//     mode (inv.shift0_keepall), where the band test is skipped and the shipped
+	//     empty-bbox test applies instead, matching the legacy shift-0 path;
 	//   * tail + count + 3 <= maxcount, so no growth can be needed;
 	//   * tail + count < MaxVerticesForPrim, so no VERTEXCOUNT flush can be
 	//     needed.
@@ -459,6 +470,10 @@ namespace GSVertexKickKernel
 		constexpr int primclass = GSUtil::GetPrimClass(prim);
 		constexpr bool strip = (prim == GS_TRIANGLESTRIP);
 		static_assert(prim == GS_TRIANGLESTRIP || prim == GS_TRIANGLELIST || prim == GS_SPRITE);
+		// GKV1: shift-0 keep-all mode is armed per entry through inv (the knob
+		// lives in GSState; the routing gate already confines shift-0 kernel
+		// entries to knob-on runs, this re-checks at the point of use).
+		const bool shift0_keepall = inv.shift0_keepall;
 
 		GSVertex* RESTRICT vbuff = vertex_buf->buff;
 		u16* RESTRICT ibuff = index_buf->buff;
@@ -560,7 +575,44 @@ namespace GSVertexKickKernel
 				const GSVertexKernels::CullMirrorEntry e0{xyp0, meta0};
 				const GSVertexKernels::CullMirrorEntry e1{xyp1, meta1};
 				const GSVertexKernels::CullMirrorEntry e2{xyp2, meta2};
-				skip = GSVertexKernels::CullTestScalar<n, primclass>(e0, e1, e2);
+				if (shift0_keepall)
+				{
+					// Shift-0 keep-all (GKV1): the outcode AND plus the
+					// coincident-degenerate test, exactly the legacy CullTest's
+					// scissor + degenerate parts at shift 0. No band test: bands
+					// are built at native width there and the legacy path does not
+					// consult them (CullGridEmpty returns 0 at shift 0). The
+					// empty-bbox part follows on the computed bbox below.
+					u64 all_out = e0.meta;
+					if constexpr (n >= 2)
+						all_out &= e1.meta;
+					if constexpr (n == 3)
+						all_out &= e2.meta;
+					if ((all_out & GSVertexKernels::kCullMetaOutcodeMask) != 0)
+						skip = 1;
+					else if constexpr (primclass == GS_TRIANGLE_CLASS)
+					{
+						if (e0.xyp == e1.xyp || e1.xyp == e2.xyp || e0.xyp == e2.xyp)
+							skip = 1;
+					}
+				}
+				else
+					skip = GSVertexKernels::CullTestScalar<n, primclass>(e0, e1, e2);
+			}
+	
+			// GKV1 shift-0: the shipped empty-bbox test, on the same rounded bbox
+			// the accept path consumes. Legacy CullTest rejects rempty bboxes at
+			// shift 0 without consulting any grid; the kernel's band test (which
+			// subsumes rempty at shift 4) is off in this mode, so this is the
+			// replacement. Computed from the same window values through the same
+			// function, so an accepted prim's bbox is unchanged.
+			GSVector4i shift0_bbox = GSVector4i::zero();
+			if (shift0_keepall && skip == 0)
+			{
+				shift0_bbox = GSVertexKernels::ComputeCullBBox<n, primclass>(
+					BroadcastXY(xyp0), BroadcastXY(xyp1), BroadcastXY(xyp2), inv.grid, false);
+				if (shift0_bbox.rempty())
+					skip = 1;
 			}
 
 			if (skip != 0)
@@ -591,9 +643,11 @@ namespace GSVertexKickKernel
 #endif
 				}
 			}
-
-			const GSVector4i bbox = GSVertexKernels::ComputeCullBBox<n, primclass>(
-				BroadcastXY(xyp0), BroadcastXY(xyp1), BroadcastXY(xyp2), inv.grid, false);
+	
+			// In shift-0 mode the bbox above is already the accept path's value.
+			const GSVector4i bbox = shift0_keepall ? shift0_bbox :
+			                                        GSVertexKernels::ComputeCullBBox<n, primclass>(
+			                                        BroadcastXY(xyp0), BroadcastXY(xyp1), BroadcastXY(xyp2), inv.grid, false);
 
 			if constexpr (prim == GS_TRIANGLESTRIP)
 			{

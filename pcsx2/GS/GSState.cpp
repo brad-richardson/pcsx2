@@ -2247,7 +2247,24 @@ __fi bool GSState::KickKernelApplies()
 {
 	constexpr int primclass = GSUtil::GetPrimClass(prim);
 	const bool aa1_expand = PRIM->AA1 && IsCoverageAlphaSupported();
-	return m_cull_grid.ShiftFor<primclass>() != 0 && !aa1_expand;
+	if (aa1_expand)
+		return false;
+	if (m_cull_grid.ShiftFor<primclass>() != 0)
+		return true;
+	// GKV1 lane knob (GE1_GKV1_SHIFT0): shift-0 keep-all kernel mode for
+	// non-power-of-two upscales (e.g. the iPad's 2.5x). Default off.
+	return GKV1Shift0Kernel();
+}
+
+bool GSState::GKV1Shift0Kernel()
+{
+	static int cached = -1;
+	if (cached < 0)
+	{
+		const char* e = std::getenv("GE1_GKV1_SHIFT0");
+		cached = (e && e[0] == '1') ? 1 : 0;
+	}
+	return cached == 1;
 }
 
 // Whether the two-pass kernel (GSVertexKickKernel.h) carries this prim type at
@@ -2801,6 +2818,11 @@ void GSState::KickPackedBatchKernel(const GIFPackedReg* RESTRICT r, u32 count)
 		// the class has a grid, so this is the same choice MakeKickMirror makes.
 		inv.grid = m_cull_grid;
 		inv.bounds = (inv.grid.shift == 4) ? m_cull_bounds_band : m_cull_bounds_raw;
+		// GKV1: arm shift-0 keep-all when this entry's class has no grid. The
+		// routing gate already confines shift-0 kernel entries to knob-on runs;
+		// re-checked here at the point of use like the cull bounds above.
+		inv.shift0_keepall = GKV1Shift0Kernel() &&
+		                     (((GSUtil::GetPrimClass(prim) == GS_SPRITE_CLASS) ? inv.grid.sprite_shift : inv.grid.shift) == 0);
 		inv.shade = (PRIM->TME ? 1u : 0u) | (PRIM->FST ? 2u : 0u) | (PRIM->IIP ? 4u : 0u);
 		inv.sprite_q_fix = (prim == GS_SPRITE) && (m_env.PRIM.FST == 0);
 		// A carrying layout's carry is re-read here for the same reason the cull
