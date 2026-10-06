@@ -6,6 +6,7 @@
 #include "GS/Renderers/HW/GSTextureCache.h"
 
 #include <functional>
+#include <string>
 #include <utility>
 
 namespace GSTextureReplacements
@@ -33,6 +34,10 @@ namespace GSTextureReplacements
 		/// complete, so the GPU must not regenerate it from the base level.
 		bool generated = false;
 	};
+
+	/// RMT1: absolute dump/replacement directories for an embedding host without a VM disc
+	/// serial (GE1). Set before the HW renderer is created; empty strings restore the default.
+	void SetDirectoryOverride(std::string dump_dir, std::string replace_dir);
 
 	void Initialize();
 	void GameChanged();
