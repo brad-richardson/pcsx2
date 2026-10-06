@@ -7632,6 +7632,7 @@ GSTextureCache::HashCacheEntry* GSTextureCache::LookupHashCache(const GIFRegTEX0
 		g_perfmon.Put(GSPerfMon::HashCacheHit, 1);
 		GL_CACHE("TC: HC Hit: %" PRIx64 " %" PRIx64 " R-%ux%u", key.TEX0Hash, key.CLUTHash, key.region_width, key.region_height);
 		HashCacheEntry* entry = &it->second;
+		if (entry->is_replacement) GSTextureReplacements::NoteUsed(it->first);
 		paltex &= (entry->texture->GetFormat() == GSTexture::Format::UNorm8);
 		entry->refcount++;
 		return entry;
