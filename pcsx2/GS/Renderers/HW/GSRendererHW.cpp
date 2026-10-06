@@ -9650,6 +9650,20 @@ __ri void GSRendererHW::EmulateTextureSampler(const GSTextureCache::Target* rt, 
 		if (psm.depth)
 		{
 			m_conf.ps.depth_fmt = !tex->m_texture->IsDepthLike() ? 3 : tex->m_32_bits_fmt ? 1 : 2;
+
+			// Identity depth-copy shuffles must retain interpolated fixed UV until
+			// conversion to the device grid. Truncating first loses a depth texel
+			// at 3x and fractional scales. Reject non-copy and region mappings.
+			if (tex->m_texture->IsDepthLike() &&
+				m_vt.m_primclass == GS_SPRITE_CLASS && PRIM->FST &&
+				scale_factor > 1.0f && scale_factor == scale_rt && !target_region &&
+				!m_vt.IsLinear() && m_conf.ps.wms == 0 && m_conf.ps.wmt == 0 &&
+				m_vt.m_min.p.x >= 0.0f && m_vt.m_min.p.y >= 0.0f &&
+				m_vt.m_min.p.x == m_vt.m_min.t.x && m_vt.m_min.p.y == m_vt.m_min.t.y &&
+				m_vt.m_max.p.x == m_vt.m_max.t.x && m_vt.m_max.p.y == m_vt.m_max.t.y)
+			{
+				m_conf.cb_ps.ScaleFactor.w = 1.0f;
+			}
 		}
 
 		// Shuffle is a 16 bits format, so aem is always required
