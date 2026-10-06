@@ -1169,7 +1169,10 @@ GSTexture* GSTextureReplacements::CreateReplacementTexture(const ReplacementText
 
 	GSTexture* tex = g_gs_device->CreateTexture(rtex.width, rtex.height, static_cast<int>(rtex.mips.size()) + 1, rtex.format);
 	if (!tex)
+	{
+		if (s_telemetry) ++s_failed;
 		return nullptr;
+	}
 
 	// Update() CAN fail, and its result was being discarded. On Vulkan an upload needs either room
 	// in the shared streaming buffer or a dedicated staging allocation (GSTextureVK::DoUpdate), and
@@ -1182,6 +1185,7 @@ GSTexture* GSTextureReplacements::CreateReplacementTexture(const ReplacementText
 	// texture instead, so the game falls back to its original and the pack degrades to "not
 	// replaced" rather than "corrupt".
 	const auto upload_failed = [&](u32 level) {
+		if (s_telemetry) ++s_failed;
 		static bool logged_once = false;
 		if (!logged_once)
 		{
