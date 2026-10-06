@@ -188,6 +188,12 @@ namespace GSTextureReplacements
 
 	static std::string s_current_serial;
 
+	/// RMT1: absolute dump/replacement directories set by an embedding host (GE1) that runs no
+	/// VM, so has no disc serial. Empty = the usual <Textures>/<serial>/{dumps,replacements}.
+	static std::string s_dump_dir_override;
+	static std::string s_replace_dir_override;
+	static constexpr const char* OVERRIDE_SERIAL = "GE1";
+
 	/// Textures that have been dumped, to save stat() calls.
 	static std::unordered_set<TextureName> s_dumped_textures;
 	static std::mutex s_dumped_textures_mutex;
@@ -541,9 +547,15 @@ std::string GSTextureReplacements::GetDumpFilename(const TextureName& name, u32 
 		return ret;
 
 	const std::string game_dir(GetGameTextureDirectory());
-	const std::string game_subdir(Path::Combine(game_dir, TEXTURE_DUMP_SUBDIRECTORY_NAME));
+	const std::string game_subdir(s_dump_dir_override.empty() ?
+		Path::Combine(game_dir, TEXTURE_DUMP_SUBDIRECTORY_NAME) : s_dump_dir_override);
 
-	if (!FileSystem::DirectoryExists(game_subdir.c_str()))
+	if (!s_dump_dir_override.empty())
+	{
+		if (!FileSystem::DirectoryExists(game_subdir.c_str()) && !FileSystem::CreateDirectoryPath(game_subdir.c_str(), true))
+			return ret;
+	}
+	else if (!FileSystem::DirectoryExists(game_subdir.c_str()))
 	{
 		// create both dumps and replacements
 		if (!FileSystem::CreateDirectoryPath(game_dir.c_str(), false) ||
@@ -600,9 +612,25 @@ std::string GSTextureReplacements::GetDumpFilename(const TextureName& name, u32 
 	return ret;
 }
 
+void GSTextureReplacements::SetDirectoryOverride(std::string dump_dir, std::string replace_dir)
+{
+	s_dump_dir_override = std::move(dump_dir);
+	s_replace_dir_override = std::move(replace_dir);
+}
+
+static std::string GetCurrentSerial()
+{
+	std::string serial = VMManager::GetDiscSerial();
+	// RMT1: a host with directory overrides and no VM still gets dumps and replacements.
+	if (serial.empty() && (!GSTextureReplacements::s_dump_dir_override.empty() ||
+							  !GSTextureReplacements::s_replace_dir_override.empty()))
+		serial = GSTextureReplacements::OVERRIDE_SERIAL;
+	return serial;
+}
+
 void GSTextureReplacements::Initialize()
 {
-	s_current_serial = VMManager::GetDiscSerial();
+	s_current_serial = GetCurrentSerial();
 
 	if (GSConfig.DumpReplaceableTextures || GSConfig.LoadTextureReplacements)
 		StartWorkerThread();
@@ -617,7 +645,7 @@ void GSTextureReplacements::Initialize()
 
 void GSTextureReplacements::GameChanged()
 {
-	std::string new_serial = VMManager::GetDiscSerial();
+	std::string new_serial = GetCurrentSerial();
 	if (s_current_serial == new_serial)
 		return;
 
@@ -679,14 +707,17 @@ void GSTextureReplacements::ReloadReplacementMap()
 	}
 
 	const std::string texture_dir = GetGameTextureDirectory();
-	const std::string replacement_dir(Path::Combine(texture_dir, TEXTURE_REPLACEMENT_SUBDIRECTORY_NAME));
+	const std::string replacement_dir(s_replace_dir_override.empty() ?
+		Path::Combine(texture_dir, TEXTURE_REPLACEMENT_SUBDIRECTORY_NAME) : s_replace_dir_override);
 
 	FileSystem::FindResultsArray files;
 
 	// For some reason texture pack authors think it's a good idea to rename the replacements directory to something with the wrong case...
 	std::string wrong_case_path;
 	const std::string* right_case_path = nullptr;
-	if (GetWrongCasePath(&wrong_case_path, EmuFolders::Textures.c_str(), s_current_serial, &files))
+	if (!s_replace_dir_override.empty())
+		; // RMT1: an absolute directory from the host; nothing to second-guess.
+	else if (GetWrongCasePath(&wrong_case_path, EmuFolders::Textures.c_str(), s_current_serial, &files))
 		right_case_path = &texture_dir;
 	else if (GetWrongCasePath(&wrong_case_path, texture_dir.c_str(), TEXTURE_REPLACEMENT_SUBDIRECTORY_NAME, &files))
 		right_case_path = &replacement_dir;
