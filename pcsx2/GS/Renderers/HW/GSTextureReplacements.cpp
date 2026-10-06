@@ -25,8 +25,11 @@
 
 #include <atomic>
 #include <cinttypes>
+#include <atomic>
+#include <chrono>
 #include <condition_variable>
 #include <cstring>
+#include <cstdlib>
 #include <deque>
 #include <functional>
 #include <list>
@@ -187,6 +190,11 @@ namespace GSTextureReplacements
 	static void NotifyStartupCompleteForCurrentGame();
 
 	static std::string s_current_serial;
+	static bool s_telemetry = false;
+	static std::chrono::steady_clock::time_point s_telemetry_boot;
+	static std::atomic<u64> s_loaded{0}, s_failed{0}, s_precache_ms{0};
+	static std::unordered_set<TextureName> s_used; // GS thread only, cumulative by complete hash key
+
 
 	/// RMT1: absolute dump/replacement directories set by an embedding host (GE1) that runs no
 	/// VM, so has no disc serial. Empty = the usual <Textures>/<serial>/{dumps,replacements}.
@@ -630,6 +638,10 @@ static std::string GetCurrentSerial()
 
 void GSTextureReplacements::Initialize()
 {
+	const char* tel = std::getenv("PS2X_GS_TELEMETRY");
+	s_telemetry = tel && *tel;
+	s_telemetry_boot = std::chrono::steady_clock::now();
+	s_loaded = 0; s_failed = 0; s_precache_ms = 0; s_used.clear();
 	s_current_serial = GetCurrentSerial();
 
 	if (GSConfig.DumpReplaceableTextures || GSConfig.LoadTextureReplacements)
@@ -899,7 +911,9 @@ GSTexture* GSTextureReplacements::LookupReplacementTexture(const GSTextureCache:
 			// replacement is cached, can immediately upload to host GPU
 			TouchReplacementCacheLocked(name);
 			*alpha_minmax = it->second.alpha_minmax;
-			return CreateReplacementTexture(it->second, mipmap);
+			GSTexture* tex = CreateReplacementTexture(it->second, mipmap);
+			if (tex && s_telemetry) s_used.insert(name);
+			return tex;
 		}
 	}
 
@@ -930,7 +944,9 @@ GSTexture* GSTextureReplacements::LookupReplacementTexture(const GSTextureCache:
 
 		// and upload to gpu
 		*alpha_minmax = rtex->alpha_minmax;
-		return CreateReplacementTexture(*rtex, mipmap);
+		GSTexture* tex = CreateReplacementTexture(*rtex, mipmap);
+		if (tex && s_telemetry) s_used.insert(name);
+		return tex;
 	}
 }
 
@@ -1026,15 +1042,20 @@ std::optional<GSTextureReplacements::ReplacementTexture> GSTextureReplacements::
 {
 	ReplacementTextureLoader loader = GetLoader(filename);
 	if (!loader)
+	{
+		if (s_telemetry) ++s_failed;
 		return std::nullopt;
+	}
 
 	ReplacementTexture rtex;
 	if (!loader(filename.c_str(), &rtex, only_base_image))
 	{
+		if (s_telemetry) ++s_failed;
 		Console.Warning("Failed to load replacement texture %s", filename.c_str());
 		return std::nullopt;
 	}
 
+	if (s_telemetry) ++s_loaded;
 	SetReplacementTextureAlphaMinMax(rtex);
 
 	return rtex;
@@ -1107,6 +1128,11 @@ void GSTextureReplacements::PrecacheReplacementTextures()
 		// precaching always goes async.. for now
 		QueueAsyncReplacementTextureLoad(it.first, it.second, mipmap, true);
 	}
+	if (s_telemetry)
+		QueueWorkerThreadItem([]() {
+			s_precache_ms.store(1 + std::chrono::duration_cast<std::chrono::milliseconds>(
+				std::chrono::steady_clock::now() - s_telemetry_boot).count(), std::memory_order_relaxed);
+		}, false);
 }
 
 void GSTextureReplacements::ClearReplacementTextures()
@@ -1941,4 +1967,22 @@ void GSTextureReplacements::SetUpscaleMode()
 
 	if (filters)
 		StartUpscaleWorkers();
+}
+
+// TEL4: called on the GS thread, only while PS2X_GS_TELEMETRY is enabled.
+void GSTextureReplacements::NoteUsed(const GSTextureCache::HashCacheKey& hash)
+{
+	if (s_telemetry) s_used.insert(CreateTextureName(hash, 0));
+}
+void GSTextureReplacements::Telemetry(u64 out[8])
+{
+	std::unique_lock<std::mutex> lock(s_replacement_texture_cache_mutex);
+	out[0] = s_replacement_texture_filenames.size();
+	out[1] = s_precache_ms.load(std::memory_order_relaxed); // 0=pending/off; otherwise ms+1
+	out[2] = s_loaded.load(std::memory_order_relaxed);
+	out[3] = s_used.size();
+	out[4] = s_replacement_texture_cache_bytes;
+	out[5] = s_failed.load(std::memory_order_relaxed);
+	out[6] = g_texture_cache ? g_texture_cache->GetHashCacheReplacementMemoryUsage() : 0;
+	out[7] = g_texture_cache ? g_texture_cache->GetHashCacheMemoryUsage() : 0;
 }

@@ -39,6 +39,8 @@ namespace GSTextureReplacements
 	/// serial (GE1). Set before the HW renderer is created; empty strings restore the default.
 	void SetDirectoryOverride(std::string dump_dir, std::string replace_dir);
 
+	void NoteUsed(const GSTextureCache::HashCacheKey& hash);
+	void Telemetry(u64 out[8]);
 	void Initialize();
 	void GameChanged();
 	void ReloadReplacementMap();
