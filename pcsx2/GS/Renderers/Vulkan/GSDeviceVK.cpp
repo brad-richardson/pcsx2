@@ -8463,6 +8463,12 @@ void GSDeviceVK::GetAndResetStallStats(u64 out[6])
 	out[5] = m_tex_create_ns.exchange(0, std::memory_order_relaxed);
 }
 
+void GSDeviceVK::SetPipelineCacheFlushDeferred(bool deferred)
+{
+	if (g_vulkan_shader_cache)
+		g_vulkan_shader_cache->SetPipelineCacheFlushDeferred(deferred);
+}
+
 bool GSDeviceVK::FlushPipelineCache()
 {
 	return g_vulkan_shader_cache ? g_vulkan_shader_cache->FlushPipelineCache() : false;

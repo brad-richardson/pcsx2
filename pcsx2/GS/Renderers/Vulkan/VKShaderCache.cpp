@@ -589,6 +589,11 @@ bool VKShaderCache::ReadExistingPipelineCache()
 
 bool VKShaderCache::FlushPipelineCache(bool force)
 {
+	// PCF1: cover both periodic requests and GetTFXPipeline auto-flushes.
+	// Leave dirty set for the next menu/app-pause; teardown still forces persistence.
+	if (!force && m_pipeline_cache_flush_deferred.load(std::memory_order_relaxed))
+		return false;
+
 	if (m_pipeline_cache == VK_NULL_HANDLE || !m_pipeline_cache_dirty || m_pipeline_cache_filename.empty())
 		return false;
 
