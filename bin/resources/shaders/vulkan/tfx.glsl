@@ -649,7 +649,7 @@ layout(std140, set = 0, binding = 1) uniform cb1
 	float ScaledScaleFactor;
 	float RcpScaleFactor;
 	float RtScaleFactor; // the render target's scale; ScaledScaleFactor is the texture's
-	float _pad1_cb1;
+	float DepthShuffleFix; // formerly padding; identity depth-copy shuffle only
 	float LineCovScale;
 	uint SubstituteAlphaKeep;
 	uint SubstituteAlphaValue;
@@ -1139,6 +1139,9 @@ ivec2 clamp_wrap_uv_depth(ivec2 uv)
 vec4 sample_depth(vec2 st, ivec2 pos)
 {
 	vec2 uv_f = vec2(clamp_wrap_uv_depth(ivec2(st))) * vec2(ScaledScaleFactor);
+	// Structurally gated identity depth-copy shuffle, without region addressing.
+	if (DepthShuffleFix > 0.5f)
+		uv_f = st * ScaledScaleFactor;
 
 	#if PS_REGION_RECT == 1
 		uv_f = clamp(uv_f + STRange.xy, STRange.xy, STRange.zw);

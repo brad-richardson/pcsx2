@@ -1014,6 +1014,9 @@ struct PSMain
 	float4 sample_depth(float2 st)
 	{
 		float2 uv_f = float2(clamp_wrap_uv_depth(ushort2(st))) * float2(cb.scale_factor.x);
+		// Structurally gated identity depth-copy shuffle, without region addressing.
+		if (cb.scale_factor.w > 0.5f)
+			uv_f = st * cb.scale_factor.x;
 
 		if (PS_REGION_RECT)
 			uv_f = clamp(uv_f + cb.st_range.xy, cb.st_range.xy, cb.st_range.zw);
