@@ -5,6 +5,7 @@
 
 #include "GS/Renderers/HW/GSTextureCache.h"
 
+#include <string>
 #include <utility>
 
 namespace GSTextureReplacements
@@ -28,6 +29,10 @@ namespace GSTextureReplacements
 		};
 		std::vector<MipData> mips;
 	};
+
+	/// RMT1: absolute dump/replacement directories for an embedding host without a VM disc
+	/// serial (GE1). Set before the HW renderer is created; empty strings restore the default.
+	void SetDirectoryOverride(std::string dump_dir, std::string replace_dir);
 
 	void Initialize();
 	void GameChanged();
