@@ -145,6 +145,7 @@ float GSGetAndResetAccumulatedGPUTime();
 float GSGetAndResetBackThreadMs();
 // PW1: pipeline-cache pre-warm. All no-op (zeros) unless the VK device is up; GS thread only.
 void GSFlushPipelineCache();
+void GSSetPipelineCacheFlushDeferred(bool deferred);
 void GSGetAndResetPipelineStats(u64* tfx_pipelines, u64* tfx_ns, u64* spv_compiles, u64* spv_ns);
 u32 GSGetTFXSelectorSize();
 void GSSetTFXSelectorRecord(bool enabled);

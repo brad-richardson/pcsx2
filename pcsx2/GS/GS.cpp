@@ -102,6 +102,14 @@ static GSDevice* GetMTLDeviceForPW1()
 }
 #endif
 
+void GSSetPipelineCacheFlushDeferred(bool deferred)
+{
+#ifdef ENABLE_VULKAN
+	if (GSDeviceVK* dev = GetVKDeviceForPW1())
+		dev->SetPipelineCacheFlushDeferred(deferred);
+#endif
+}
+
 void GSFlushPipelineCache()
 {
 #ifdef ENABLE_VULKAN

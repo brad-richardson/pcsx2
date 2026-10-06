@@ -33,6 +33,10 @@ public:
 	/// Serialises the pipeline cache to disk. This is SYNCHRONOUS and runs on the GS thread, so it
 	/// is rate-limited: pass force=true only where a missed flush actually loses data (teardown).
 	bool FlushPipelineCache(bool force = false);
+	void SetPipelineCacheFlushDeferred(bool deferred)
+	{
+		m_pipeline_cache_flush_deferred.store(deferred, std::memory_order_relaxed);
+	}
 
 	/// Replaces the pipeline cache with an empty one, so a cleared cache is not written back. GS thread
 	/// only, with no pipeline compile running on another thread.
@@ -74,6 +78,8 @@ private:
 
 	VkPipelineCache m_pipeline_cache = VK_NULL_HANDLE;
 	std::atomic<bool> m_pipeline_cache_dirty{false};
+	// PCF1: shared with the back thread, which also flushes after new compiles.
+	std::atomic<bool> m_pipeline_cache_flush_deferred{false};
 	/// When the cache was last serialised, so the synchronous GS-thread write can be rate-limited.
 	std::chrono::steady_clock::time_point m_last_pipeline_cache_flush{};
 };
