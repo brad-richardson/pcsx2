@@ -1493,6 +1493,22 @@ void GSReleaseExportAHB(AHardwareBuffer* buffer)
 	if (g_gs_device && GSCurrentRenderer == GSRendererType::VK)
 		static_cast<GSDeviceVK*>(g_gs_device.get())->ReleaseExportAHB(buffer);
 }
+
+int GSCompositeHudAHB(AHardwareBuffer* buffer, const void* scene, u32 sceneSize, const u8* atlasPx,
+	u32 atlasW, u32 atlasH, u64 atlasId, u64* fence_counter)
+{
+	if (!g_gs_renderer || !g_gs_device || !g_gs_device->GetCurrent() || !fence_counter)
+		return 0;
+	if (GSCurrentRenderer != GSRendererType::VK)
+		return 0;
+	// HUD4: same back-thread quiesce as the export (the composite records on
+	// the calling thread's command buffer, like CopySnapshotToAHB).
+	g_gs_renderer->DrainBackQueue();
+	return static_cast<GSDeviceVK*>(g_gs_device.get())
+	           ->CompositeHudAHB(buffer, scene, sceneSize, atlasPx, atlasW, atlasH, atlasId, fence_counter)
+	       ? 1
+	       : -1;
+}
 #endif
 
 #ifdef __APPLE__

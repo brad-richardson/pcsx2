@@ -14,6 +14,8 @@
 #include "GS/Renderers/Vulkan/VKShaderCache.h"
 #include "GS/Renderers/Vulkan/VKSwapChain.h"
 #include "GS/Renderers/Vulkan/VKLibretro.h"
+#include <cstddef> // HUD4: offsetof (scene blob layout checks)
+#include <cstring> // HUD4: memcpy (atlas staging)
 
 // Libretro presentation backbuffers: the frontend samples the published
 // VkImageView asynchronously (including cached-frame replays long after the
@@ -3179,6 +3181,9 @@ void GSDeviceVK::Destroy()
 	if (m_device != VK_NULL_HANDLE)
 	{
 		DestroySpinResources();
+#ifdef __ANDROID__
+		DestroyHudResources();
+#endif
 		DestroyResources();
 	}
 
@@ -4871,7 +4876,11 @@ bool GSDeviceVK::CopySnapshotToAHB(GSTexture* source, AHardwareBuffer* buffer, u
 		ii.arrayLayers = 1;
 		ii.samples = VK_SAMPLE_COUNT_1_BIT;
 		ii.tiling = VK_IMAGE_TILING_OPTIMAL;
-		ii.usage = VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
+		// HUD4: STORAGE_BIT for the Tricky HUD compute composite (the AHB view
+		// stays UNORM; the shader writes exact integers through it). A usage
+		// superset only; the copy path is byte-identical with it set.
+		ii.usage = VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT |
+		           VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_STORAGE_BIT;
 		ii.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
 		if (vkCreateImage(m_device, &ii, nullptr, &image.image) != VK_SUCCESS)
 			return fail("vkCreateImage failed");
@@ -4951,6 +4960,706 @@ void GSDeviceVK::ReleaseExportAHB(AHardwareBuffer* buffer)
 	vkDestroyImage(m_device, found->second.image, nullptr);
 	vkFreeMemory(m_device, found->second.memory, nullptr);
 	m_export_images.erase(found);
+	// HUD4: drop this buffer's composite view + descriptor set (GPU is idle).
+	auto hud = m_hud_frames.find(buffer);
+	if (hud != m_hud_frames.end())
+	{
+		if (hud->second.view != VK_NULL_HANDLE)
+			vkDestroyImageView(m_device, hud->second.view, nullptr);
+		if (hud->second.set != VK_NULL_HANDLE && m_hud_ds_pool != VK_NULL_HANDLE)
+			vkFreeDescriptorSets(m_device, m_hud_ds_pool, 1, &hud->second.set);
+		m_hud_frames.erase(hud);
+	}
+}
+
+// HUD4: Tricky HUD composite (ge1_gs_hud_scene). One compute dispatch per
+// scene over the HUD region: smears read the pristine temp, quads read the
+// atlas, and each invocation carries its pixel's dst chain in registers, so
+// the single dispatch reproduces the CPU's smear-then-quads order exactly.
+// The mirror struct below must match the runtime's Ge1HudScene byte for
+// byte (all members 4 bytes, no padding); magic + exact size are checked,
+// fail-closed, so any drift refuses loudly instead of misdrawing.
+struct HudSceneBlob
+{
+	u32 magic, version;
+	s32 regionX, regionY, regionW, regionH;
+	s32 nsmears;
+	s32 smearX0[2], smearY0[2], smearX1[2], smearY1[2];
+	s32 smearLX[2], smearRX[2];
+	s32 nquads;
+	s32 quadSrcX[26], quadSrcY[26], quadSrcW[26], quadSrcH[26];
+	s32 quadDX[26], quadDY[26], quadDW[26], quadDH[26];
+	float quadDim[26];
+};
+static_assert(sizeof(HudSceneBlob) == 1016, "HudSceneBlob must match Ge1HudScene");
+static_assert(offsetof(HudSceneBlob, regionX) == 8, "HudSceneBlob layout");
+static_assert(offsetof(HudSceneBlob, nsmears) == 24, "HudSceneBlob layout");
+static_assert(offsetof(HudSceneBlob, nquads) == 76, "HudSceneBlob layout");
+static_assert(offsetof(HudSceneBlob, quadSrcX) == 80, "HudSceneBlob layout");
+static_assert(offsetof(HudSceneBlob, quadDim) == 912, "HudSceneBlob layout");
+static constexpr u32 HUD_SCENE_MAGIC = 0x44554847u; // 'HUDG'
+static constexpr u32 HUD_SCENE_VERSION = 1u;
+
+// The composite shader. Every float expression mirrors the CPU reference
+// (ps2_ssx3_tricky_hud.h sampleAtlas / blendSample / smearCoverS) in the
+// same operation order, and every intermediate is precise (no reassociation
+// or contraction; the runtime builds with -ffp-contract=off), so with IEEE
+// basic ops the results are bit-identical. Truncation points are mirrored
+// too: each smear and each quad rounds to u8 before the next draw reads it.
+// Pixels no draw touches are never written.
+static constexpr std::string_view HUD_COMPOSITE_SHADER = R"(
+#version 460 core
+
+layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
+layout(rgba8ui, set = 0, binding = 0) readonly uniform uimage2D tempImg;
+layout(rgba8ui, set = 0, binding = 1) readonly uniform uimage2D atlasImg;
+layout(rgba8, set = 0, binding = 2) uniform image2D frameImg;
+layout(std430, set = 0, binding = 3) readonly buffer Scene
+{
+	uint magic;
+	uint version;
+	int regionX, regionY, regionW, regionH;
+	int nsmears;
+	int smearX0[2];
+	int smearY0[2];
+	int smearX1[2];
+	int smearY1[2];
+	int smearLX[2];
+	int smearRX[2];
+	int nquads;
+	int quadSrcX[26];
+	int quadSrcY[26];
+	int quadSrcW[26];
+	int quadSrcH[26];
+	int quadDX[26];
+	int quadDY[26];
+	int quadDW[26];
+	int quadDH[26];
+	float quadDim[26];
+};
+
+void main()
+{
+	int px = int(gl_GlobalInvocationID.x);
+	int py = int(gl_GlobalInvocationID.y);
+	if (px >= regionW || py >= regionH)
+		return;
+	uvec4 t0 = imageLoad(tempImg, ivec2(px, py));
+	precise vec3 dst = vec3(t0.rgb);
+	precise float dstA = float(t0.a);
+	bool covered = false;
+	for (int i = 0; i < nsmears; i++)
+	{
+		// smearCoverS in region coords (clip test here, feather on the
+		// unclipped rect, edge columns from the blob, temp reads).
+		int x0 = smearX0[i] - regionX, y0 = smearY0[i] - regionY;
+		int x1 = smearX1[i] - regionX, y1 = smearY1[i] - regionY;
+		if (x1 <= x0 || y1 <= y0)
+			continue;
+		int xa = x0 < 0 ? 0 : x0;
+		int xb = x1 > regionW ? regionW : x1;
+		int ya = y0 < 0 ? 0 : y0;
+		int yb = y1 > regionH ? regionH : y1;
+		if (px < xa || px >= xb || py < ya || py >= yb)
+			continue;
+		precise float span = float(x1 - x0);
+		uvec4 L = imageLoad(tempImg, ivec2(smearLX[i] - regionX, py));
+		uvec4 R = imageLoad(tempImg, ivec2(smearRX[i] - regionX, py));
+		precise float lr = float(L.r), lg = float(L.g), lb = float(L.b);
+		precise float rr = float(R.r), rg = float(R.g), rb = float(R.b);
+		precise float fy0 = float(py - y0) / 3.0f;
+		precise float fy1 = float(y1 - py) / 3.0f;
+		precise float t = float(px - x0) / span;
+		precise float a = fy0;
+		if (fy1 < a)
+			a = fy1;
+		precise float fx0 = float(px - x0) / 2.0f;
+		precise float fx1 = float(x1 - px) / 2.0f;
+		if (fx0 < a)
+			a = fx0;
+		if (fx1 < a)
+			a = fx1;
+		if (a <= 0.0f)
+			continue;
+		if (a > 1.0f)
+			a = 1.0f;
+		precise float ia = 1.0f - a;
+		precise vec3 sm = (vec3(lr, lg, lb) + (vec3(rr, rg, rb) - vec3(lr, lg, lb)) * t) * a + dst * ia;
+		dst = floor(sm + 0.5f);
+		covered = true;
+	}
+	for (int q = 0; q < nquads; q++)
+	{
+		int dx = quadDX[q] - regionX, dy = quadDY[q] - regionY;
+		int dw = quadDW[q], dh = quadDH[q];
+		if (dw <= 0 || dh <= 0)
+			continue;
+		int xa = dx < 0 ? 0 : dx;
+		int xb = dx + dw > regionW ? regionW : dx + dw;
+		int ya = dy < 0 ? 0 : dy;
+		int yb = dy + dh > regionH ? regionH : dy + dh;
+		if (px < xa || px >= xb || py < ya || py >= yb)
+			continue;
+		int sx = quadSrcX[q], sy = quadSrcY[q], sw = quadSrcW[q], sh = quadSrcH[q];
+		int rx = px - dx, ry = py - dy;
+		precise float v = (float(ry) + 0.5f) * float(sh) / float(dh) - 0.5f;
+		int v0 = int(floor(v));
+		precise float fv = v - float(v0);
+		if (v0 < 0)
+		{
+			v0 = 0;
+			fv = 0.0f;
+		}
+		if (v0 > sh - 2)
+		{
+			v0 = sh - 2;
+			fv = 1.0f;
+		}
+		if (sh < 2)
+		{
+			v0 = 0;
+			fv = 0.0f;
+		}
+		precise float u = (float(rx) + 0.5f) * float(sw) / float(dw) - 0.5f;
+		int u0 = int(floor(u));
+		precise float fu = u - float(u0);
+		if (u0 < 0)
+		{
+			u0 = 0;
+			fu = 0.0f;
+		}
+		if (u0 > sw - 2)
+		{
+			u0 = sw - 2;
+			fu = 1.0f;
+		}
+		if (sw < 2)
+		{
+			u0 = 0;
+			fu = 0.0f;
+		}
+		uvec4 p00 = imageLoad(atlasImg, ivec2(sx + u0, sy + v0));
+		uvec4 p10 = imageLoad(atlasImg, ivec2(sx + u0 + 1, sy + v0));
+		uvec4 p01 = imageLoad(atlasImg, ivec2(sx + u0, sy + v0 + 1));
+		uvec4 p11 = imageLoad(atlasImg, ivec2(sx + u0 + 1, sy + v0 + 1));
+		precise float w00 = (1.0f - fu) * (1.0f - fv);
+		precise float w10 = fu * (1.0f - fv);
+		precise float w01 = (1.0f - fu) * fv;
+		precise float w11 = fu * fv;
+		precise float dim = quadDim[q];
+		precise float sr = (float(p00.r) * w00 + float(p10.r) * w10 + float(p01.r) * w01 + float(p11.r) * w11) * dim;
+		precise float sg = (float(p00.g) * w00 + float(p10.g) * w10 + float(p01.g) * w01 + float(p11.g) * w11) * dim;
+		precise float sb = (float(p00.b) * w00 + float(p10.b) * w10 + float(p01.b) * w01 + float(p11.b) * w11) * dim;
+		precise float sa = (float(p00.a) * w00 + float(p10.a) * w10 + float(p01.a) * w01 + float(p11.a) * w11) / 255.0f;
+		if (sa <= 0.0f)
+			continue;
+		precise float ia = 1.0f - sa;
+		dst = floor(vec3(sr, sg, sb) * sa + dst * ia + 0.5f);
+		dstA = 255.0f;
+		covered = true;
+	}
+	if (!covered)
+		return;
+	// Exact integers through the UNORM view: N/255 round-trips to N (the
+	// conversion error is < 2^-16 against a 0.5 margin).
+	imageStore(frameImg, ivec2(regionX + px, regionY + py), vec4(dst / 255.0f, dstA / 255.0f));
+}
+)";
+
+void GSDeviceVK::DestroyHudResources()
+{
+	if (m_device == VK_NULL_HANDLE)
+		return;
+	// GPU is idle at all callers. Views are device objects (destroy them);
+	// sets die with the pool.
+	for (const auto& [buffer, frame] : m_hud_frames)
+	{
+		if (frame.view != VK_NULL_HANDLE)
+			vkDestroyImageView(m_device, frame.view, nullptr);
+	}
+	m_hud_frames.clear();
+	if (m_hud_ds_pool != VK_NULL_HANDLE)
+	{
+		vkDestroyDescriptorPool(m_device, m_hud_ds_pool, nullptr);
+		m_hud_ds_pool = VK_NULL_HANDLE;
+	}
+	if (m_hud_pipeline != VK_NULL_HANDLE)
+	{
+		vkDestroyPipeline(m_device, m_hud_pipeline, nullptr);
+		m_hud_pipeline = VK_NULL_HANDLE;
+	}
+	if (m_hud_pipeline_layout != VK_NULL_HANDLE)
+	{
+		vkDestroyPipelineLayout(m_device, m_hud_pipeline_layout, nullptr);
+		m_hud_pipeline_layout = VK_NULL_HANDLE;
+	}
+	if (m_hud_ds_layout != VK_NULL_HANDLE)
+	{
+		vkDestroyDescriptorSetLayout(m_device, m_hud_ds_layout, nullptr);
+		m_hud_ds_layout = VK_NULL_HANDLE;
+	}
+	if (m_hud_temp_view != VK_NULL_HANDLE)
+	{
+		vkDestroyImageView(m_device, m_hud_temp_view, nullptr);
+		m_hud_temp_view = VK_NULL_HANDLE;
+	}
+	if (m_hud_temp_image != VK_NULL_HANDLE)
+	{
+		vmaDestroyImage(m_allocator, m_hud_temp_image, m_hud_temp_allocation);
+		m_hud_temp_image = VK_NULL_HANDLE;
+		m_hud_temp_allocation = VK_NULL_HANDLE;
+	}
+	m_hud_temp_w = m_hud_temp_h = 0;
+	m_hud_temp_general = false;
+	if (m_hud_atlas_view != VK_NULL_HANDLE)
+	{
+		vkDestroyImageView(m_device, m_hud_atlas_view, nullptr);
+		m_hud_atlas_view = VK_NULL_HANDLE;
+	}
+	if (m_hud_atlas_image != VK_NULL_HANDLE)
+	{
+		vmaDestroyImage(m_allocator, m_hud_atlas_image, m_hud_atlas_allocation);
+		m_hud_atlas_image = VK_NULL_HANDLE;
+		m_hud_atlas_allocation = VK_NULL_HANDLE;
+	}
+	m_hud_atlas_id = 0;
+	m_hud_atlas_w = m_hud_atlas_h = 0;
+	if (m_hud_scene_buffer != VK_NULL_HANDLE)
+	{
+		vmaDestroyBuffer(m_allocator, m_hud_scene_buffer, m_hud_scene_allocation);
+		m_hud_scene_buffer = VK_NULL_HANDLE;
+		m_hud_scene_allocation = VK_NULL_HANDLE;
+	}
+	m_hud_failed = false;
+}
+
+bool GSDeviceVK::InitHudResources()
+{
+	auto fail = [](const char* why) { std::fprintf(stderr, "GE1 HUD composite: %s\n", why); return false; };
+	// UINT storage must be available for the exact temp/atlas images.
+	VkFormatProperties uintProps = {};
+	vkGetPhysicalDeviceFormatProperties(m_physical_device, VK_FORMAT_R8G8B8A8_UINT, &uintProps);
+	if ((uintProps.optimalTilingFeatures & VK_FORMAT_FEATURE_STORAGE_IMAGE_BIT) == 0)
+		return fail("R8G8B8A8_UINT storage unsupported");
+	VkFormatProperties unormProps = {};
+	vkGetPhysicalDeviceFormatProperties(m_physical_device, VK_FORMAT_R8G8B8A8_UNORM, &unormProps);
+	if ((unormProps.optimalTilingFeatures & VK_FORMAT_FEATURE_STORAGE_IMAGE_BIT) == 0)
+		return fail("R8G8B8A8_UNORM storage unsupported");
+
+	Vulkan::DescriptorSetLayoutBuilder dslb;
+	dslb.AddBinding(0, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT);
+	dslb.AddBinding(1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT);
+	dslb.AddBinding(2, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT);
+	dslb.AddBinding(3, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT);
+	if ((m_hud_ds_layout = dslb.Create(m_device)) == VK_NULL_HANDLE)
+		return fail("descriptor layout failed");
+	Vulkan::SetObjectName(m_device, m_hud_ds_layout, "HUD descriptor layout");
+
+	Vulkan::PipelineLayoutBuilder plb;
+	plb.AddDescriptorSet(m_hud_ds_layout);
+	if ((m_hud_pipeline_layout = plb.Create(m_device)) == VK_NULL_HANDLE)
+		return fail("pipeline layout failed");
+	Vulkan::SetObjectName(m_device, m_hud_pipeline_layout, "HUD pipeline layout");
+
+	VkShaderModule mod = g_vulkan_shader_cache->GetComputeShader(HUD_COMPOSITE_SHADER);
+	if (mod == VK_NULL_HANDLE)
+		return fail("compute shader compile failed");
+	Vulkan::SetObjectName(m_device, mod, "HUD composite shader");
+	Vulkan::ComputePipelineBuilder cpb;
+	cpb.SetPipelineLayout(m_hud_pipeline_layout);
+	cpb.SetShader(mod, "main");
+	m_hud_pipeline = cpb.Create(m_device, g_vulkan_shader_cache->GetPipelineCache(true), false);
+	vkDestroyShaderModule(m_device, mod, nullptr);
+	if (!m_hud_pipeline)
+		return fail("compute pipeline failed");
+	Vulkan::SetObjectName(m_device, m_hud_pipeline, "HUD composite pipeline");
+
+	VkDescriptorPoolSize poolSizes[2] = {};
+	poolSizes[0].type = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+	poolSizes[0].descriptorCount = 12; // 4 sets x temp/atlas/frame
+	poolSizes[1].type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+	poolSizes[1].descriptorCount = 4; // 4 sets x scene
+	VkDescriptorPoolCreateInfo poolInfo = {VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
+	poolInfo.flags = VK_DESCRIPTOR_POOL_CREATE_FREE_DESCRIPTOR_SET_BIT;
+	poolInfo.maxSets = 4;
+	poolInfo.poolSizeCount = 2;
+	poolInfo.pPoolSizes = poolSizes;
+	if (vkCreateDescriptorPool(m_device, &poolInfo, nullptr, &m_hud_ds_pool) != VK_SUCCESS)
+		return fail("descriptor pool failed");
+
+	// Scene blob buffer: device-local, refreshed per composite with
+	// vkCmdUpdateBuffer (stream-ordered: a mapped memcpy would race the
+	// previous composite's in-flight dispatch on the same queue).
+	VkBufferCreateInfo sceneBci = {VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
+	sceneBci.size = sizeof(HudSceneBlob);
+	sceneBci.usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+	sceneBci.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+	VmaAllocationCreateInfo sceneAci = {};
+	sceneAci.usage = VMA_MEMORY_USAGE_GPU_ONLY;
+	if (vmaCreateBuffer(m_allocator, &sceneBci, &sceneAci, &m_hud_scene_buffer,
+	                    &m_hud_scene_allocation, nullptr) != VK_SUCCESS)
+		return fail("scene buffer failed");
+	return true;
+}
+
+// All four bindings of one composite set. Called for fresh sets (never in
+// flight: always safe) and, after a GPU idle, for every live set when the
+// temp/atlas objects are recreated (steady state never updates: updating a
+// set an in-flight dispatch reads is undefined even with identical contents).
+static void HudWriteSet(VkDevice device, VkDescriptorSet set, VkImageView tempView,
+	VkImageView atlasView, VkImageView frameView, VkBuffer sceneBuffer)
+{
+	VkDescriptorImageInfo tempInfo = {};
+	tempInfo.imageView = tempView;
+	tempInfo.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
+	VkDescriptorImageInfo atlasInfo = {};
+	atlasInfo.imageView = atlasView;
+	atlasInfo.imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+	VkDescriptorImageInfo frameInfo = {};
+	frameInfo.imageView = frameView;
+	frameInfo.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
+	VkDescriptorBufferInfo sceneInfo = {};
+	sceneInfo.buffer = sceneBuffer;
+	sceneInfo.offset = 0;
+	sceneInfo.range = sizeof(HudSceneBlob);
+	VkWriteDescriptorSet writes[4] = {};
+	writes[0].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+	writes[0].dstSet = set;
+	writes[0].dstBinding = 0;
+	writes[0].descriptorCount = 1;
+	writes[0].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+	writes[0].pImageInfo = &tempInfo;
+	writes[1] = writes[0];
+	writes[1].dstBinding = 1;
+	writes[1].pImageInfo = &atlasInfo;
+	writes[2] = writes[0];
+	writes[2].dstBinding = 2;
+	writes[2].pImageInfo = &frameInfo;
+	writes[3].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+	writes[3].dstSet = set;
+	writes[3].dstBinding = 3;
+	writes[3].descriptorCount = 1;
+	writes[3].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+	writes[3].pBufferInfo = &sceneInfo;
+	vkUpdateDescriptorSets(device, 4, writes, 0, nullptr);
+}
+
+bool GSDeviceVK::CompositeHudAHB(AHardwareBuffer* buffer, const void* scene, u32 sceneSize,
+	const u8* atlasPx, u32 atlasW, u32 atlasH, u64 atlasId, u64* fence_counter)
+{
+	auto fail = [](const char* why) { std::fprintf(stderr, "GE1 HUD composite: %s\n", why); return false; };
+	if (!buffer || !scene || !atlasPx || !fence_counter || !m_device)
+		return fail("invalid arguments");
+	if (sceneSize != sizeof(HudSceneBlob))
+		return fail("scene size mismatch");
+	const HudSceneBlob* sc = static_cast<const HudSceneBlob*>(scene);
+	if (sc->magic != HUD_SCENE_MAGIC || sc->version != HUD_SCENE_VERSION)
+		return fail("scene magic/version mismatch");
+	if (sc->nsmears < 0 || sc->nsmears > 2 || sc->nquads <= 0 || sc->nquads > 26)
+		return fail("scene counts out of range");
+	if (sc->regionW <= 0 || sc->regionH <= 0 || sc->regionW > 8192 || sc->regionH > 8192)
+		return fail("region out of range");
+	if (atlasW == 0 || atlasH == 0 || atlasW > 1024 || atlasH > 1024)
+		return fail("atlas dimensions out of range");
+	auto found = m_export_images.find(buffer);
+	if (found == m_export_images.end())
+		return fail("buffer was never exported");
+	ExportImage& image = found->second;
+	if (sc->regionX < 0 || sc->regionY < 0 || sc->regionX + sc->regionW > static_cast<s32>(image.width) ||
+	    sc->regionY + sc->regionH > static_cast<s32>(image.height))
+		return fail("region outside the export");
+	for (int i = 0; i < sc->nsmears; i++)
+	{
+		if (sc->smearX1[i] <= sc->smearX0[i] || sc->smearY1[i] <= sc->smearY0[i])
+			return fail("degenerate smear");
+		if (sc->smearLX[i] < sc->regionX || sc->smearRX[i] < sc->regionX ||
+		    sc->smearLX[i] >= sc->regionX + sc->regionW || sc->smearRX[i] >= sc->regionX + sc->regionW)
+			return fail("smear edge outside the region");
+	}
+	for (int q = 0; q < sc->nquads; q++)
+	{
+		if (sc->quadSrcX[q] < 0 || sc->quadSrcY[q] < 0 || sc->quadSrcW[q] < 2 || sc->quadSrcH[q] < 2 ||
+		    sc->quadSrcX[q] + sc->quadSrcW[q] > static_cast<s32>(atlasW) ||
+		    sc->quadSrcY[q] + sc->quadSrcH[q] > static_cast<s32>(atlasH))
+			return fail("quad src outside the atlas");
+	}
+	if (m_hud_failed)
+		return fail("resources failed before (fail-closed)");
+	if (m_hud_pipeline == VK_NULL_HANDLE && !InitHudResources())
+	{
+		DestroyHudResources(); // no partial state (re-inits cleanly next time)
+		m_hud_failed = true;
+		return fail("resource init failed");
+	}
+
+	// Temp (region-sized UINT copy of the pristine frame). Recreated only on
+	// a region change (fixed per run): idle first so live sets can be
+	// re-pointed and the old objects destroyed directly.
+	if (m_hud_temp_image == VK_NULL_HANDLE || m_hud_temp_w != static_cast<u32>(sc->regionW) ||
+	    m_hud_temp_h != static_cast<u32>(sc->regionH))
+	{
+		const bool hadTemp = (m_hud_temp_image != VK_NULL_HANDLE);
+		if (hadTemp)
+			WaitForGPUIdle();
+		if (m_hud_temp_view != VK_NULL_HANDLE)
+		{
+			vkDestroyImageView(m_device, m_hud_temp_view, nullptr);
+			m_hud_temp_view = VK_NULL_HANDLE;
+		}
+		if (m_hud_temp_image != VK_NULL_HANDLE)
+		{
+			vmaDestroyImage(m_allocator, m_hud_temp_image, m_hud_temp_allocation);
+			m_hud_temp_image = VK_NULL_HANDLE;
+			m_hud_temp_allocation = VK_NULL_HANDLE;
+		}
+		VkImageCreateInfo ici = {VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
+		ici.imageType = VK_IMAGE_TYPE_2D;
+		ici.format = VK_FORMAT_R8G8B8A8_UINT;
+		ici.extent = {static_cast<u32>(sc->regionW), static_cast<u32>(sc->regionH), 1};
+		ici.mipLevels = 1;
+		ici.arrayLayers = 1;
+		ici.samples = VK_SAMPLE_COUNT_1_BIT;
+		ici.tiling = VK_IMAGE_TILING_OPTIMAL;
+		ici.usage = VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_STORAGE_BIT;
+		ici.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+		VmaAllocationCreateInfo aci = {};
+		aci.usage = VMA_MEMORY_USAGE_GPU_ONLY;
+		if (vmaCreateImage(m_allocator, &ici, &aci, &m_hud_temp_image, &m_hud_temp_allocation,
+		                   nullptr) != VK_SUCCESS)
+			return fail("temp image failed");
+		VkImageViewCreateInfo vci = {VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
+		vci.image = m_hud_temp_image;
+		vci.viewType = VK_IMAGE_VIEW_TYPE_2D;
+		vci.format = VK_FORMAT_R8G8B8A8_UINT;
+		vci.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+		if (vkCreateImageView(m_device, &vci, nullptr, &m_hud_temp_view) != VK_SUCCESS)
+			return fail("temp view failed");
+		m_hud_temp_w = static_cast<u32>(sc->regionW);
+		m_hud_temp_h = static_cast<u32>(sc->regionH);
+		m_hud_temp_general = false;
+		// Re-point every live set (a no-op before the first frame exists;
+		// also heals sets left dangling by a failed recreate).
+		for (const auto& [buf, frame] : m_hud_frames)
+		{
+			if (frame.set != VK_NULL_HANDLE)
+				HudWriteSet(m_device, frame.set, m_hud_temp_view, m_hud_atlas_view, frame.view,
+					m_hud_scene_buffer);
+		}
+	}
+
+	// Atlas (UINT, uploaded once per id/dims; same idle + re-point rule as temp).
+	bool atlasUploaded = false;
+	if (m_hud_atlas_image == VK_NULL_HANDLE || m_hud_atlas_id != atlasId ||
+	    m_hud_atlas_w != atlasW || m_hud_atlas_h != atlasH)
+	{
+		const bool hadAtlas = (m_hud_atlas_image != VK_NULL_HANDLE);
+		if (hadAtlas)
+			WaitForGPUIdle();
+		if (m_hud_atlas_view != VK_NULL_HANDLE)
+		{
+			vkDestroyImageView(m_device, m_hud_atlas_view, nullptr);
+			m_hud_atlas_view = VK_NULL_HANDLE;
+		}
+		if (m_hud_atlas_image != VK_NULL_HANDLE)
+		{
+			vmaDestroyImage(m_allocator, m_hud_atlas_image, m_hud_atlas_allocation);
+			m_hud_atlas_image = VK_NULL_HANDLE;
+			m_hud_atlas_allocation = VK_NULL_HANDLE;
+		}
+		VkImageCreateInfo ici = {VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
+		ici.imageType = VK_IMAGE_TYPE_2D;
+		ici.format = VK_FORMAT_R8G8B8A8_UINT;
+		ici.extent = {atlasW, atlasH, 1};
+		ici.mipLevels = 1;
+		ici.arrayLayers = 1;
+		ici.samples = VK_SAMPLE_COUNT_1_BIT;
+		ici.tiling = VK_IMAGE_TILING_OPTIMAL;
+		ici.usage = VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_STORAGE_BIT;
+		ici.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+		VmaAllocationCreateInfo aci = {};
+		aci.usage = VMA_MEMORY_USAGE_GPU_ONLY;
+		if (vmaCreateImage(m_allocator, &ici, &aci, &m_hud_atlas_image, &m_hud_atlas_allocation,
+		                   nullptr) != VK_SUCCESS)
+			return fail("atlas image failed");
+		VkImageViewCreateInfo vci = {VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
+		vci.image = m_hud_atlas_image;
+		vci.viewType = VK_IMAGE_VIEW_TYPE_2D;
+		vci.format = VK_FORMAT_R8G8B8A8_UINT;
+		vci.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+		if (vkCreateImageView(m_device, &vci, nullptr, &m_hud_atlas_view) != VK_SUCCESS)
+			return fail("atlas view failed");
+		VkBufferCreateInfo stageBci = {VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
+		stageBci.size = static_cast<VkDeviceSize>(atlasW) * atlasH * 4;
+		stageBci.usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT;
+		stageBci.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+		VmaAllocationCreateInfo stageAci = {};
+		stageAci.usage = VMA_MEMORY_USAGE_CPU_ONLY;
+		stageAci.flags = VMA_ALLOCATION_CREATE_MAPPED_BIT;
+		VkBuffer stage = VK_NULL_HANDLE;
+		VmaAllocation stageAlloc = VK_NULL_HANDLE;
+		VmaAllocationInfo stageAi = {};
+		if (vmaCreateBuffer(m_allocator, &stageBci, &stageAci, &stage, &stageAlloc, &stageAi) !=
+		        VK_SUCCESS ||
+		    !stageAi.pMappedData)
+		{
+			if (stage != VK_NULL_HANDLE)
+				vmaDestroyBuffer(m_allocator, stage, stageAlloc);
+			return fail("atlas staging failed");
+		}
+		std::memcpy(stageAi.pMappedData, atlasPx, static_cast<size_t>(atlasW) * atlasH * 4);
+		vmaFlushAllocation(m_allocator, stageAlloc, 0, VK_WHOLE_SIZE);
+		EndRenderPass();
+		const VkCommandBuffer upCmd = GetCurrentCommandBuffer();
+		VkImageMemoryBarrier toDst = {VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
+		toDst.srcAccessMask = 0;
+		toDst.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+		toDst.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+		toDst.newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+		toDst.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+		toDst.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+		toDst.image = m_hud_atlas_image;
+		toDst.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+		vkCmdPipelineBarrier(upCmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
+			0, 0, nullptr, 0, nullptr, 1, &toDst);
+		VkBufferImageCopy bic = {};
+		bic.bufferOffset = 0;
+		bic.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+		bic.imageOffset = {0, 0, 0};
+		bic.imageExtent = {atlasW, atlasH, 1};
+		vkCmdCopyBufferToImage(upCmd, stage, m_hud_atlas_image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+			1, &bic);
+		VkImageMemoryBarrier toRead = toDst;
+		toRead.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+		toRead.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+		toRead.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+		toRead.newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+		vkCmdPipelineBarrier(upCmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+			0, 0, nullptr, 0, nullptr, 1, &toRead);
+		DeferBufferDestruction(stage, stageAlloc);
+		m_hud_atlas_id = atlasId;
+		m_hud_atlas_w = atlasW;
+		m_hud_atlas_h = atlasH;
+		atlasUploaded = true;
+		std::fprintf(stderr, "GE1 HUD composite: atlas uploaded %ux%u id=%llu\n", atlasW, atlasH,
+			static_cast<unsigned long long>(atlasId));
+		// Re-point every live set at the new atlas (a no-op before the
+		// first frame exists; heals sets dangling after a failed upload).
+		for (const auto& [buf, frame] : m_hud_frames)
+		{
+			if (frame.set != VK_NULL_HANDLE)
+				HudWriteSet(m_device, frame.set, m_hud_temp_view, m_hud_atlas_view, frame.view,
+					m_hud_scene_buffer);
+		}
+	}
+
+	// Per-buffer frame view + descriptor set (fresh sets are never in
+	// flight, so writing them here is always safe; steady state never
+	// updates).
+	auto frameIt = m_hud_frames.find(buffer);
+	if (frameIt == m_hud_frames.end())
+	{
+		VkImageViewCreateInfo vci = {VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
+		vci.image = image.image;
+		vci.viewType = VK_IMAGE_VIEW_TYPE_2D;
+		vci.format = VK_FORMAT_R8G8B8A8_UNORM;
+		vci.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+		VkImageView view = VK_NULL_HANDLE;
+		if (vkCreateImageView(m_device, &vci, nullptr, &view) != VK_SUCCESS)
+			return fail("frame view failed");
+		VkDescriptorSetAllocateInfo alloc = {VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
+		alloc.descriptorPool = m_hud_ds_pool;
+		alloc.descriptorSetCount = 1;
+		alloc.pSetLayouts = &m_hud_ds_layout;
+		VkDescriptorSet set = VK_NULL_HANDLE;
+		if (vkAllocateDescriptorSets(m_device, &alloc, &set) != VK_SUCCESS)
+		{
+			vkDestroyImageView(m_device, view, nullptr);
+			return fail("descriptor set failed");
+		}
+		frameIt = m_hud_frames.emplace(buffer, HudFrame{set, view}).first;
+		HudWriteSet(m_device, set, m_hud_temp_view, m_hud_atlas_view, view, m_hud_scene_buffer);
+	}
+
+	EndRenderPass();
+	const VkCommandBuffer cmd = GetCurrentCommandBuffer();
+	// Scene blob, stream-ordered (the driver copies it at record time).
+	vkCmdUpdateBuffer(cmd, m_hud_scene_buffer, 0, sizeof(HudSceneBlob), sc);
+	// Acquire the AHB (the copy released it to FOREIGN): GENERAL -> TRANSFER_SRC.
+	VkImageMemoryBarrier acquire = {VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
+	acquire.srcAccessMask = 0;
+	acquire.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+	acquire.oldLayout = VK_IMAGE_LAYOUT_GENERAL;
+	acquire.newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+	acquire.srcQueueFamilyIndex = VK_QUEUE_FAMILY_FOREIGN_EXT;
+	acquire.dstQueueFamilyIndex = m_graphics_queue_family_index;
+	acquire.image = image.image;
+	acquire.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+	// Temp -> TRANSFER_DST (first use from UNDEFINED, later from GENERAL).
+	VkImageMemoryBarrier tempDst = acquire;
+	tempDst.srcAccessMask = m_hud_temp_general ? VK_ACCESS_SHADER_READ_BIT : 0;
+	tempDst.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+	tempDst.oldLayout = m_hud_temp_general ? VK_IMAGE_LAYOUT_GENERAL : VK_IMAGE_LAYOUT_UNDEFINED;
+	tempDst.newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+	tempDst.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+	tempDst.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+	tempDst.image = m_hud_temp_image;
+	VkImageMemoryBarrier preBarriers[2] = {acquire, tempDst};
+	vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+		VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0, nullptr, 2, preBarriers);
+	// Pristine region -> temp (raw 32-bit copy across UNORM/UINT views).
+	VkImageCopy copy = {};
+	copy.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+	copy.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+	copy.srcOffset = {sc->regionX, sc->regionY, 0};
+	copy.dstOffset = {0, 0, 0};
+	copy.extent = {static_cast<u32>(sc->regionW), static_cast<u32>(sc->regionH), 1};
+	vkCmdCopyImage(cmd, image.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, m_hud_temp_image,
+		VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &copy);
+	// Compute-ready: temp + frame -> GENERAL, scene update -> SHADER_READ.
+	VkImageMemoryBarrier tempGeneral = tempDst;
+	tempGeneral.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+	tempGeneral.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+	tempGeneral.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+	tempGeneral.newLayout = VK_IMAGE_LAYOUT_GENERAL;
+	VkImageMemoryBarrier frameGeneral = acquire;
+	frameGeneral.srcAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+	frameGeneral.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
+	frameGeneral.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+	frameGeneral.newLayout = VK_IMAGE_LAYOUT_GENERAL;
+	frameGeneral.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+	frameGeneral.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+	VkBufferMemoryBarrier sceneReady = {VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER};
+	sceneReady.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+	sceneReady.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+	sceneReady.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+	sceneReady.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+	sceneReady.buffer = m_hud_scene_buffer;
+	sceneReady.offset = 0;
+	sceneReady.size = sizeof(HudSceneBlob);
+	VkImageMemoryBarrier computeBarriers[2] = {tempGeneral, frameGeneral};
+	vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+		0, 0, nullptr, 1, &sceneReady, 2, computeBarriers);
+	vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_hud_pipeline);
+	vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_hud_pipeline_layout, 0, 1,
+		&frameIt->second.set, 0, nullptr);
+	vkCmdDispatch(cmd, (static_cast<u32>(sc->regionW) + 15) / 16,
+		(static_cast<u32>(sc->regionH) + 15) / 16, 1);
+	// Release the AHB to FOREIGN (mirrors the copy's release).
+	VkImageMemoryBarrier release = acquire;
+	release.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+	release.dstAccessMask = 0;
+	release.oldLayout = VK_IMAGE_LAYOUT_GENERAL;
+	release.newLayout = VK_IMAGE_LAYOUT_GENERAL;
+	release.srcQueueFamilyIndex = m_graphics_queue_family_index;
+	release.dstQueueFamilyIndex = VK_QUEUE_FAMILY_FOREIGN_EXT;
+	vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,
+		0, 0, nullptr, 0, nullptr, 1, &release);
+	m_hud_temp_general = true;
+	*fence_counter = GetCurrentFenceCounter();
+	ExecuteCommandBuffer(WaitType::None); // the runtime queues after this fence completes
+	if (atlasUploaded)
+		std::fprintf(stderr, "GE1 HUD composite: first composite after atlas upload\n");
+	return !m_last_submit_failed || fail("GS Vulkan command submission failed");
 }
 #endif
 

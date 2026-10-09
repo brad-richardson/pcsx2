@@ -254,6 +254,9 @@ public:
 #ifdef __ANDROID__
 	bool CopySnapshotToAHB(GSTexture* src, AHardwareBuffer* buffer, u32 width, u32 height, u32 pad_x, u32 pad_y, u64* fence_counter);
 	void ReleaseExportAHB(AHardwareBuffer* buffer);
+	// HUD4: one Tricky HUD compute composite onto an exported AHB (see GS.h).
+	bool CompositeHudAHB(AHardwareBuffer* buffer, const void* scene, u32 sceneSize, const u8* atlasPx,
+		u32 atlasW, u32 atlasH, u64 atlasId, u64* fence_counter);
 #endif
 
 	// A stream ring replaced its buffer (VKStreamBuffer::Grow). Rebinds whatever refers to it by
@@ -264,6 +267,28 @@ private:
 #ifdef __ANDROID__
 	struct ExportImage { VkImage image = VK_NULL_HANDLE; VkDeviceMemory memory = VK_NULL_HANDLE; u32 width = 0; u32 height = 0; };
 	std::unordered_map<AHardwareBuffer*, ExportImage> m_export_images;
+	// HUD4: Tricky HUD composite state (all device-lifetime; the pool holds ≤4 sets).
+	VkPipeline m_hud_pipeline = VK_NULL_HANDLE;
+	VkPipelineLayout m_hud_pipeline_layout = VK_NULL_HANDLE;
+	VkDescriptorSetLayout m_hud_ds_layout = VK_NULL_HANDLE;
+	VkDescriptorPool m_hud_ds_pool = VK_NULL_HANDLE;
+	VkImage m_hud_temp_image = VK_NULL_HANDLE;
+	VkImageView m_hud_temp_view = VK_NULL_HANDLE;
+	VmaAllocation m_hud_temp_allocation = VK_NULL_HANDLE;
+	u32 m_hud_temp_w = 0, m_hud_temp_h = 0;
+	bool m_hud_temp_general = false;
+	VkImage m_hud_atlas_image = VK_NULL_HANDLE;
+	VkImageView m_hud_atlas_view = VK_NULL_HANDLE;
+	VmaAllocation m_hud_atlas_allocation = VK_NULL_HANDLE;
+	u64 m_hud_atlas_id = 0;
+	u32 m_hud_atlas_w = 0, m_hud_atlas_h = 0;
+	VkBuffer m_hud_scene_buffer = VK_NULL_HANDLE;
+	VmaAllocation m_hud_scene_allocation = VK_NULL_HANDLE;
+	struct HudFrame { VkDescriptorSet set = VK_NULL_HANDLE; VkImageView view = VK_NULL_HANDLE; };
+	std::unordered_map<AHardwareBuffer*, HudFrame> m_hud_frames;
+	bool m_hud_failed = false; // a resource build failed; refuse until re-init (fail-closed)
+	void DestroyHudResources();
+	bool InitHudResources();
 #endif
 	// Helper method to create a Vulkan instance.
 	static VkInstance CreateVulkanInstance(const WindowInfo& wi, OptionalExtensions* oe, bool enable_debug_utils,

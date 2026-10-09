@@ -193,6 +193,15 @@ struct AHardwareBuffer;
 int GSExportSnapshotToAHB(AHardwareBuffer* buffer, u32 width, u32 height, u64* fence_counter);
 void GSWaitExportFence(u64 fence_counter);
 void GSReleaseExportAHB(AHardwareBuffer* buffer);
+// HUD4: composite one Tricky HUD scene onto an already-exported AHB, on this
+// device's queue, right behind the export copy (same queue, in order). The
+// scene blob is the runtime's Ge1HudScene (magic + version + fixed-size
+// geometry; re-validated here, fail-closed); the atlas is w*h*4 RGBA bytes
+// uploaded once per (id, w, h). 1=composited (*fence_counter covers the
+// export too), 0=unsupported/unready, -1=composite failed (CPU fallback).
+#define GS_HAS_HUD_SCENE_API 1
+int GSCompositeHudAHB(AHardwareBuffer* buffer, const void* scene, u32 sceneSize, const u8* atlasPx,
+	u32 atlasW, u32 atlasH, u64 atlasId, u64* fence_counter);
 #endif
 #ifdef __APPLE__
 // GI1 iOS platform seam: GPU copy of the composed GS image into an
