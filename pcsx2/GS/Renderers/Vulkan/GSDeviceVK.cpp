@@ -1684,8 +1684,26 @@ VkDescriptorSet GSDeviceVK::AllocateDescriptorSetFromFramePool(VkDescriptorSetLa
 	}
 }
 
+// HUD4 Part 2: fence counters with the top bit set name a HUD composite submit (its own
+// fence, 1-deep), not a ring frame. The runtime waits them through the same entry.
+static constexpr u64 HUD_FENCE_COUNTER_BIT = 1ULL << 63;
+
 void GSDeviceVK::WaitForFenceCounter(u64 fence_counter)
 {
+#ifdef __ANDROID__
+	if (fence_counter & HUD_FENCE_COUNTER_BIT)
+	{
+		// No perfmon Put: this runs on the runtime's helper thread and the counters are
+		// not atomic. The fence is 1-deep and always waited before the next submit.
+		if (m_hud_fence != VK_NULL_HANDLE)
+		{
+			const VkResult res = vkWaitForFences(m_device, 1, &m_hud_fence, VK_TRUE, UINT64_MAX);
+			if (res != VK_SUCCESS)
+				LOG_VULKAN_ERROR(res, "vkWaitForFences (HUD) failed: ");
+		}
+		return;
+	}
+#endif
 	if (m_completed_fence_counter >= fence_counter)
 		return;
 
@@ -2079,7 +2097,14 @@ void GSDeviceVK::SubmitCommandBuffer(VKSwapChain* present_swap_chain)
 	// on the write-combined road -- each of these six calls returns on a compare.
 	FlushStreamRingWrites();
 
-	res = vkQueueSubmit(m_graphics_queue, 1, &submit_info, resources.fence);
+	// HUD4 Part 2: the helper thread's HUD submit (Android) shares this queue; the spin
+	// submit joins the same section (on single-queue devices it is this queue object).
+	{
+		std::lock_guard<std::mutex> submit_lock(m_submit_mutex);
+		res = vkQueueSubmit(m_graphics_queue, 1, &submit_info, resources.fence);
+		if (res == VK_SUCCESS && spin_cycles != 0)
+			SubmitSpinCommand(m_current_frame, spin_cycles);
+	}
 	if (res != VK_SUCCESS)
 	{
 		LOG_VULKAN_ERROR(res, "vkQueueSubmit failed: ");
@@ -2088,9 +2113,6 @@ void GSDeviceVK::SubmitCommandBuffer(VKSwapChain* present_swap_chain)
 		m_last_submit_failed = true;
 		return;
 	}
-
-	if (spin_cycles != 0)
-		SubmitSpinCommand(m_current_frame, spin_cycles);
 
 	if (present_swap_chain)
 	{
@@ -4849,7 +4871,14 @@ bool GSDeviceVK::CopySnapshotToAHB(GSTexture* source, AHardwareBuffer* buffer, u
 	AHardwareBuffer_describe(buffer, &desc);
 	if (desc.width != width || desc.height != height || desc.format != AHARDWAREBUFFER_FORMAT_R8G8B8A8_UNORM)
 		return fail("AHB dimensions or RGBA8 format mismatch");
-	auto found = m_export_images.find(buffer);
+	// HUD4 Part 2: the helper thread's composite reads this map; the find and the emplace
+	// below are each guarded (the AHB import between them stays outside the lock; node
+	// handles keep the reference below valid across other slots' inserts).
+	std::unordered_map<AHardwareBuffer*, ExportImage>::iterator found;
+	{
+		std::lock_guard<std::mutex> map_lock(m_submit_mutex);
+		found = m_export_images.find(buffer);
+	}
 	if (found == m_export_images.end())
 	{
 		auto get_props = reinterpret_cast<PFN_vkGetAndroidHardwareBufferPropertiesANDROID>(
@@ -4898,7 +4927,10 @@ bool GSDeviceVK::CopySnapshotToAHB(GSTexture* source, AHardwareBuffer* buffer, u
 			vkDestroyImage(m_device, image.image, nullptr);
 			return fail("AHB memory allocation or bind failed");
 		}
-		found = m_export_images.emplace(buffer, image).first;
+		{
+			std::lock_guard<std::mutex> map_lock(m_submit_mutex);
+			found = m_export_images.emplace(buffer, image).first;
+		}
 	}
 	ExportImage& image = found->second;
 	if (image.width != width || image.height != height)
@@ -4953,23 +4985,48 @@ bool GSDeviceVK::CopySnapshotToAHB(GSTexture* source, AHardwareBuffer* buffer, u
 
 void GSDeviceVK::ReleaseExportAHB(AHardwareBuffer* buffer)
 {
-	auto found = m_export_images.find(buffer);
-	if (found == m_export_images.end())
-		return;
-	WaitForGPUIdle();
-	vkDestroyImage(m_device, found->second.image, nullptr);
-	vkFreeMemory(m_device, found->second.memory, nullptr);
-	m_export_images.erase(found);
-	// HUD4: drop this buffer's composite view + descriptor set (GPU is idle).
-	auto hud = m_hud_frames.find(buffer);
-	if (hud != m_hud_frames.end())
+	// HUD4 Part 2: guard the map ends (the runtime joins its helper before releasing,
+	// so these never contend; the idle + destroys stay outside the lock).
 	{
-		if (hud->second.view != VK_NULL_HANDLE)
-			vkDestroyImageView(m_device, hud->second.view, nullptr);
-		if (hud->second.set != VK_NULL_HANDLE && m_hud_ds_pool != VK_NULL_HANDLE)
-			vkFreeDescriptorSets(m_device, m_hud_ds_pool, 1, &hud->second.set);
-		m_hud_frames.erase(hud);
+		std::lock_guard<std::mutex> map_lock(m_submit_mutex);
+		auto found = m_export_images.find(buffer);
+		if (found == m_export_images.end())
+			return;
 	}
+	WaitForGPUIdle();
+	VkImage deadImage = VK_NULL_HANDLE;
+	VkDeviceMemory deadMemory = VK_NULL_HANDLE;
+	{
+		std::lock_guard<std::mutex> map_lock(m_submit_mutex);
+		auto found = m_export_images.find(buffer);
+		if (found == m_export_images.end())
+			return;
+		deadImage = found->second.image;
+		deadMemory = found->second.memory;
+		m_export_images.erase(found);
+	}
+	if (deadImage != VK_NULL_HANDLE)
+		vkDestroyImage(m_device, deadImage, nullptr);
+	if (deadMemory != VK_NULL_HANDLE)
+		vkFreeMemory(m_device, deadMemory, nullptr);
+	// HUD4: drop this buffer's composite view + descriptor set (GPU is idle). Same uniform
+	// guard (join-covered in practice; the destroys stay outside the lock).
+	VkImageView hudView = VK_NULL_HANDLE;
+	VkDescriptorSet hudSet = VK_NULL_HANDLE;
+	{
+		std::lock_guard<std::mutex> map_lock(m_submit_mutex);
+		auto hud = m_hud_frames.find(buffer);
+		if (hud != m_hud_frames.end())
+		{
+			hudView = hud->second.view;
+			hudSet = hud->second.set;
+			m_hud_frames.erase(hud);
+		}
+	}
+	if (hudView != VK_NULL_HANDLE)
+		vkDestroyImageView(m_device, hudView, nullptr);
+	if (hudSet != VK_NULL_HANDLE && m_hud_ds_pool != VK_NULL_HANDLE)
+		vkFreeDescriptorSets(m_device, m_hud_ds_pool, 1, &hudSet);
 }
 
 // HUD4: Tricky HUD composite (ge1_gs_hud_scene). One compute dispatch per
@@ -5230,6 +5287,19 @@ void GSDeviceVK::DestroyHudResources()
 		m_hud_scene_buffer = VK_NULL_HANDLE;
 		m_hud_scene_allocation = VK_NULL_HANDLE;
 	}
+	// HUD4 Part 2: own submit objects (GPU is idle at all callers; the pool owns the buffer).
+	if (m_hud_fence != VK_NULL_HANDLE)
+	{
+		vkDestroyFence(m_device, m_hud_fence, nullptr);
+		m_hud_fence = VK_NULL_HANDLE;
+	}
+	if (m_hud_cmd_pool != VK_NULL_HANDLE)
+	{
+		vkDestroyCommandPool(m_device, m_hud_cmd_pool, nullptr);
+		m_hud_cmd_pool = VK_NULL_HANDLE;
+		m_hud_cmd = VK_NULL_HANDLE;
+	}
+	m_hud_fence_seq = 0;
 	m_hud_failed = false;
 }
 
@@ -5299,6 +5369,24 @@ bool GSDeviceVK::InitHudResources()
 	if (vmaCreateBuffer(m_allocator, &sceneBci, &sceneAci, &m_hud_scene_buffer,
 	                    &m_hud_scene_allocation, nullptr) != VK_SUCCESS)
 		return fail("scene buffer failed");
+
+	// HUD4 Part 2: the composite's own pool + buffer + fence (1-deep). The pool reset
+	// flag lets one vkResetCommandPool recycle the buffer after its fence completes.
+	VkCommandPoolCreateInfo hudPool = {VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO};
+	hudPool.flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;
+	hudPool.queueFamilyIndex = m_graphics_queue_family_index;
+	if (vkCreateCommandPool(m_device, &hudPool, nullptr, &m_hud_cmd_pool) != VK_SUCCESS)
+		return fail("HUD command pool failed");
+	VkCommandBufferAllocateInfo hudAlloc = {VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
+	hudAlloc.commandPool = m_hud_cmd_pool;
+	hudAlloc.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+	hudAlloc.commandBufferCount = 1;
+	if (vkAllocateCommandBuffers(m_device, &hudAlloc, &m_hud_cmd) != VK_SUCCESS)
+		return fail("HUD command buffer failed");
+	VkFenceCreateInfo hudFence = {VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
+	if (vkCreateFence(m_device, &hudFence, nullptr, &m_hud_fence) != VK_SUCCESS)
+		return fail("HUD fence failed");
+	m_hud_fence_seq = 0;
 	return true;
 }
 
@@ -5361,10 +5449,15 @@ bool GSDeviceVK::CompositeHudAHB(AHardwareBuffer* buffer, const void* scene, u32
 		return fail("region out of range");
 	if (atlasW == 0 || atlasH == 0 || atlasW > 1024 || atlasH > 1024)
 		return fail("atlas dimensions out of range");
-	auto found = m_export_images.find(buffer);
-	if (found == m_export_images.end())
-		return fail("buffer was never exported");
-	ExportImage& image = found->second;
+	// HUD4 Part 2: guarded (the worker emplaces other slots' first exports concurrently).
+	ExportImage image;
+	{
+		std::lock_guard<std::mutex> map_lock(m_submit_mutex);
+		auto found = m_export_images.find(buffer);
+		if (found == m_export_images.end())
+			return fail("buffer was never exported");
+		image = found->second;
+	}
 	if (sc->regionX < 0 || sc->regionY < 0 || sc->regionX + sc->regionW > static_cast<s32>(image.width) ||
 	    sc->regionY + sc->regionH > static_cast<s32>(image.height))
 		return fail("region outside the export");
@@ -5392,6 +5485,63 @@ bool GSDeviceVK::CompositeHudAHB(AHardwareBuffer* buffer, const void* scene, u32
 		return fail("resource init failed");
 	}
 
+	// HUD4 Part 2: the composite's own submit vehicle (1-deep fence). beginHud recycles
+	// the buffer; submitHud ends + submits under the queue lock and hands back the fence
+	// the runtime waits. The pre-wait is free in the contract case (the runtime waited
+	// already, so the fence is signaled) and self-serializes a double submit. Neither
+	// lambda touches the worker's ring: no Drain, no EndRenderPass, no MoveToNext stall.
+	auto beginHud = [&]() -> bool {
+		// Any begin/submit failure sticks (fail-closed to the CPU stamp for the run):
+		// a half-reset fence must never be waited or reused below.
+		if (vkResetCommandPool(m_device, m_hud_cmd_pool, 0) != VK_SUCCESS)
+		{
+			m_hud_failed = true;
+			return false;
+		}
+		VkCommandBufferBeginInfo bi = {VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
+		bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+		if (vkBeginCommandBuffer(m_hud_cmd, &bi) != VK_SUCCESS)
+		{
+			m_hud_failed = true;
+			return false;
+		}
+		return true;
+	};
+	auto submitHud = [&](const char* why) -> bool {
+		if (m_hud_fence_seq > 0)
+		{
+			const VkResult waitRes = vkWaitForFences(m_device, 1, &m_hud_fence, VK_TRUE, UINT64_MAX);
+			if (waitRes != VK_SUCCESS)
+			{
+				m_hud_failed = true;
+				return fail(why);
+			}
+		}
+		if (vkResetFences(m_device, 1, &m_hud_fence) != VK_SUCCESS)
+		{
+			m_hud_failed = true;
+			return fail(why);
+		}
+		if (vkEndCommandBuffer(m_hud_cmd) != VK_SUCCESS)
+		{
+			m_hud_failed = true;
+			return fail(why);
+		}
+		VkSubmitInfo si = {VK_STRUCTURE_TYPE_SUBMIT_INFO};
+		si.commandBufferCount = 1;
+		si.pCommandBuffers = &m_hud_cmd;
+		{
+			std::lock_guard<std::mutex> submit_lock(m_submit_mutex);
+			if (vkQueueSubmit(m_graphics_queue, 1, &si, m_hud_fence) != VK_SUCCESS)
+			{
+				m_hud_failed = true;
+				return fail(why);
+			}
+		}
+		++m_hud_fence_seq;
+		return true;
+	};
+
 	// Temp (region-sized UINT copy of the pristine frame). Recreated only on
 	// a region change (fixed per run): idle first so live sets can be
 	// re-pointed and the old objects destroyed directly.
@@ -5400,7 +5550,7 @@ bool GSDeviceVK::CompositeHudAHB(AHardwareBuffer* buffer, const void* scene, u32
 	{
 		const bool hadTemp = (m_hud_temp_image != VK_NULL_HANDLE);
 		if (hadTemp)
-			WaitForGPUIdle();
+			vkDeviceWaitIdle(m_device); // direct: WaitForGPUIdle's perfmon Put is not thread-safe
 		if (m_hud_temp_view != VK_NULL_HANDLE)
 		{
 			vkDestroyImageView(m_device, m_hud_temp_view, nullptr);
@@ -5454,7 +5604,7 @@ bool GSDeviceVK::CompositeHudAHB(AHardwareBuffer* buffer, const void* scene, u32
 	{
 		const bool hadAtlas = (m_hud_atlas_image != VK_NULL_HANDLE);
 		if (hadAtlas)
-			WaitForGPUIdle();
+			vkDeviceWaitIdle(m_device); // direct: WaitForGPUIdle's perfmon Put is not thread-safe
 		if (m_hud_atlas_view != VK_NULL_HANDLE)
 		{
 			vkDestroyImageView(m_device, m_hud_atlas_view, nullptr);
@@ -5508,8 +5658,14 @@ bool GSDeviceVK::CompositeHudAHB(AHardwareBuffer* buffer, const void* scene, u32
 		}
 		std::memcpy(stageAi.pMappedData, atlasPx, static_cast<size_t>(atlasW) * atlasH * 4);
 		vmaFlushAllocation(m_allocator, stageAlloc, 0, VK_WHOLE_SIZE);
-		EndRenderPass();
-		const VkCommandBuffer upCmd = GetCurrentCommandBuffer();
+		// HUD4 Part 2: upload on the HUD buffer, then wait + destroy the staging here
+		// (once per atlas id; the frame path never defers onto the worker's ring).
+		if (!beginHud())
+		{
+			vmaDestroyBuffer(m_allocator, stage, stageAlloc);
+			return fail("HUD upload begin failed");
+		}
+		const VkCommandBuffer upCmd = m_hud_cmd;
 		VkImageMemoryBarrier toDst = {VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
 		toDst.srcAccessMask = 0;
 		toDst.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
@@ -5535,7 +5691,20 @@ bool GSDeviceVK::CompositeHudAHB(AHardwareBuffer* buffer, const void* scene, u32
 		toRead.newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
 		vkCmdPipelineBarrier(upCmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
 			0, 0, nullptr, 0, nullptr, 1, &toRead);
-		DeferBufferDestruction(stage, stageAlloc);
+		if (!submitHud("HUD atlas upload failed"))
+		{
+			vmaDestroyBuffer(m_allocator, stage, stageAlloc);
+			return false;
+		}
+		{
+			const VkResult uploadWait = vkWaitForFences(m_device, 1, &m_hud_fence, VK_TRUE, UINT64_MAX);
+			vmaDestroyBuffer(m_allocator, stage, stageAlloc);
+			if (uploadWait != VK_SUCCESS)
+			{
+				m_hud_failed = true;
+				return fail("HUD atlas upload wait failed");
+			}
+		}
 		m_hud_atlas_id = atlasId;
 		m_hud_atlas_w = atlasW;
 		m_hud_atlas_h = atlasH;
@@ -5580,8 +5749,9 @@ bool GSDeviceVK::CompositeHudAHB(AHardwareBuffer* buffer, const void* scene, u32
 		HudWriteSet(m_device, set, m_hud_temp_view, m_hud_atlas_view, view, m_hud_scene_buffer);
 	}
 
-	EndRenderPass();
-	const VkCommandBuffer cmd = GetCurrentCommandBuffer();
+	if (!beginHud())
+		return fail("HUD command begin failed");
+	const VkCommandBuffer cmd = m_hud_cmd;
 	// Scene blob, stream-ordered (the driver copies it at record time).
 	vkCmdUpdateBuffer(cmd, m_hud_scene_buffer, 0, sizeof(HudSceneBlob), sc);
 	// Acquire the AHB (the copy released it to FOREIGN): GENERAL -> TRANSFER_SRC.
@@ -5655,11 +5825,14 @@ bool GSDeviceVK::CompositeHudAHB(AHardwareBuffer* buffer, const void* scene, u32
 	vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,
 		0, 0, nullptr, 0, nullptr, 1, &release);
 	m_hud_temp_general = true;
-	*fence_counter = GetCurrentFenceCounter();
-	ExecuteCommandBuffer(WaitType::None); // the runtime queues after this fence completes
+	if (!submitHud("HUD composite submit failed"))
+		return false;
+	// The runtime waits this through GSWaitExportFence (partitioned namespace); it covers
+	// the export copy (same queue in order, or already complete when the helper submits).
+	*fence_counter = HUD_FENCE_COUNTER_BIT | m_hud_fence_seq;
 	if (atlasUploaded)
 		std::fprintf(stderr, "GE1 HUD composite: first composite after atlas upload\n");
-	return !m_last_submit_failed || fail("GS Vulkan command submission failed");
+	return true;
 }
 #endif
 

@@ -287,9 +287,21 @@ private:
 	struct HudFrame { VkDescriptorSet set = VK_NULL_HANDLE; VkImageView view = VK_NULL_HANDLE; };
 	std::unordered_map<AHardwareBuffer*, HudFrame> m_hud_frames;
 	bool m_hud_failed = false; // a resource build failed; refuse until re-init (fail-closed)
+	// HUD4 Part 2: the composite records on its own command buffer and submits with its own
+	// fence, so the runtime's helper thread can submit while the GS worker renders/exports.
+	// The composite never rotates the worker's ring (no MoveToNext stall on either thread).
+	VkCommandPool m_hud_cmd_pool = VK_NULL_HANDLE;
+	VkCommandBuffer m_hud_cmd = VK_NULL_HANDLE;
+	VkFence m_hud_fence = VK_NULL_HANDLE;
+	u64 m_hud_fence_seq = 0; // 1-deep: every submit is waited before the next (see CompositeHudAHB)
 	void DestroyHudResources();
 	bool InitHudResources();
 #endif
+	// HUD4 Part 2: serializes vkQueueSubmit on the graphics queue (worker ring submits + spin
+	// submits vs the helper's HUD submit, Android) and the m_export_images map. Held only
+	// around the syscall / the map op: never across a fence wait, so neither thread stalls
+	// on the other's work. Uncontended cost on non-Android: one mutex round-trip per submit.
+	std::mutex m_submit_mutex;
 	// Helper method to create a Vulkan instance.
 	static VkInstance CreateVulkanInstance(const WindowInfo& wi, OptionalExtensions* oe, bool enable_debug_utils,
 		bool enable_validation_layer);

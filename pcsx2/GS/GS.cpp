@@ -1501,9 +1501,9 @@ int GSCompositeHudAHB(AHardwareBuffer* buffer, const void* scene, u32 sceneSize,
 		return 0;
 	if (GSCurrentRenderer != GSRendererType::VK)
 		return 0;
-	// HUD4: same back-thread quiesce as the export (the composite records on
-	// the calling thread's command buffer, like CopySnapshotToAHB).
-	g_gs_renderer->DrainBackQueue();
+	// HUD4 Part 2: no drain (the composite records on its own command buffer, never the
+	// worker's ring; ordering vs the export copy comes from same-queue submit order, or
+	// from the copy already being complete when the runtime's helper thread submits).
 	return static_cast<GSDeviceVK*>(g_gs_device.get())
 	           ->CompositeHudAHB(buffer, scene, sceneSize, atlasPx, atlasW, atlasH, atlasId, fence_counter)
 	       ? 1
