@@ -117,11 +117,15 @@ TEST(GSInvSrc1Policy, RemapTouchesNothingElse)
 		EXPECT_EQ(GSInvSrc1Policy::RemapFactor(f), f) << "factor " << static_cast<u32>(f);
 	}
 
-	// The plain MIX1 row: a conflict, and identical after the remap.
-	const BlendState mix1 = StateFor(0, 1, 0, 1);
-	const BlendState after = GSInvSrc1Policy::RemapToSrc1(mix1);
-	EXPECT_EQ(after.src_factor, mix1.src_factor);
-	EXPECT_EQ(after.dst_factor, mix1.dst_factor);
+	// A state with no inverted factor at all is identical after the remap: the Ad form of
+	// the equation (DST_ALPHA / INV_DST_ALPHA reads neither output). Conflict states like MIX1
+	// are refused by CanRewriteInvSrc1, so the remap is never applied to them.
+	const BlendState ad_row = StateFor(0, 1, 1, 1);
+	const BlendState after = GSInvSrc1Policy::RemapToSrc1(ad_row);
+	EXPECT_EQ(after.src_factor, ad_row.src_factor);
+	EXPECT_EQ(after.dst_factor, ad_row.dst_factor);
+	EXPECT_EQ(after.src_factor_alpha, ad_row.src_factor_alpha);
+	EXPECT_EQ(after.dst_factor_alpha, ad_row.dst_factor_alpha);
 }
 
 // The refusals. Each of these leaves the blend path exactly as it is today.
