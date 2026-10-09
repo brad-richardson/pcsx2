@@ -28,107 +28,9 @@
 #include <limits>
 #include <cstdio>
 #include <cstdlib>
-#include <map> // OMS1 census (LOCAL-ONLY)
 
 using PS_ATST  = GSShader::PS_ATST;
 using PS_AFAIL = GSShader::PS_AFAIL;
-
-// OMS1 blend-state census (LOCAL-ONLY, not pushed). Counts INV_SRC1 blend states by shape over a
-// replay. Gate: OMS1_CENSUS=1. Table 1 (at-hook) is what the rewrite decision sees, with
-// would-rewrite evaluated as-if the knob were on; table 2 (final) is the post-SecondPass truth.
-// Run with the rewrite knob OFF so both tables see natural states.
-namespace OMS1Census
-{
-	struct Label
-	{
-		u8 src, dst, sa, da, op, constant;
-		bool enable, constant_enable;
-	};
-	static bool s_env_read = false;
-	static bool s_enabled = false;
-	static u64 s_hook_draws = 0;
-	static u64 s_final_draws = 0;
-	static std::map<u32, u64> s_hook;
-	static std::map<u32, u64> s_hook_rewritable;
-	static std::map<u32, u64> s_final;
-	static std::map<u32, Label> s_labels;
-
-	static void Dump()
-	{
-		if (!s_enabled)
-			return;
-		std::fprintf(stderr, "OMS1CENSUS at-hook draws=%llu\n", (unsigned long long)s_hook_draws);
-		for (const auto& [key, n] : s_hook)
-		{
-			const Label& l = s_labels[key];
-			u64 rw = 0;
-			if (auto it = s_hook_rewritable.find(key); it != s_hook_rewritable.end())
-				rw = it->second;
-			std::fprintf(stderr,
-				"OMS1CENSUS at-hook key=%u draws=%llu rewritable=%llu src=%u dst=%u sa=%u da=%u op=%u en=%u ce=%u c=%u\n",
-				key, (unsigned long long)n, (unsigned long long)rw, l.src, l.dst, l.sa, l.da, l.op,
-				l.enable ? 1u : 0u, l.constant_enable ? 1u : 0u, l.constant);
-		}
-		std::fprintf(stderr, "OMS1CENSUS final draws=%llu\n", (unsigned long long)s_final_draws);
-		for (const auto& [key, n] : s_final)
-		{
-			const Label& l = s_labels[key];
-			std::fprintf(stderr,
-				"OMS1CENSUS final key=%u draws=%llu src=%u dst=%u sa=%u da=%u op=%u en=%u ce=%u c=%u\n",
-				key, (unsigned long long)n, l.src, l.dst, l.sa, l.da, l.op, l.enable ? 1u : 0u,
-				l.constant_enable ? 1u : 0u, l.constant);
-		}
-		std::fprintf(
-			stderr,
-			"OMS1CENSUS legend src/dst/sa/da: 0=SRC_C 1=INV_SRC_C 2=DST_C 3=INV_DST_C 4=SRC1_C 5=INV_SRC1_C "
-			"6=SRC_A 7=INV_SRC_A 8=DST_A 9=INV_DST_A 10=SRC1_A 11=INV_SRC1_A 12=CONST_C 13=INV_CONST_C 14=ONE 15=ZERO\n");
-	}
-
-	static void MaybeInit()
-	{
-		if (s_env_read)
-			return;
-		s_env_read = true;
-		const char* census = std::getenv("OMS1_CENSUS");
-		s_enabled = census && std::strcmp(census, "1") == 0;
-		if (s_enabled)
-			std::atexit(Dump);
-	}
-
-	static void RecordLabel(const GSHWDrawConfig::BlendState& bs)
-	{
-		if (s_labels.find(bs.key) != s_labels.end())
-			return;
-		s_labels[bs.key] = Label{bs.src_factor, bs.dst_factor, bs.src_factor_alpha, bs.dst_factor_alpha,
-			bs.op, bs.constant, bs.enable, bs.constant_enable};
-	}
-
-	static void AtHook(const GSHWDrawConfig::BlendState& bs, const GSInvSrc1Policy::DrawInputs& in)
-	{
-		MaybeInit();
-		if (!s_enabled)
-			return;
-		s_hook_draws++;
-		if (!GSInvSrc1Policy::ReadsInvSrc1(bs))
-			return;
-		RecordLabel(bs);
-		s_hook[bs.key]++;
-		if (GSInvSrc1Policy::CanRewriteInvSrc1(bs, in))
-			s_hook_rewritable[bs.key]++;
-	}
-
-	static void AtFinal(const GSHWDrawConfig::BlendState& bs)
-	{
-		MaybeInit();
-		if (!s_enabled)
-			return;
-		s_final_draws++;
-		if (!GSInvSrc1Policy::ReadsInvSrc1(bs))
-			return;
-		RecordLabel(bs);
-		s_final[bs.key]++;
-	}
-} // namespace OMS1Census
 
 GSRendererHW::GSRendererHW()
 	: GSRenderer()
@@ -9214,18 +9116,6 @@ void GSRendererHW::EmulateBlending(int rt_alpha_min, int rt_alpha_max, DATEOptio
 	// road. Runs after the constant reroute so it sees the final factors; the two compose (a
 	// rerouted lopsided state complements Af the same way). GSInvSrc1Policy.h carries what each
 	// guard protects.
-	// OMS1 census (LOCAL-ONLY): what the rewrite decision sees, as-if the knob were on.
-	{
-		GSInvSrc1Policy::DrawInputs census_in;
-		census_in.inv_src1_rewrite = true;
-		census_in.dual_source_blend = features.dual_source_blend;
-		census_in.simple_rgb_only = m_conf.alpha_test == GSHWDrawConfig::AlphaTestMode::SIMPLE_RGB_ONLY;
-		census_in.pabe = m_conf.ps.pabe != 0;
-		census_in.blend_factor_in_alpha = m_conf.ps.blend_factor_in_alpha != 0;
-		census_in.multi_pass_reads_second_output = m_conf.blend_multi_pass.enable &&
-			GSBlendConstantPolicy::ReadsSecondOutput(m_conf.blend_multi_pass.blend);
-		OMS1Census::AtHook(m_conf.blend, census_in);
-	}
 	if (features.inv_src1_rewrite)
 	{
 		GSInvSrc1Policy::DrawInputs rewrite;
@@ -11531,9 +11421,6 @@ __ri void GSRendererHW::DrawPrims(GSTextureCache::Target* rt, GSTextureCache::Ta
 		GL_INS("HW: Aborting draw %s due to alpha test config.", s_n);
 		return;
 	}
-
-	// OMS1 census (LOCAL-ONLY): the post-SecondPass truth.
-	OMS1Census::AtFinal(m_conf.blend);
 
 	// rs
 	const GSVector4i hacked_scissor = m_channel_shuffle ? GSVector4i::cxpr(0, 0, 1024, 1024) : m_context->scissor.in;
