@@ -4261,6 +4261,16 @@ void GSDeviceVK::ResolveFeatureTable()
 	}
 #endif
 
+	// ssx3 OMS1: GE1_ADRENO_SRC1_REWRITE=1 rewrites lopsided ONE_MINUS_SRC1_* blends to SRC1_*
+	// with a complemented second output (GSInvSrc1Policy.h), so our Turnip's MR1 0004 stops
+	// forcing those passes into GMEM. Default off everywhere; set on the Odin play env. Read on
+	// every platform (the Mac validates the rewrite over MoltenVK).
+	if (const char* rewrite = std::getenv("GE1_ADRENO_SRC1_REWRITE"); rewrite && std::strcmp(rewrite, "1") == 0)
+	{
+		m_features.inv_src1_rewrite = true;
+		Console.WriteLn("VK: OMS1 inv-src1 rewrite on (GE1_ADRENO_SRC1_REWRITE=1)");
+	}
+
 	// Use D32F depth instead of D32S8 when we have framebuffer fetch.
 	m_features.stencil_buffer &= !m_features.framebuffer_fetch;
 
@@ -7733,6 +7743,7 @@ VkShaderModule GSDeviceVK::GetTFXFragmentShader(const GSHWDrawConfig::PSSelector
 	AddMacro(ss, "PS_NO_COLOR1", sel.no_color1);
 	AddMacro(ss, "PS_BLEND_FACTOR_IN_ALPHA", sel.blend_factor_in_alpha);
 	AddMacro(ss, "PS_AF_IN_SRC1", sel.af_in_src1);
+	AddMacro(ss, "PS_INV_SRC1_REWRITE", sel.inv_src1_rewrite);
 	AddMacro(ss, "PS_STENCIL_COUNTER", sel.stencil_counter);
 	AddMacro(ss, "PS_ZTST", sel.ztst);
 	AddMacro(ss, "PS_AA1", static_cast<u32>(sel.aa1));

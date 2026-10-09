@@ -2055,7 +2055,15 @@ void main()
 			o_col0.rgb = C.rgb / 255.0f;
 		#endif
 		#if !PS_NO_COLOR1
-			o_col1 = alpha_blend;
+			#if PS_INV_SRC1_REWRITE
+				// OMS1: the blend factors were rewritten INV_SRC1_* -> SRC1_*, so the second output
+				// carries the complement. Set only for lopsided states (no plain SRC1_* reader) --
+				// see GSInvSrc1Policy.h. A stencil-counter draw overwrites o_col1 below; those states
+				// never rewrite (no inverted factor), so the overwrite wins.
+				o_col1 = vec4(1.0) - alpha_blend;
+			#else
+				o_col1 = alpha_blend;
+			#endif
 		#endif
 
 		#if PS_STENCIL_COUNTER && !PS_NO_COLOR1

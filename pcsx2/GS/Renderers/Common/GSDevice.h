@@ -811,6 +811,7 @@ struct alignas(16) GSHWDrawConfig
 				u32 no_color1      : 1; // disables second color output (when unnecessary)
 				u32 blend_factor_in_alpha : 1; // writes the blend factor to the first output's alpha instead of the second output (no dual-source blend)
 				u32 af_in_src1     : 1; // writes the fixed blend factor (AFIX/128) to the second output, for a driver that ignores the blend constant
+				u32 inv_src1_rewrite : 1; // the blend factors were rewritten INV_SRC1_* -> SRC1_*; the second output carries 1-f (see GSInvSrc1Policy.h)
 
 				// Others ways to fetch the texture
 				u32 channel : 3;
@@ -1604,6 +1605,7 @@ public:
 		bool dual_source_blend    : 1; ///< Supports a second fragment output (SRC1) as a hardware blend factor.
 		bool broken_mad_deinterlace : 1; ///< Driver can't reliably preserve/read the two-bank FastMAD history target.
 		bool broken_blend_constant : 1; ///< Driver applies a CONST_COLOR / INV_CONST_COLOR blend factor as if the constant were zero. A fixed (AFIX) factor rides the second fragment output instead -- see GSBlendConstantPolicy.h.
+		bool inv_src1_rewrite : 1; ///< GE1_ADRENO_SRC1_REWRITE=1 on this backend: lopsided INV_SRC1_* blends ride SRC1_* factors with a complemented second output -- see GSInvSrc1Policy.h.
 		GSFeedbackCarry feedback_carry; ///< Which draws may keep the open pass's feedback-loop bits. Vulkan only; see GSDrawRoad.h.
 		FeatureSupport()
 		{

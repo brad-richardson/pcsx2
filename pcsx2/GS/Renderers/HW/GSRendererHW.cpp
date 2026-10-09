@@ -12,6 +12,7 @@
 #include "GS/Renderers/HW/GSTextureReplacements.h"
 #include "GS/Renderers/Common/GSAlphaBitLogicOp.h"
 #include "GS/Renderers/Common/GSBlendConstantPolicy.h"
+#include "GS/Renderers/Common/GSInvSrc1Policy.h"
 #include "GS/Renderers/Common/GSDrawRoad.h"
 #include "GS/Renderers/Common/GSFastStencilShadow.h"
 #include "GS/Renderers/Common/GSNativeTexelGridPolicy.h"
@@ -9106,6 +9107,40 @@ void GSRendererHW::EmulateBlending(int rt_alpha_min, int rt_alpha_max, DATEOptio
 		}
 	}
 
+	// The inverted-src1 road to the blend unit, on a backend that asked for it. Where the state
+	// is lopsided (an INV_SRC1_* factor with no plain SRC1_* reader in any of the four factors),
+	// the uninverted factor with a complemented second output hands the same product to the same
+	// fixed-function multiply (OMS1): the blend unit computes Cd*(1-f) either way, and our Turnip
+	// renders SRC1_* exactly in sysmem while 0004 keeps forcing INV_SRC1_* passes into GMEM.
+	// Conflict states (plain MIX1/MIX3, SIMPLE_RGB_ONLY alpha) keep their factors and the GMEM
+	// road. Runs after the constant reroute so it sees the final factors; the two compose (a
+	// rerouted lopsided state complements Af the same way). GSInvSrc1Policy.h carries what each
+	// guard protects.
+	if (features.inv_src1_rewrite)
+	{
+		GSInvSrc1Policy::DrawInputs rewrite;
+		rewrite.inv_src1_rewrite = true;
+		rewrite.dual_source_blend = features.dual_source_blend;
+		rewrite.simple_rgb_only = m_conf.alpha_test == GSHWDrawConfig::AlphaTestMode::SIMPLE_RGB_ONLY;
+		rewrite.pabe = m_conf.ps.pabe != 0;
+		rewrite.blend_factor_in_alpha = m_conf.ps.blend_factor_in_alpha != 0;
+		// The two passes of a blend multi-pass share one pixel shader, so the second pass reading
+		// the second output makes the complement unreadable to the first.
+		rewrite.multi_pass_reads_second_output = m_conf.blend_multi_pass.enable &&
+		                                         GSBlendConstantPolicy::ReadsSecondOutput(m_conf.blend_multi_pass.blend);
+
+		if (GSInvSrc1Policy::CanRewriteInvSrc1(m_conf.blend, rewrite))
+		{
+			m_conf.ps.inv_src1_rewrite = 1;
+			m_conf.blend = GSInvSrc1Policy::RemapToSrc1(m_conf.blend);
+			// Dual-source factors remain, so the second output still has to be written. No later
+			// stage rewrites these factors (SIMPLE_RGB_ONLY is refused above; the ROV arm below
+			// clears the bit with the blend); say it here too so the state leaves this function
+			// coherent.
+			m_conf.ps.no_color1 = false;
+		}
+	}
+
 	// Notify the shader that it needs to invert rounding
 	if (m_conf.blend.op == GSDevice::OP_REV_SUBTRACT)
 		m_conf.ps.round_inv = 1;
@@ -9328,6 +9363,7 @@ void GSRendererHW::ConfigureROV(bool color_rov, bool depth_rov)
 			m_conf.ps.round_inv = false;
 			m_conf.ps.a_masked = false;
 			m_conf.ps.af_in_src1 = false;
+			m_conf.ps.inv_src1_rewrite = false;
 		}
 
 		// Dither setup
