@@ -114,11 +114,16 @@ namespace GSStatic
 		const GSVertexKernels::CullGrid& grid = cs.grid;
 		const bool shift0 = cs.shift0 != 0;
 
-		GSVector4i m0[kStaticMaxVerts], m1[kStaticMaxVerts];
+		// Only the cull mirror per vertex up front; the trace parses a vertex
+		// when it folds it in (once, by the watermark below).
 		u64 xyp[kStaticMaxVerts], meta[kStaticMaxVerts];
+		const auto accum = [&](u32 v, bool color) __attribute__((always_inline)) {
+			GSVector4i m0, m1;
+			Parse(d + v, cs.uv, clamp, keep, shifted, m0, m1);
+			GSVertexKernels::FmmAccumVertex(o.acc, m0, m1, tme, fst, color);
+		};
 		for (u32 i = 0; i < count; i++)
 		{
-			Parse(d + i, cs.uv, clamp, keep, shifted, m0[i], m1[i]);
 			const int wx = static_cast<int>(d[i].X & 0xFFFFu) - cs.xyof_x;
 			const int wy = static_cast<int>(d[i].Y & 0xFFFFu) - cs.xyof_y;
 			const GSVertexKernels::CullMirrorEntry e = Mirror(cs, wx, wy);
@@ -198,8 +203,8 @@ namespace GSStatic
 			s3[1] = static_cast<u8>(dst + 1);
 			s3[2] = static_cast<u8>(dst + 2);
 			for (u32 j = std::max(wm, dst); j < dst + 2; j++)
-				GSVertexKernels::FmmAccumVertex(o.acc, m0[o.src[j]], m1[o.src[j]], tme, fst, iip);
-			GSVertexKernels::FmmAccumVertex(o.acc, m0[o.src[dst + 2]], m1[o.src[dst + 2]], tme, fst, true);
+				accum(o.src[j], iip);
+			accum(o.src[dst + 2], true);
 			wm = dst + 3;
 			const GSVector4i r = GSVertexKernels::PrimDrawRect(bbox);
 			const GSVector4i nr = GSVertexKernels::PrimNativeDrawRectOrNone<GS_TRIANGLE_CLASS>(bbox);
