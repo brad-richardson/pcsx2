@@ -106,6 +106,8 @@ u32 GSStaticPrepareRecord(const u8* compact, u32 size, u8* out, u32 cap);
 // malformed). End clears it.
 void GSStaticRecordBegin(const u8* block, u32 size);
 void GSStaticRecordEnd();
+// The S4c fast-path counters to stderr (they also print every 240 vsyncs).
+void GSStaticStatsPrint();
 void GSgifTransfer1(u8* mem, u32 addr);
 void GSgifTransfer2(u8* mem, u32 size);
 void GSgifTransfer3(u8* mem, u32 size);

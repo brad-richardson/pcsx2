@@ -6073,7 +6073,7 @@ bool SpecEq(const GSStaticCullState& a, const GSStaticCullState& b, bool with_uv
 void PrintFast()
 {
 	std::fprintf(stderr,
-		"[ge1] s4c fast: packets=%llu fast=%llu verts=%llu unsupported=%llu fallback(autoflush=%llu kernel=%llu "
+		"[ge1] s4c fast: packets=%llu fast=%llu verts=%llu unsupported=%llu fallback(autoflush=%llu aa1=%llu "
 		"scissor=%llu overlap=%llu vertexcount=%llu shift0=%llu) record(hit=%llu miss=%llu absent=%llu) shadow compared=%llu mismatched=%llu flush_inside=%llu "
 		"fields(itail %llu index %llu vertex %llu head/tail/next %llu ring %llu fmm %llu wm %llu rect %llu m_v %llu env %llu)\n",
 		(unsigned long long)s_fp[0].load(), (unsigned long long)s_fp[1].load(), (unsigned long long)s_fp[2].load(),
@@ -6235,6 +6235,11 @@ void GSStaticRecordEnd()
 	GSState::s_static_rec_npk = 0;
 }
 
+void GSStaticStatsPrint()
+{
+	PrintFast();
+}
+
 void GSState::StaticCullStateLive(GSStaticCullState& cs)
 {
 	std::memset(&cs, 0, sizeof(cs));
@@ -6248,8 +6253,12 @@ void GSState::StaticCullStateLive(GSStaticCullState& cs)
 	// StaticApply does with the live value.
 	cs.uv = (GSStatic::PrimTME(cs.prim) && GSStatic::PrimFST(cs.prim)) ? m_v.UV : 0u;
 	cs.clamp = static_cast<s32>(GetDepthClampMode());
-	cs.shift0 = (GKV1Shift0Kernel() && m_cull_grid.shift == 0) ? 1 : 0;
-	cs.kernel_ok = KickKernelApplies<GS_TRIANGLESTRIP>() ? 1 : 0;
+	// At shift 0 (a non-power-of-two upscale) the kick takes the legacy
+	// per-vertex CullTest unless GE1_GKV1_SHIFT0 arms the kernel's keep-all
+	// mode, which decides exactly as that CullTest does (GKV1: replay pixels
+	// and det IDENTICAL at 2.5x); Prepare uses keep-all at shift 0 either way.
+	cs.shift0 = (m_cull_grid.shift == 0) ? 1 : 0;
+	cs.kernel_ok = (PRIM->AA1 && IsCoverageAlphaSupported()) ? 0 : 1; // no AA1 expansion
 	cs.scissor_invalid = m_scissor_invalid ? 1 : 0;
 }
 
@@ -6259,8 +6268,8 @@ int GSState::StaticFastOk(u32 count)
 {
 	if (m_fpGIFCompactHandler[prim] != &GSState::GIFCompactHandlerSTQRGBAXYZF2<prim, false>)
 		return 1; // auto flush: HandleAutoFlush per vertex
-	if (!KickKernelApplies<prim>())
-		return 2; // AA1 expansion or the shift-0 legacy cull
+	if (PRIM->AA1 && IsCoverageAlphaSupported())
+		return 2; // AA1 expansion: the legacy CullTest with the expanded bbox
 	if (m_scissor_invalid)
 		return 3; // the kick skips everything through the legacy path
 	if (m_recent_buffer_switch && GSConfig.UserHacks_DrawBuffering)
@@ -6268,8 +6277,6 @@ int GSState::StaticFastOk(u32 count)
 	constexpr u32 max_vertices = MaxVerticesForPrim(prim);
 	if (max_vertices != 0 && m_vertex->tail + count >= max_vertices)
 		return 5; // a VERTEXCOUNT flush inside the packet
-	if (m_cull_grid.shift == 0)
-		return 6; // shift-0: count < kMinKernelVertices takes the full CullTest
 	return 0;
 }
 
