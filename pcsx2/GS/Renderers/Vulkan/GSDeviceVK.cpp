@@ -5177,6 +5177,11 @@ static_assert(offsetof(HudSceneBlob, quadSrcX) == 80, "HudSceneBlob layout");
 static_assert(offsetof(HudSceneBlob, quadDim) == 912, "HudSceneBlob layout");
 static constexpr u32 HUD_SCENE_MAGIC = 0x44554847u; // 'HUDG'
 static constexpr u32 HUD_SCENE_VERSION = 1u;
+// HPR1: one descriptor set per live AHB. The runtime's pool depth
+// (PS2X_PRESENT_AHB_POOL) ranges 4..8, so the pool holds 8 sets; HUD4's 4
+// exhausted on the 5th buffer (PB53: "descriptor set failed" + CPU fallback
+// on 2 of every 6 frames). Allocation sizing only: pixels untouched.
+static constexpr u32 HUD_MAX_SETS = 8u;
 
 // The composite shader. Every float expression mirrors the CPU reference
 // (ps2_ssx3_tricky_hud.h sampleAtlas / blendSample / smearCoverS) in the
@@ -5510,12 +5515,12 @@ bool GSDeviceVK::InitHudResources()
 
 	VkDescriptorPoolSize poolSizes[2] = {};
 	poolSizes[0].type = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
-	poolSizes[0].descriptorCount = 12; // 4 sets x temp/atlas/frame
+	poolSizes[0].descriptorCount = 3 * HUD_MAX_SETS; // sets x temp/atlas/frame
 	poolSizes[1].type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
-	poolSizes[1].descriptorCount = 4; // 4 sets x scene
+	poolSizes[1].descriptorCount = HUD_MAX_SETS; // sets x scene
 	VkDescriptorPoolCreateInfo poolInfo = {VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
 	poolInfo.flags = VK_DESCRIPTOR_POOL_CREATE_FREE_DESCRIPTOR_SET_BIT;
-	poolInfo.maxSets = 4;
+	poolInfo.maxSets = HUD_MAX_SETS;
 	poolInfo.poolSizeCount = 2;
 	poolInfo.pPoolSizes = poolSizes;
 	if (vkCreateDescriptorPool(m_device, &poolInfo, nullptr, &m_hud_ds_pool) != VK_SUCCESS)

@@ -281,7 +281,7 @@ private:
 	};
 	std::unordered_map<AHardwareBuffer*, ExportImage> m_export_images;
 	ExportImage* FindOrImportAHBImage(AHardwareBuffer* buffer, u32 width, u32 height);
-	// HUD4: Tricky HUD composite state (all device-lifetime; the pool holds ≤4 sets).
+	// HUD4: Tricky HUD composite state (all device-lifetime; the pool holds ≤8 sets, HPR1).
 	VkPipeline m_hud_pipeline = VK_NULL_HANDLE;
 	VkPipelineLayout m_hud_pipeline_layout = VK_NULL_HANDLE;
 	VkDescriptorSetLayout m_hud_ds_layout = VK_NULL_HANDLE;
