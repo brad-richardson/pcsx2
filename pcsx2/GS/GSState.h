@@ -7,6 +7,7 @@
 #include "GS/GSPerfMon.h"
 #include "GS/GSLocalMemory.h"
 #include "GS/GSVertexKick.h"
+#include "GS/GSStaticPrep.h"
 #include "GS/GSVertexKickKernel.h"
 #include "GS/GSBackQueue.h"
 #include "GS/GSDrawingContext.h"
@@ -485,23 +486,26 @@ protected:
 	template<u32 prim> void KickCompactOneStaged(const Ge1CompactVertex* RESTRICT dv);
 	template<u32 prim> void KickCompactStagedRun(const Ge1CompactVertex* RESTRICT d, u32 count);
 	template<u32 prim> void KickCompactOneLegacy(const Ge1CompactVertex* RESTRICT dv, u32 uv, GSLimit24BitDepth depth_clamp);
-	// RZV1 S4b: one static-world packet's kick outcome computed without the
-	// kick. ApplyPRIM resets the vertex queue at every packet (head = tail =
-	// next), so the outcome depends only on the packet, the cull state and,
-	// at the GsWorker, the slot base and whether the draw is still empty.
-	// Emitted indices are relative slots; slotSrc says which packet vertex a
-	// relative slot holds at the end; acc is the fused-FMM union over the
-	// emitted triangles; rect/nrect the draw-rect unions. Strip and list only.
-	struct StaticPrep
+	// RZV1 S4b/S4c: the static-world fast path (GSStaticPrep.h). StaticPacket
+	// runs per compact packet after ApplyPRIM: false = the kick runs as before.
+	// GE1_STATIC_FAST=1 replaces the kick with GSStatic::Prepare + StaticApply
+	// where StaticFastOk holds; GE1_RESIDENT_CHECK=2 runs the kick too, on the
+	// same state, and compares everything it leaves behind; GE1_RESIDENT_SPEC=1
+	// counts how often the cull state repeats (the MTVU speculation question).
+	bool StaticPacket(const Ge1CompactVertex* d, u32 count);
+	void StaticCullStateLive(GSStaticCullState& cs);
+	template<u32 prim> int StaticFastOk(u32 count);
+	template<u32 prim> void StaticApply(const Ge1CompactVertex* RESTRICT d, const GSStaticPrep& p, const GSStaticCullState& cs);
+	void StaticSpecNote(const GSStaticCullState& cs);
+	struct StaticShadow;
+	void StaticShadowCapture(StaticShadow& s, u32 base, u32 itail0);
+	void StaticShadowRestore(const StaticShadow& s);
+	struct StaticSpec
 	{
-		u32 ntri = 0;
-		u32 nslot = 0;
-		u8 slot[3 * 64];
-		u8 slotSrc[64];
-		GSVertexKernels::FmmAcc acc;
-		GSVector4i rect, nrect;
-	};
-	template<u32 prim> void StaticPrepare(const Ge1CompactVertex* RESTRICT d, u32 count, StaticPrep& out);
+		GSStaticCullState prev[2], vs1[2], vs2[2], prev_any;
+		bool hp[2] = {}, h1[2] = {}, h2[2] = {}, hpa = false;
+		u64 vsyncs = 0;
+	} m_static_spec;
 	// GE1_RESIDENT_CHECK=1: StaticPrepare beside the real kick, per packet.
 	void StaticCheckPacket(const Ge1CompactVertex* d, u32 count);
 	void StaticCheckAfter(const Ge1CompactVertex* d, u32 count);
@@ -516,7 +520,7 @@ protected:
 		GSVertexKernels::FmmAcc acc0;
 		bool fmm_valid0 = false;
 		GSVector4i rect0, nrect0;
-		StaticPrep prep;
+		GSStaticPrep prep;
 	} m_static_check;
 	template<u32 prim> bool KickKernelApplies();
 	// GKV1 census (lane branch only): per-batch two-pass vs legacy + fallback
@@ -1092,6 +1096,7 @@ public:
 	// malformed record; the caller falls back to GIF packets.
 	bool TransferCompact(const u8* bytes, u32 size);
 	static inline void (*s_compact_packet_hook)(u32 packet, u32 uv, int depth_clamp_mode) = nullptr; // RZV1 S4b
+	void StaticSpecVsync(); // RZV1 S4c: GE1_RESIDENT_SPEC rotation (GSvsync)
 	int Freeze(freezeData* fd, bool sizeonly);
 	int Defrost(const freezeData* fd);
 

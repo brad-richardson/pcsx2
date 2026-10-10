@@ -925,6 +925,7 @@ void GSvsync(u32 field, bool registers_written)
 	// Do not move the flush into the VSync() method. It's here because EE transfers
 	// get cleared in HW VSync, and may be needed for a buffered draw (FFX FMVs).
 	front->Flush(GSState::VSYNC);
+	front->StaticSpecVsync(); // RZV1 S4c
 	g_gs_renderer->SubmitVsync(field, registers_written);
 	if (g_gs_front)
 		g_gs_front->MirrorPostVsyncState();

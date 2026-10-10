@@ -6016,124 +6016,22 @@ void GSState::Transfer(const u8* mem, u32 size)
 // refuses the whole call without changing any state, and the caller falls
 // back to GIF packets. No dump-sink feed: GE1 never opens one (the runtime
 // capture is the capture path, and it sees expanded packets at the frontend).
-// ---------------------------------------------------------------- RZV1 S4b
-template <u32 prim>
-void GSState::StaticPrepare(const Ge1CompactVertex* RESTRICT d, u32 count, StaticPrep& o)
-{
-	static_assert(prim == GS_TRIANGLESTRIP || prim == GS_TRIANGLELIST);
-	constexpr bool strip = (prim == GS_TRIANGLESTRIP);
-	const bool tme = PRIM->TME, fst = PRIM->FST, iip = PRIM->IIP;
-	const u32 uv = m_v.UV;
-	const GSLimit24BitDepth depth_clamp = GetDepthClampMode();
-	const bool clamp = depth_clamp != GSLimit24BitDepth::Disabled;
-	GSVector4i keep, shifted;
-	if (clamp)
-		GSVertexKickKernel::MakeDepthClampMasks(depth_clamp, keep, shifted);
-	const GSVertexKernels::CullGrid grid = m_cull_grid;
-	const bool shift0 = GKV1Shift0Kernel() && grid.shift == 0;
-
-	GSVector4i m0[64], m1[64];
-	u64 xyp[64], meta[64];
-	for (u32 i = 0; i < count; i++)
-	{
-		GSVertexKernels::ParseCompactXYZF2(d + i, uv, m0[i], m1[i]);
-		if (clamp)
-			m1[i] = (m1[i] & keep) | (m1[i].srl32<8>() & shifted);
-		const int wx = static_cast<int>(d[i].X & 0xFFFFu) - m_xyof.I32[0];
-		const int wy = static_cast<int>(d[i].Y & 0xFFFFu) - m_xyof.I32[1];
-		const GSVertexKernels::CullMirrorEntry e = MakeKickMirror(GS_TRIANGLE_CLASS, wx, wy);
-		xyp[i] = e.xyp;
-		meta[i] = e.meta | (static_cast<u64>(d[i].W3 & 0x8000u) << 45);
-	}
-
-	GSVertexKernels::FmmAccReset(o.acc, tme, fst);
-	o.ntri = 0;
-	o.rect = GSVector4i::zero();
-	o.nrect = GSVector4i::zero();
-	u32 head = 0, tail = 0, next = 0;
-	for (u32 i = 0; i < count; i++)
-	{
-		o.slotSrc[tail] = static_cast<u8>(i);
-		tail++;
-		if ((tail - head) < 3)
-			continue;
-		const GSVertexKernels::CullMirrorEntry e0{xyp[i], meta[i]};
-		const GSVertexKernels::CullMirrorEntry e1{xyp[i - 1], meta[i - 1]};
-		const GSVertexKernels::CullMirrorEntry e2{xyp[i - 2], meta[i - 2]};
-		u32 skip = static_cast<u32>((meta[i] >> 60) & 1u);
-		GSVector4i bbox = GSVector4i::zero();
-		if (skip == 0)
-		{
-			if (shift0)
-			{
-				const u64 all_out = e0.meta & e1.meta & e2.meta;
-				if ((all_out & GSVertexKernels::kCullMetaOutcodeMask) != 0)
-					skip = 1;
-				else if (e0.xyp == e1.xyp || e1.xyp == e2.xyp || e0.xyp == e2.xyp)
-					skip = 1;
-				if (skip == 0)
-				{
-					bbox = GSVertexKernels::ComputeCullBBox<3, GS_TRIANGLE_CLASS>(GSVertexKickKernel::BroadcastXY(xyp[i]),
-						GSVertexKickKernel::BroadcastXY(xyp[i - 1]), GSVertexKickKernel::BroadcastXY(xyp[i - 2]), grid, false);
-					if (bbox.rempty())
-						skip = 1;
-				}
-			}
-			else
-				skip = GSVertexKernels::CullTestScalar<3, GS_TRIANGLE_CLASS>(e0, e1, e2);
-		}
-		if (skip != 0)
-		{
-			if constexpr (strip)
-				head = head + 1;
-			else
-				tail = head;
-			continue;
-		}
-		u32 dst = head;
-		if constexpr (strip)
-		{
-			if (next < head)
-			{
-				o.slotSrc[next + 0] = o.slotSrc[head + 0];
-				o.slotSrc[next + 1] = o.slotSrc[head + 1];
-				o.slotSrc[next + 2] = o.slotSrc[head + 2];
-				dst = next;
-			}
-		}
-		if (!shift0)
-			bbox = GSVertexKernels::ComputeCullBBox<3, GS_TRIANGLE_CLASS>(GSVertexKickKernel::BroadcastXY(xyp[i]),
-				GSVertexKickKernel::BroadcastXY(xyp[i - 1]), GSVertexKickKernel::BroadcastXY(xyp[i - 2]), grid, false);
-		u8* s3 = o.slot + 3 * o.ntri;
-		s3[0] = static_cast<u8>(dst);
-		s3[1] = static_cast<u8>(dst + 1);
-		s3[2] = static_cast<u8>(dst + 2);
-		for (u32 j = 0; j < 3; j++)
-		{
-			const u32 v = o.slotSrc[dst + j];
-			GSVertexKernels::FmmAccumVertex(o.acc, m0[v], m1[v], tme, fst, iip || j == 2);
-		}
-		const GSVector4i r = GSVertexKernels::PrimDrawRect(bbox);
-		const GSVector4i nr = GSVertexKernels::PrimNativeDrawRectOrNone<GS_TRIANGLE_CLASS>(bbox);
-		o.rect = o.ntri ? o.rect.runion(r) : r;
-		o.nrect = o.ntri ? o.nrect.runion(nr) : nr;
-		o.ntri++;
-		if constexpr (strip)
-		{
-			head = dst + 1;
-			next = tail = dst + 3;
-		}
-		else
-			head = next = tail = dst + 3;
-	}
-	o.nslot = next;
-}
-
+// ---------------------------------------------------------------- RZV1 S4b/S4c
 namespace
 {
 std::atomic<u64> s_sc[8]; // 0 compared, 1 matched, 2 mismatched, 3 flush/switch inside, 4 unsupported prim, 5 empty-and-matched
 std::atomic<u64> s_scField[6]; // ntri, index, vertex bytes, next, fmm, rect
 std::atomic<int> s_scDumps{8};
+// S4c fast path: 0 packets seen, 1 fast, 2 fast vertices, 3 unsupported (prim/count),
+// 4..9 StaticFastOk reasons 1..6, 10 shadow compared, 11 shadow mismatched,
+// 12 shadow flush/switch inside the kick
+std::atomic<u64> s_fp[16];
+std::atomic<u64> s_fpField[16];
+std::atomic<int> s_fpDumps{8};
+// S4c spec: 0 packets, 1 hit prev (same ctx), 2 hit prev (any ctx), 3 have vs1, 4 hit vs1,
+// 5 have vs2, 6 hit vs2, 7 hit vs1 ignoring UV, 8 state changes (same ctx)
+std::atomic<u64> s_sp[10];
+
 void FmmMerge(GSVertexKernels::FmmAcc& a, const GSVertexKernels::FmmAcc& b, bool tme, bool fst)
 {
 	a.pmin = a.pmin.min_u32(b.pmin);
@@ -6155,14 +6053,406 @@ void FmmMerge(GSVertexKernels::FmmAcc& a, const GSVertexKernels::FmmAcc& b, bool
 	a.cmin = a.cmin.min_u8(b.cmin);
 	a.cmax = a.cmax.max_u8(b.cmax);
 }
+
+int EnvInt(const char* name)
+{
+	const char* v = std::getenv(name);
+	return v ? std::atoi(v) : 0;
+}
+
+bool SpecEq(const GSStaticCullState& a, const GSStaticCullState& b, bool with_uv)
+{
+	GSStaticCullState x = a, y = b;
+	x.prim = y.prim = 0; // the record's tag carries PRIM
+	if (!with_uv)
+		x.uv = y.uv = 0;
+	return std::memcmp(&x, &y, sizeof(x)) == 0;
+}
+
+void PrintFast()
+{
+	std::fprintf(stderr,
+		"[ge1] s4c fast: packets=%llu fast=%llu verts=%llu unsupported=%llu fallback(autoflush=%llu kernel=%llu "
+		"scissor=%llu overlap=%llu vertexcount=%llu shift0=%llu) shadow compared=%llu mismatched=%llu flush_inside=%llu "
+		"fields(itail %llu index %llu vertex %llu head/tail/next %llu ring %llu fmm %llu wm %llu rect %llu m_v %llu env %llu)\n",
+		(unsigned long long)s_fp[0].load(), (unsigned long long)s_fp[1].load(), (unsigned long long)s_fp[2].load(),
+		(unsigned long long)s_fp[3].load(), (unsigned long long)s_fp[4].load(), (unsigned long long)s_fp[5].load(),
+		(unsigned long long)s_fp[6].load(), (unsigned long long)s_fp[7].load(), (unsigned long long)s_fp[8].load(),
+		(unsigned long long)s_fp[9].load(), (unsigned long long)s_fp[10].load(), (unsigned long long)s_fp[11].load(),
+		(unsigned long long)s_fp[12].load(), (unsigned long long)s_fpField[0].load(), (unsigned long long)s_fpField[1].load(),
+		(unsigned long long)s_fpField[2].load(), (unsigned long long)s_fpField[3].load(), (unsigned long long)s_fpField[4].load(),
+		(unsigned long long)s_fpField[5].load(), (unsigned long long)s_fpField[6].load(), (unsigned long long)s_fpField[7].load(),
+		(unsigned long long)s_fpField[8].load(), (unsigned long long)s_fpField[9].load());
+}
+
+void PrintSpec(u64 vsyncs)
+{
+	const double n = static_cast<double>(std::max<u64>(1, s_sp[0].load()));
+	const double h1 = static_cast<double>(std::max<u64>(1, s_sp[3].load()));
+	const double h2 = static_cast<double>(std::max<u64>(1, s_sp[5].load()));
+	std::fprintf(stderr,
+		"[ge1] s4c spec: packets=%llu vsyncs=%llu hit_prev_ctx=%.4f%% hit_prev_any=%.4f%% hit_vs1=%.4f%% (of %llu) "
+		"hit_vs2=%.4f%% (of %llu) hit_vs1_no_uv=%.4f%% changes_ctx=%llu\n",
+		(unsigned long long)s_sp[0].load(), (unsigned long long)vsyncs, 100.0 * s_sp[1].load() / n, 100.0 * s_sp[2].load() / n,
+		100.0 * s_sp[4].load() / h1, (unsigned long long)s_sp[3].load(), 100.0 * s_sp[6].load() / h2,
+		(unsigned long long)s_sp[5].load(), 100.0 * s_sp[7].load() / h1, (unsigned long long)s_sp[8].load());
+}
 } // namespace
+
+void GSState::StaticCullStateLive(GSStaticCullState& cs)
+{
+	std::memset(&cs, 0, sizeof(cs));
+	cs.grid = m_cull_grid;
+	cs.bounds = (m_cull_grid.shift == 4) ? m_cull_bounds_band : m_cull_bounds_raw;
+	cs.xyof_x = m_xyof.I32[0];
+	cs.xyof_y = m_xyof.I32[1];
+	cs.uv = m_v.UV;
+	cs.prim = PRIM->U32[0] & 0x398u; // IIP, TME, AA1, FST, CTXT
+	cs.clamp = static_cast<s32>(GetDepthClampMode());
+	cs.shift0 = (GKV1Shift0Kernel() && m_cull_grid.shift == 0) ? 1 : 0;
+	cs.kernel_ok = KickKernelApplies<GS_TRIANGLESTRIP>() ? 1 : 0;
+	cs.scissor_invalid = m_scissor_invalid ? 1 : 0;
+}
+
+// 0 = the kick's outcome is GSStatic::Prepare's; else the reason it is not.
+template <u32 prim>
+int GSState::StaticFastOk(u32 count)
+{
+	if (m_fpGIFCompactHandler[prim] != &GSState::GIFCompactHandlerSTQRGBAXYZF2<prim, false>)
+		return 1; // auto flush: HandleAutoFlush per vertex
+	if (!KickKernelApplies<prim>())
+		return 2; // AA1 expansion or the shift-0 legacy cull
+	if (m_scissor_invalid)
+		return 3; // the kick skips everything through the legacy path
+	if (m_recent_buffer_switch && GSConfig.UserHacks_DrawBuffering)
+		return 4; // CheckOverlapVertsSlow may flush mid-packet
+	constexpr u32 max_vertices = MaxVerticesForPrim(prim);
+	if (max_vertices != 0 && m_vertex->tail + count >= max_vertices)
+		return 5; // a VERTEXCOUNT flush inside the packet
+	if (m_cull_grid.shift == 0)
+		return 6; // shift-0: count < kMinKernelVertices takes the full CullTest
+	return 0;
+}
+
+template <u32 prim>
+void GSState::StaticApply(const Ge1CompactVertex* RESTRICT d, const GSStaticPrep& p, const GSStaticCullState& cs)
+{
+	GSVertexBuff* RESTRICT vb = m_vertex;
+	const u32 base = vb->tail; // == head == next after ApplyPRIM
+	const u32 itail0 = m_index->tail;
+	const u32 count = p.count;
+
+	// VertexKickDirect's draw snapshot: the first filled window of an empty draw
+	// (whether or not its prim is then culled).
+	if (itail0 == 0 && count >= 3)
+	{
+		const int ctx = m_env.PRIM.CTXT;
+		std::memcpy(&m_prev_env, &m_env, 88);
+		std::memcpy(&m_prev_env.CTXT[ctx], &m_env.CTXT[ctx], 96);
+		std::memcpy(&m_prev_env.CTXT[ctx].offset, &m_env.CTXT[ctx].offset, sizeof(m_env.CTXT[ctx].offset));
+		std::memcpy(&m_prev_env.CTXT[ctx].scissor, &m_env.CTXT[ctx].scissor, sizeof(m_env.CTXT[ctx].scissor));
+		m_dirty_gs_regs = 0;
+		m_backed_up_ctx = m_env.PRIM.CTXT;
+		SetDrawBufferEnv();
+	}
+
+	while ((base + count + 3) > vb->maxcount)
+		GrowVertexBuffer();
+
+	const bool clamp = static_cast<GSLimit24BitDepth>(cs.clamp) != GSLimit24BitDepth::Disabled;
+	GSVector4i keep = GSVector4i::xffffffff(), shifted = GSVector4i::zero();
+	if (clamp)
+		GSVertexKickKernel::MakeDepthClampMasks(static_cast<GSLimit24BitDepth>(cs.clamp), keep, shifted);
+
+	GSVertex* RESTRICT vbuff = vb->buff + base;
+	GSVector4i m0, m1;
+	for (u32 s = 0; s < p.tail; s++)
+	{
+		GSStatic::Parse(d + p.src[s], cs.uv, clamp, keep, shifted, m0, m1);
+		GSVector4i* RESTRICT dst = reinterpret_cast<GSVector4i*>(vbuff + s);
+		dst[0] = m0;
+		dst[1] = m1;
+	}
+	// The kick leaves the last parsed vertex in m_v.
+	GSStatic::Parse(d + count - 1, cs.uv, clamp, keep, shifted, m0, m1);
+	m_v.m[0] = m0;
+	m_v.m[1] = m1;
+
+	const u32 nidx = 3 * p.ntri;
+	u16* RESTRICT ib = m_index->buff + itail0;
+	for (u32 k = 0; k < nidx; k++)
+		ib[k] = static_cast<u16>(base + p.slot[k]);
+	m_index->tail = itail0 + nidx;
+
+	vb->head = base + p.head;
+	vb->tail = base + p.tail;
+	vb->next = p.ntri ? base + p.nslot : base;
+
+	const u32 xyt = vb->xy_tail;
+	for (u32 j = 0; j < p.nring; j++)
+	{
+		const u32 slot = (xyt + count - p.nring + j) & 3;
+		vb->xy[slot] = GSVertexKickKernel::BroadcastXY(p.ring_xyp[j]);
+		vb->kick_ring[slot].xyp = p.ring_xyp[j];
+		vb->kick_ring[slot].meta = p.ring_meta[j];
+	}
+	vb->xy_tail = xyt + count;
+
+	if (p.ntri)
+	{
+#ifdef ARCH_ARM64
+		const bool tme = GSStatic::PrimTME(cs.prim), fst = GSStatic::PrimFST(cs.prim);
+		if (itail0 == 0)
+		{
+			vb->fmm_acc = p.acc;
+			vb->fmm_valid = true;
+		}
+		else if (vb->fmm_valid)
+			FmmMerge(vb->fmm_acc, p.acc, tme, fst);
+		if (vb->fmm_valid)
+			vb->fmm_watermark = base + p.nslot;
+		else if (p.wm_min != ~0u)
+			vb->fmm_watermark = std::min(vb->fmm_watermark, base + p.wm_min);
+#endif
+		temp_draw_rect = ((itail0 == 0) ? p.rect : temp_draw_rect.runion(p.rect)).rintersect(m_context->scissor.in);
+		if (m_track_native_draw_rect)
+			temp_native_draw_rect =
+				((itail0 == 0) ? p.nrect : temp_native_draw_rect.runion(p.nrect)).rintersect(m_context->scissor.in);
+	}
+}
+
+struct GSState::StaticShadow
+{
+	GSVertexBuff vb;
+	u32 itail;
+	GSVector4i rect, nrect;
+	GSVertex v;
+	float q;
+	u32 dirty;
+	int backed_ctx;
+	u64 sn;
+	const void* vbp;
+	const void* ibp;
+	GSDrawingEnvironment prev_env;
+	GSDrawBufferEnv envbuf;
+	int buf_idx;
+	u32 base, nvert;
+	GSVertex verts[kStaticMaxVerts + 4];
+	u16 idx[3 * kStaticMaxVerts];
+};
+
+void GSState::StaticShadowCapture(StaticShadow& s, u32 base, u32 itail0)
+{
+	s.vb = *m_vertex;
+	s.itail = m_index->tail;
+	s.rect = temp_draw_rect;
+	s.nrect = temp_native_draw_rect;
+	s.v = m_v;
+	s.q = m_q;
+	s.dirty = m_dirty_gs_regs;
+	s.backed_ctx = m_backed_up_ctx;
+	s.sn = s_n;
+	s.vbp = m_vertex;
+	s.ibp = m_index;
+	std::memcpy(&s.prev_env, &m_prev_env, sizeof(s.prev_env));
+	s.buf_idx = m_current_buffer_idx;
+	std::memcpy(&s.envbuf, &m_env_buffers[m_current_buffer_idx], sizeof(s.envbuf));
+	s.base = base;
+	s.nvert = 0;
+	if (m_vertex->tail > base)
+	{
+		s.nvert = std::min<u32>(m_vertex->tail - base, kStaticMaxVerts + 4);
+		std::memcpy(s.verts, m_vertex->buff + base, sizeof(GSVertex) * s.nvert);
+	}
+	if (m_index->tail > itail0)
+		std::memcpy(s.idx, m_index->buff + itail0, sizeof(u16) * std::min<u32>(m_index->tail - itail0, 3 * kStaticMaxVerts));
+}
+
+void GSState::StaticShadowRestore(const StaticShadow& s)
+{
+	GSVertex* const buff = m_vertex->buff;
+	GSVertex* const buff_copy = m_vertex->buff_copy;
+	const u32 maxcount = m_vertex->maxcount;
+	*m_vertex = s.vb;
+	m_vertex->buff = buff; // a growth inside the kick keeps its arrays
+	m_vertex->buff_copy = buff_copy;
+	m_vertex->maxcount = maxcount;
+	m_index->tail = s.itail;
+	temp_draw_rect = s.rect;
+	temp_native_draw_rect = s.nrect;
+	m_v = s.v;
+	m_q = s.q;
+	m_dirty_gs_regs = s.dirty;
+	m_backed_up_ctx = s.backed_ctx;
+	std::memcpy(&m_prev_env, &s.prev_env, sizeof(s.prev_env));
+	std::memcpy(&m_env_buffers[s.buf_idx], &s.envbuf, sizeof(s.envbuf));
+}
+
+void GSState::StaticSpecNote(const GSStaticCullState& cs)
+{
+	StaticSpec& sp = m_static_spec;
+	const int ctx = (cs.prim >> 9) & 1;
+	s_sp[0].fetch_add(1, std::memory_order_relaxed);
+	if (sp.hp[ctx])
+	{
+		if (SpecEq(cs, sp.prev[ctx], true))
+			s_sp[1].fetch_add(1, std::memory_order_relaxed);
+		else
+			s_sp[8].fetch_add(1, std::memory_order_relaxed);
+	}
+	if (sp.hpa && SpecEq(cs, sp.prev_any, true))
+		s_sp[2].fetch_add(1, std::memory_order_relaxed);
+	if (sp.h1[ctx])
+	{
+		s_sp[3].fetch_add(1, std::memory_order_relaxed);
+		if (SpecEq(cs, sp.vs1[ctx], true))
+			s_sp[4].fetch_add(1, std::memory_order_relaxed);
+		if (SpecEq(cs, sp.vs1[ctx], false))
+			s_sp[7].fetch_add(1, std::memory_order_relaxed);
+	}
+	if (sp.h2[ctx])
+	{
+		s_sp[5].fetch_add(1, std::memory_order_relaxed);
+		if (SpecEq(cs, sp.vs2[ctx], true))
+			s_sp[6].fetch_add(1, std::memory_order_relaxed);
+	}
+	sp.prev[ctx] = cs;
+	sp.hp[ctx] = true;
+	sp.prev_any = cs;
+	sp.hpa = true;
+}
+
+void GSState::StaticSpecVsync()
+{
+	static const bool spec = EnvInt("GE1_RESIDENT_SPEC") == 1;
+	static const bool fast = EnvInt("GE1_STATIC_FAST") == 1 || EnvInt("GE1_RESIDENT_CHECK") == 2;
+	if (!spec && !fast)
+		return;
+	StaticSpec& sp = m_static_spec;
+	for (int c = 0; c < 2; c++)
+	{
+		sp.vs2[c] = sp.vs1[c];
+		sp.h2[c] = sp.h1[c];
+		sp.vs1[c] = sp.prev[c];
+		sp.h1[c] = sp.hp[c];
+	}
+	sp.vsyncs++;
+	if ((sp.vsyncs % 240u) == 0)
+	{
+		if (spec)
+			PrintSpec(sp.vsyncs);
+		if (fast)
+			PrintFast();
+	}
+}
+
+bool GSState::StaticPacket(const Ge1CompactVertex* d, u32 count)
+{
+	static const bool fast_on = EnvInt("GE1_STATIC_FAST") == 1;
+	static const bool shadow = EnvInt("GE1_RESIDENT_CHECK") == 2;
+	static const bool spec = EnvInt("GE1_RESIDENT_SPEC") == 1;
+	if (!fast_on && !shadow && !spec)
+		return false;
+	s_fp[0].fetch_add(1, std::memory_order_relaxed);
+	const u32 prim = PRIM->PRIM;
+	if ((prim != GS_TRIANGLESTRIP && prim != GS_TRIANGLELIST) || count > kStaticMaxVerts)
+	{
+		s_fp[3].fetch_add(1, std::memory_order_relaxed);
+		return false;
+	}
+	// The handler's first act; idempotent (S4b P1), so the kick below, if it
+	// runs, sees the same state.
+	CheckFlushes();
+	alignas(16) GSStaticCullState cs;
+	StaticCullStateLive(cs);
+	if (spec)
+		StaticSpecNote(cs);
+	if (!fast_on && !shadow)
+		return false;
+	const int why = (prim == GS_TRIANGLESTRIP) ? StaticFastOk<GS_TRIANGLESTRIP>(count) : StaticFastOk<GS_TRIANGLELIST>(count);
+	if (why != 0)
+	{
+		s_fp[3 + why].fetch_add(1, std::memory_order_relaxed);
+		return false;
+	}
+	alignas(16) GSStaticPrep prep;
+	if (prim == GS_TRIANGLESTRIP)
+		GSStatic::Prepare<GS_TRIANGLESTRIP>(d, count, cs, prep);
+	else
+		GSStatic::Prepare<GS_TRIANGLELIST>(d, count, cs, prep);
+
+	const u32 base = m_vertex->tail;
+	const u32 itail0 = m_index->tail;
+	static StaticShadow s_pre, s_kick, s_apply; // GsWorker only
+	if (shadow)
+	{
+		StaticShadowCapture(s_pre, base, itail0);
+		(this->*m_fpGIFCompactHandler[prim])(d, count);
+		if (s_n != s_pre.sn || static_cast<const void*>(m_vertex) != s_pre.vbp || static_cast<const void*>(m_index) != s_pre.ibp ||
+			m_index->tail < itail0)
+		{
+			s_fp[12].fetch_add(1, std::memory_order_relaxed);
+			return true; // the kick's outcome stands (it already set m_q)
+		}
+		StaticShadowCapture(s_kick, base, itail0);
+		StaticShadowRestore(s_pre);
+	}
+	if (prim == GS_TRIANGLESTRIP)
+		StaticApply<GS_TRIANGLESTRIP>(d, prep, cs);
+	else
+		StaticApply<GS_TRIANGLELIST>(d, prep, cs);
+	std::memcpy(&m_q, &d[count - 1].Q, sizeof(m_q)); // the handler's last act
+	s_fp[1].fetch_add(1, std::memory_order_relaxed);
+	s_fp[2].fetch_add(count, std::memory_order_relaxed);
+	if (shadow)
+	{
+		StaticShadowCapture(s_apply, base, itail0);
+		const StaticShadow& k = s_kick;
+		const StaticShadow& a = s_apply;
+		int bad = -1;
+		if (k.itail != a.itail)
+			bad = 0;
+		else if (std::memcmp(k.idx, a.idx, sizeof(u16) * (k.itail - itail0)))
+			bad = 1;
+		else if (k.vb.head != a.vb.head || k.vb.tail != a.vb.tail || k.vb.next != a.vb.next || k.vb.xy_tail != a.vb.xy_tail)
+			bad = 3;
+		else if (k.nvert != a.nvert || std::memcmp(k.verts, a.verts, sizeof(GSVertex) * k.nvert))
+			bad = 2;
+		else if (std::memcmp(k.vb.xy, a.vb.xy, sizeof(k.vb.xy)) || std::memcmp(k.vb.kick_ring, a.vb.kick_ring, sizeof(k.vb.kick_ring)))
+			bad = 4;
+		else if (k.vb.fmm_valid != a.vb.fmm_valid || (k.vb.fmm_valid && std::memcmp(&k.vb.fmm_acc, &a.vb.fmm_acc, sizeof(k.vb.fmm_acc))))
+			bad = 5;
+		else if (k.vb.fmm_watermark != a.vb.fmm_watermark)
+			bad = 6;
+		else if (!k.rect.eq(a.rect) || (m_track_native_draw_rect && !k.nrect.eq(a.nrect)))
+			bad = 7;
+		else if (std::memcmp(&k.v, &a.v, sizeof(GSVertex)) || std::memcmp(&k.q, &a.q, sizeof(float)))
+			bad = 8;
+		else if (k.dirty != a.dirty || k.backed_ctx != a.backed_ctx || std::memcmp(&k.prev_env, &a.prev_env, sizeof(k.prev_env)) ||
+				 std::memcmp(&k.envbuf, &a.envbuf, sizeof(k.envbuf)))
+			bad = 9;
+		s_fp[10].fetch_add(1, std::memory_order_relaxed);
+		if (bad >= 0)
+		{
+			s_fp[11].fetch_add(1, std::memory_order_relaxed);
+			s_fpField[bad].fetch_add(1, std::memory_order_relaxed);
+			if (s_fpDumps.fetch_sub(1, std::memory_order_relaxed) > 0)
+				std::fprintf(stderr,
+					"[ge1] s4c shadow mismatch field=%d prim=%u count=%u ntri=%u base=%u itail0=%u kick(h/t/n=%u/%u/%u itail=%u wm=%u v=%d) "
+					"apply(h/t/n=%u/%u/%u itail=%u wm=%u v=%d)\n",
+					bad, prim, count, prep.ntri, base, itail0, k.vb.head, k.vb.tail, k.vb.next, k.itail, k.vb.fmm_watermark,
+					k.vb.fmm_valid ? 1 : 0, a.vb.head, a.vb.tail, a.vb.next, a.itail, a.vb.fmm_watermark, a.vb.fmm_valid ? 1 : 0);
+		}
+	}
+	return true;
+}
 
 void GSState::StaticCheckPacket(const Ge1CompactVertex* d, u32 count)
 {
 	StaticCheckSnap& s = m_static_check;
 	s.armed = false;
 	s.prim = PRIM->PRIM;
-	if ((s.prim != GS_TRIANGLESTRIP && s.prim != GS_TRIANGLELIST) || count > 64)
+	if ((s.prim != GS_TRIANGLESTRIP && s.prim != GS_TRIANGLELIST) || count > kStaticMaxVerts)
 	{
 		s_sc[4].fetch_add(1, std::memory_order_relaxed);
 		return;
@@ -6179,10 +6469,12 @@ void GSState::StaticCheckPacket(const Ge1CompactVertex* d, u32 count)
 	s.fmm_valid0 = m_vertex->fmm_valid;
 	s.rect0 = temp_draw_rect;
 	s.nrect0 = temp_native_draw_rect;
+	alignas(16) GSStaticCullState cs;
+	StaticCullStateLive(cs);
 	if (s.prim == GS_TRIANGLESTRIP)
-		StaticPrepare<GS_TRIANGLESTRIP>(d, count, s.prep);
+		GSStatic::Prepare<GS_TRIANGLESTRIP>(d, count, cs, s.prep);
 	else
-		StaticPrepare<GS_TRIANGLELIST>(d, count, s.prep);
+		GSStatic::Prepare<GS_TRIANGLELIST>(d, count, cs, s.prep);
 	s.armed = true;
 }
 
@@ -6197,7 +6489,7 @@ void GSState::StaticCheckAfter(const Ge1CompactVertex* d, u32 count)
 		s_sc[3].fetch_add(1, std::memory_order_relaxed);
 		return;
 	}
-	const StaticPrep& p = s.prep;
+	const GSStaticPrep& p = s.prep;
 	const bool tme = PRIM->TME, fst = PRIM->FST;
 	int bad = -1;
 	const u32 got = (m_index->tail - s.itail0) / 3u;
@@ -6217,7 +6509,7 @@ void GSState::StaticCheckAfter(const Ge1CompactVertex* d, u32 count)
 			break;
 		}
 		GSVector4i m0, m1;
-		GSVertexKernels::ParseCompactXYZF2(d + p.slotSrc[p.slot[k]], uv, m0, m1);
+		GSVertexKernels::ParseCompactXYZF2(d + p.src[p.slot[k]], uv, m0, m1);
 		if (depth_clamp != GSLimit24BitDepth::Disabled)
 			m1 = (m1 & keep) | (m1.srl32<8>() & shifted);
 		if (std::memcmp(&m_vertex->buff[idx].m[0], &m0, 16) || std::memcmp(&m_vertex->buff[idx].m[1], &m1, 16))
@@ -6331,6 +6623,11 @@ bool GSState::TransferCompact(const u8* bytes, u32 size)
 		}();
 		if (s_compact_packet_hook)
 			s_compact_packet_hook(i, m_v.UV, static_cast<int>(GetDepthClampMode()));
+		if (StaticPacket(packets[i].verts, packets[i].nloop))
+		{
+			path.nloop = 0;
+			continue;
+		}
 		if (s_static_check)
 			StaticCheckPacket(packets[i].verts, packets[i].nloop);
 		(this->*m_fpGIFCompactHandler[PRIM->PRIM])(packets[i].verts, packets[i].nloop);
