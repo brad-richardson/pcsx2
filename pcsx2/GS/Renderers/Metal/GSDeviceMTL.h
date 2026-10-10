@@ -313,7 +313,9 @@ public:
 		return m_convert_pipeline[ShaderConvertSelector(shader).Index()];
 	}
 
-	MRCOwned<id<MTLFunction>> m_hw_vs[6 << 3];
+	// TPF1: indexed by VSSelector key with tme/edge-clamp zero (max 125). The
+	// fused key (expand Fuse3) lands at 96+; expand 7 stays nil (never emitted).
+	MRCOwned<id<MTLFunction>> m_hw_vs[8 << 4];
 	std::unordered_map<PSSelector, MRCOwned<id<MTLFunction>>> m_hw_ps;
 	std::unordered_map<PipelineSelectorMTL, MRCOwned<id<MTLRenderPipelineState>>> m_hw_pipeline;
 	// ISH1: async Metal TFX prewarm (GE1_TFX_PREWARM). The prewarm thread builds
@@ -365,10 +367,12 @@ public:
 			bool pipeline_sel : 1;
 			bool sampler      : 1;
 			bool rt1_depth    : 1;
+			bool fuse_sampler : 1;
 		} has = {};
 		DepthStencilSelector depth_sel = DepthStencilSelector::NoDepth();
 		// Clear line (Things below here are tracked by `has` and don't need to be cleared to reset)
 		SamplerSelector sampler_sel;
+		SamplerSelector fuse_sampler_sel;
 		u8 blend_color;
 		struct { u32 w, h; } full_rov_size;
 		GSVector4i scissor;
@@ -545,6 +549,7 @@ public:
 	void MRESetDSS(DepthStencilSelector sel);
 	void MRESetDSS(id<MTLDepthStencilState> dss);
 	void MRESetSampler(SamplerSelector sel);
+	void MRESetFuseSampler(SamplerSelector sel); // TPF1: sampler index 1.
 	void MRESetTexture(GSTexture* tex, int pos);
 	void MRESetTexture(id<MTLTexture> tex, int pos);
 	void MRESetVertices(id<MTLBuffer> buffer, size_t offset);

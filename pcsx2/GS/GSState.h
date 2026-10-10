@@ -864,6 +864,9 @@ public:
 	bool TestDrawChanged();
 	void FlushWrite();
 	virtual void Draw() = 0;
+	// TPF1: executes a fused (T1,T3,T2) triple (payload in m_fuse_offpath).
+	// Default runs the plain draw (SW never arms fusion).
+	virtual void FuseDraw();
 	virtual void PurgeTextureCache(bool sources, bool targets, bool hash_cache);
 	virtual void ReadbackTextureCache();
 	virtual void InvalidateVideoMem(const GIFRegBITBLTBUF& BITBLTBUF, const GSVector4i& r) {}
@@ -876,6 +879,10 @@ public:
 	/// True when a local-to-local move can be taken by a GameDB move hook, which leaves TRXDIR at
 	/// 2 where the ordinary move sets it to 3.
 	virtual bool HasMoveHook() const { return false; }
+
+	/// TPF1: true when this renderer can execute fused terrain draws (HW
+	/// renderers on a backend with the PS_FUSE3/VSExpand::Fuse3 shaders).
+	virtual bool SupportsTerrainFuse() const { return false; }
 
 	virtual void Move();
 
@@ -891,6 +898,24 @@ public:
 	void ExecDrawRecord(const GSBackQueue::DrawRecord& rec);
 	GSBackQueue::DrawPrivRegs CaptureDrawPrivRegs();
 	void DrawRecordTail(u64 draw_serial);
+
+	// TPF1: terrain pass-fusion hold. FlushPrim withholds a T1 draw (and then a
+	// T1+T3 pair) while the next flushes arrive with byte-identical XYZ and the
+	// T3/T2 states; a completed triple emits one fused draw, and any pattern
+	// break emits the held draws unchanged first. Held draws always execute in
+	// original order before any later record: every non-draw seam flushes them.
+	bool TerrainFuseArmed() const;
+	void FlushHeldTerrainDraws();
+	// Considers the live draw at FlushPrim time. Returns true when the draw was
+	// stashed or fused (caller skips the normal emit and runs the buffer reset).
+	bool ConsiderTerrainFuse(const GSBackQueue::DrawPrivRegs& priv);
+	// Normal-emit path of FlushPrim, extracted so held/fused draws re-emit it.
+	void EmitDrawInternal(const GSBackQueue::DrawPrivRegs& priv);
+	void StashHeldTerrainDraw(
+		GSBackQueue::DrawNode::FusePassState& st, const GSBackQueue::DrawPrivRegs& priv);
+	void InstallHeldTerrainDraw(const GSBackQueue::DrawNode::FusePassState& st);
+	// Applies the tail's texel-rounding decisions to a stashed pass (same code).
+	void ApplyTexelRoundingToStash(GSBackQueue::DrawNode::FusePassState& st);
 	void SubmitPcrtcSync();
 	void ExecPcrtcSyncRecord(const GSBackQueue::PcrtcSyncRecord& rec);
 
@@ -933,6 +958,16 @@ public:
 	GSBackQueue::DrawNode* AcquireDrawNode();
 	void ReleaseDrawNode(GSBackQueue::DrawNode* node);
 
+	// TPF1: held terrain draws (front-side, at most a T1+T3 pair). Owned copies;
+	// vectors grow to the largest triple and are reused. m_fuse_* carries the
+	// active fused draw's T3/T2 passes on the record-off path (on the record
+	// path they ride in the node's fuse payload).
+	GSBackQueue::DrawNode::FusePassState m_held_terrain[2];
+	u32 m_held_terrain_count = 0;
+	GSBackQueue::DrawNode::FusePayload m_fuse_offpath;
+	// Fused-draw scratch (back-side): assembled 48-byte vertices + per-source UVs.
+	std::vector<u8> m_fuse_vert_scratch;
+
 	// GV7-1c: transfer payload pool (record modes only; mode 0 keeps
 	// GSTransferBuffer's own allocation untouched). m_tr.buff aliases the
 	// current node's 4MB buffer; RotateTransferPayload runs at transfer Init and
@@ -966,6 +1001,10 @@ public:
 	template <typename T>
 	void PushRecord(GSBackQueue::RecordType type, const T& rec)
 	{
+		// TPF1: a non-draw record executes after every older draw, so held
+		// terrain draws emit first (no-op when nothing is held).
+		if (type != GSBackQueue::RecordType::Draw)
+			FlushHeldTerrainDraws();
 		// One producer: the ring is single-producer, and the MTGS thread is the only one allowed.
 		pxAssert(std::this_thread::get_id() == m_chan->drain_thread);
 		for (;;)

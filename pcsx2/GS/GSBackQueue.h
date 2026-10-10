@@ -122,6 +122,35 @@ namespace GSBackQueue
 	{
 		VertexBuff vb;
 		IndexBuff ib;
+		// TPF1: terrain-fusion payload. When active, this node's draw is the T1
+		// of a fused (T1,T3,T2) triple and passes[0..1] carry the T3/T2 draws'
+		// full front state (owned copies; vectors grow to the largest triple
+		// and are reused). The back either consumes them into one fused draw or
+		// re-executes all three draws normally on any verify failure.
+		struct FusePassState
+		{
+			GSDrawingEnvironment draw_env = {};
+			GSDrawingEnvironment next_env = {};
+			GSVertex next_v = {};
+			GSVector4i draw_rect = GSVector4i::zero();
+			GSVector4i native_draw_rect = GSVector4i::zero();
+			std::vector<GSVertex> verts;
+			std::vector<u16> indices;
+			u32 vhead = 0, vtail = 0, vnext = 0, itail = 0;
+			u64 draw_serial = 0;
+			int backed_up_ctx = -1;
+			u32 dirty_gs_regs = 0;
+			int flush_reason = 0;
+			bool channel_shuffle_finish = false;
+			bool packed_uv_hack_flag = false;
+			DrawPrivRegs priv = {};
+		};
+		struct FusePayload
+		{
+			bool active = false;
+			FusePassState passes[2];
+		};
+		FusePayload fuse;
 	};
 
 	// GV7-1c: pooled transfer staging buffer (4MB, the GSTransferBuffer size).

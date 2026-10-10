@@ -3545,7 +3545,7 @@ void GSRendererHW::Draw()
 		draw_label.active = true;
 	}
 
-	if (GSDrawLog::IsActive()) [[unlikely]]
+	if (GSDrawLog::IsActive() && !m_fuse_verify_active) [[unlikely]]
 		RecordDrawLogEntry();
 
 	GL_PUSH("HW: Draw %lld (Context %u)", s_n, PRIM->CTXT);
@@ -5752,7 +5752,27 @@ void GSRendererHW::Draw()
 	const GSVector4i real_rect = m_r;
 
 	if (!skip_draw)
+	{
+		// TPF1: the first verify pass captures the triple's targets plus the two
+		// cache fields a verify can move non-idempotently (restored on abort).
+		if (m_fuse_verify_active && !m_fuse_targets_captured)
+		{
+			m_fuse_targets_captured = true;
+			m_fuse_cap_rt = rt;
+			m_fuse_cap_ds = ds;
+			if (rt)
+			{
+				m_fuse_cap_rt_scaled = rt->m_rt_alpha_scale;
+				m_fuse_cap_rt_last_draw = rt->m_last_draw;
+			}
+			if (ds)
+			{
+				m_fuse_cap_ds_scaled = ds->m_rt_alpha_scale;
+				m_fuse_cap_ds_last_draw = ds->m_last_draw;
+			}
+		}
 		DrawPrims(rt, ds, src, tmm);
+	}
 
 
 	// Temporary source *must* be invalidated before normal, because otherwise it'll be double freed.
@@ -11483,7 +11503,20 @@ __ri void GSRendererHW::DrawPrims(GSTextureCache::Target* rt, GSTextureCache::Ta
 		}
 	}
 
+	// TPF1: a verify pass suppresses the submit but still decides the road (pure,
+	// and the snapshot asserts it) and closes any DS-as-RT the pass opened, so no
+	// device state leaks into the next verify. No draw-log row is opened (BeginDraw
+	// is gated in Draw()) or closed here; the fused draw opens and closes one row
+	// outside the verifies. The dump block above already ran with this pass's own
+	// serial, exactly as stock.
 	m_conf.road = DecideDrawRoad(m_conf, g_gs_device->Features());
+	if (m_fuse_verify_active)
+	{
+		m_fuse_verify_reached_submit = true;
+		if (g_gs_device->IsDSInRTActive())
+			g_gs_device->EndDSAsRT();
+		return;
+	}
 
 	// Completes the row opened at the top of Draw() with the backend view, which only
 	// exists here.
@@ -13057,4 +13090,803 @@ bool GSRendererHW::IsCoverageAlphaSupported()
 	// rides the rectangle's own vertex alpha (AA1LineCoverageFromPixelRuns).
 	return IsCoverageAlpha() && IsRTWritten() &&
 		   (g_gs_device->Features().aa1 || AA1LineCoverageFromPixelRuns());
+}
+
+// =====================================================================
+// TPF1 terrain pass-fusion (GE1_TERRAIN_FUSE=1).
+//
+// A terrain triple (T1 base / T3 shadow / T2 light: same XYZ/RGBAQ/indices,
+// same everything-but-per-pass-template) draws as one fused draw whose pixel
+// shader chains the three stock blends in-shader:
+//
+//   c1 = Cs1                        (T1 (FIX-FIX)*FIX+Cs, REPLACE)
+//   c2 = rnd(c1*As3 - Cs3*As3)       (T3 (Cd-Cs)*As+0, REV_SUBTRACT, emulated round)
+//   c3 = Cs2*Cs1.a + c2              (T2 (Cs-FIX)*Ad+Cd, ADD, Ad = unwritten alpha)
+//
+// T1's REPLACE erases framebuffer dependence, so the chain needs no RT reads;
+// the emulated T3 round (RNE, per backend) is the only device-sensitive step
+// and the replay/det gates prove it. Every template surprise aborts to a
+// serial replay that is stock DrawRecordTail per pass.
+// =====================================================================
+
+namespace
+{
+
+enum class FuseAbort : u8
+{
+	None = 0,
+	EqZ, // B1: a pass would ST-round (tail mutation the stash predates)
+	EqSTQ, // B2: SetupIA would ST/Q-divide (Draw-time vertex mutation)
+	NoSubmit, // B3: a verify pass skipped before submit (chain broken)
+	TargetChange, // B5: rt/ds/texture pointers moved mid-triple
+	BlendPattern, // B6: a pass's blend_* left its template primary
+	MultiPass, // B6: multi-pass blend (different op order, unreplicable)
+	BlendConst, // B6: blend constant armed (Ad→Af-style rewrite)
+	RTA, // B6: RT alpha scaling visible (correction bits set)
+	FbmaskRoad, // B6: fbmask/quantize/substitute road (needs post-T1 RT reads)
+	SecondPass, // B6: alpha-test second pass armed
+	ROVBarrierRoad, // B6: ROV/barrier/road/hazard/offset/raster (self-reads)
+	TexIsFBHLE, // B6: tex-is-fb or HLE bits (RT-reading blends, skip paths)
+	StencilChannel, // B6: stencil-counter/channel-fetch/shuffle/depth-fmt
+	FixedFunction, // B6: fog/iip/fst/tfx/tcc/dither/scanmsk/colclip/point/region/grid/edge/nocolor/aa1/pabe/lodsingle
+	TempZShuffle, // B6: temp-Z, channel shuffle or texture shuffle active
+	PalSampler, // B6: palette presence or T3/T2 sampler mismatch
+	SharedMismatch, // B6: shared state (selectors/constants/depth/scissor/...) diverged
+	Count
+};
+
+static constexpr const char* FuseAbortName(FuseAbort r)
+{
+	switch (r)
+	{
+		case FuseAbort::None: return "none";
+		case FuseAbort::EqZ: return "eqz";
+		case FuseAbort::EqSTQ: return "eqstq";
+		case FuseAbort::NoSubmit: return "nosubmit";
+		case FuseAbort::TargetChange: return "targetchange";
+		case FuseAbort::BlendPattern: return "blendpattern";
+		case FuseAbort::MultiPass: return "multipass";
+		case FuseAbort::BlendConst: return "blendconst";
+		case FuseAbort::RTA: return "rta";
+		case FuseAbort::FbmaskRoad: return "fbmaskroad";
+		case FuseAbort::SecondPass: return "secondpass";
+		case FuseAbort::ROVBarrierRoad: return "rovbarrierroad";
+		case FuseAbort::TexIsFBHLE: return "texisfbhle";
+		case FuseAbort::StencilChannel: return "stencilchannel";
+		case FuseAbort::FixedFunction: return "fixedfunction";
+		case FuseAbort::TempZShuffle: return "tempzshuffle";
+		case FuseAbort::PalSampler: return "palsampler";
+		case FuseAbort::SharedMismatch: return "sharedmismatch";
+		default: return "?";
+	}
+}
+
+struct FuseStats
+{
+	u64 fused = 0;
+	u64 aborted = 0;
+	u64 calls = 0;
+	u64 reason[static_cast<size_t>(FuseAbort::Count)] = {};
+	bool announced[static_cast<size_t>(FuseAbort::Count)] = {};
+	bool enabled = false;
+	bool enabled_init = false;
+};
+
+static FuseStats s_fuse_stats;
+
+static bool FuseStatsEnabled()
+{
+	if (!s_fuse_stats.enabled_init)
+	{
+		s_fuse_stats.enabled_init = true;
+		const char* e = std::getenv("GE1_TERRAIN_FUSE_STATS");
+		s_fuse_stats.enabled = e && e[0] == '1';
+	}
+	return s_fuse_stats.enabled;
+}
+
+static void FuseCountAbort(FuseAbort r)
+{
+	s_fuse_stats.aborted++;
+	s_fuse_stats.reason[static_cast<size_t>(r)]++;
+	if (FuseStatsEnabled() && !s_fuse_stats.announced[static_cast<size_t>(r)])
+	{
+		s_fuse_stats.announced[static_cast<size_t>(r)] = true;
+		std::fprintf(stderr, "TPF1: first abort reason=%s\n", FuseAbortName(r));
+	}
+}
+
+static void FuseCountFused()
+{
+	s_fuse_stats.fused++;
+	if (FuseStatsEnabled() && (++s_fuse_stats.calls % 36000) == 0)
+	{
+		std::fprintf(stderr, "TPF1: fused=%llu aborted=%llu (eqz=%llu eqstq=%llu nosubmit=%llu blend=%llu road=%llu shared=%llu other=%llu)\n",
+			(unsigned long long)s_fuse_stats.fused, (unsigned long long)s_fuse_stats.aborted,
+			(unsigned long long)s_fuse_stats.reason[static_cast<size_t>(FuseAbort::EqZ)],
+			(unsigned long long)s_fuse_stats.reason[static_cast<size_t>(FuseAbort::EqSTQ)],
+			(unsigned long long)s_fuse_stats.reason[static_cast<size_t>(FuseAbort::NoSubmit)],
+			(unsigned long long)(s_fuse_stats.reason[static_cast<size_t>(FuseAbort::BlendPattern)] +
+				s_fuse_stats.reason[static_cast<size_t>(FuseAbort::MultiPass)] +
+				s_fuse_stats.reason[static_cast<size_t>(FuseAbort::BlendConst)]),
+			(unsigned long long)(s_fuse_stats.reason[static_cast<size_t>(FuseAbort::FbmaskRoad)] +
+				s_fuse_stats.reason[static_cast<size_t>(FuseAbort::SecondPass)] +
+				s_fuse_stats.reason[static_cast<size_t>(FuseAbort::ROVBarrierRoad)]),
+			(unsigned long long)s_fuse_stats.reason[static_cast<size_t>(FuseAbort::SharedMismatch)],
+			(unsigned long long)(s_fuse_stats.aborted - s_fuse_stats.reason[static_cast<size_t>(FuseAbort::EqZ)] -
+				s_fuse_stats.reason[static_cast<size_t>(FuseAbort::EqSTQ)] -
+				s_fuse_stats.reason[static_cast<size_t>(FuseAbort::NoSubmit)] -
+				s_fuse_stats.reason[static_cast<size_t>(FuseAbort::BlendPattern)] -
+				s_fuse_stats.reason[static_cast<size_t>(FuseAbort::MultiPass)] -
+				s_fuse_stats.reason[static_cast<size_t>(FuseAbort::BlendConst)] -
+				s_fuse_stats.reason[static_cast<size_t>(FuseAbort::FbmaskRoad)] -
+				s_fuse_stats.reason[static_cast<size_t>(FuseAbort::SecondPass)] -
+				s_fuse_stats.reason[static_cast<size_t>(FuseAbort::ROVBarrierRoad)] -
+				s_fuse_stats.reason[static_cast<size_t>(FuseAbort::SharedMismatch)]));
+	}
+}
+
+// Canonicalize the per-pass-diverging PSSelector fields (runtime per-source in
+// the fused shader (FuseMode/FuseFlags) or blend-formula-immune) so the rest
+// can be compared for exact equality.
+static void FuseCanonicalizeDiverging(GSHWDrawConfig::PSSelector& ps)
+{
+	ps.wms = 0;
+	ps.wmt = 0;
+	ps.ltf = 0;
+	ps.blend_a = ps.blend_b = ps.blend_c = ps.blend_d = 0;
+	ps.blend_hw = 0;
+	ps.blend_mix = 0;
+	ps.no_color1 = 0;
+	ps.af_in_src1 = 0;
+	ps.blend_factor_in_alpha = 0;
+	ps.inv_src1_rewrite = 0;
+	ps.round_inv = 0;
+	ps.pal_fmt = 0;
+	ps.aem_fmt = 0;
+	ps.aem = 0;
+	ps.adjs = 0;
+	ps.adjt = 0;
+	ps.manual_lod = 0;
+	ps.automatic_lod = 0;
+	ps.sw_aniso = 0;
+	ps.replacement_alpha_snap = 0;
+}
+
+static bool FuseRoadIsClear(const GSDrawRoad& road)
+{
+	return !road.rt_loop && !road.depth_loop && !road.depth_read && !road.clone_rt && !road.carry_rt &&
+	       !road.carry_depth;
+}
+
+// Bitwise vector equality (NaN-safe: identical constants have identical bytes).
+template <typename T>
+static bool FuseVecEq(const T& a, const T& b)
+{
+	return std::memcmp(&a, &b, sizeof(T)) == 0;
+}
+
+// FuseFlags bitpack for one source (sources 1/2; source 0 uses the shared
+// selector): aem_fmt[0-1] pal_fmt[2-3] aem[4] adjs[5] adjt[6] sw_aniso[7-11]
+// repl_snap[12].
+static u32 FusePackFlags(const GSHWDrawConfig::PSSelector& ps)
+{
+	return (ps.aem_fmt & 3u) | ((ps.pal_fmt & 3u) << 2) | ((ps.aem & 1u) << 4) | ((ps.adjs & 1u) << 5) |
+	       ((ps.adjt & 1u) << 6) | ((ps.sw_aniso & 31u) << 7) | ((ps.replacement_alpha_snap & 1u) << 12);
+}
+
+static u32 FusePackBlend(const GSHWDrawConfig& c)
+{
+	const GSHWDrawConfig::PSSelector& ps = c.ps;
+	u32 v = (ps.blend_a & 3u) | ((ps.blend_b & 3u) << 2) | ((ps.blend_c & 3u) << 4) | ((ps.blend_d & 3u) << 6);
+	v |= (static_cast<u32>(ps.blend_hw) & 7u) << 8;
+	v |= (static_cast<u32>(ps.blend_mix) & 3u) << 11;
+	v |= (ps.no_color1 & 1u) << 13;
+	v |= (ps.af_in_src1 & 1u) << 14;
+	v |= (ps.blend_factor_in_alpha & 1u) << 15;
+	v |= (ps.inv_src1_rewrite & 1u) << 16;
+	v |= (ps.round_inv & 1u) << 17;
+	v |= (c.blend.enable ? 1u : 0u) << 18;
+	v |= (static_cast<u32>(c.blend.op) & 3u) << 19;
+	v |= (static_cast<u32>(c.blend.src) & 15u) << 21;
+	v |= (static_cast<u32>(c.blend.dst) & 15u) << 25;
+	return v;
+}
+
+} // namespace
+
+void GSRendererHW::FuseSaveLiveT1()
+{
+	m_fuse_saved_vb = *m_vertex;
+	m_fuse_saved_ib = *m_index;
+	std::memcpy(&m_fuse_saved_prev_env, &m_prev_env, sizeof(m_fuse_saved_prev_env));
+	std::memcpy(&m_fuse_saved_env, &m_env, sizeof(m_fuse_saved_env));
+	m_fuse_saved_v = m_v;
+	m_fuse_saved_draw_rect = temp_draw_rect;
+	m_fuse_saved_native_draw_rect = temp_native_draw_rect;
+	m_fuse_saved_serial = s_n;
+	m_fuse_saved_priv = m_draw_priv;
+	m_fuse_saved_backed_up_ctx = m_backed_up_ctx;
+	m_fuse_saved_dirty_regs = m_dirty_gs_regs;
+	m_fuse_saved_flush_reason = static_cast<int>(m_state_flush_reason);
+	m_fuse_saved_shuffle_finish = m_channel_shuffle_finish;
+	m_fuse_saved_uv_hack = m_isPackedUV_HackFlag;
+}
+
+void GSRendererHW::FuseRestoreLiveT1()
+{
+	*m_vertex = m_fuse_saved_vb;
+	*m_index = m_fuse_saved_ib;
+	std::memcpy(&m_prev_env, &m_fuse_saved_prev_env, sizeof(m_prev_env));
+	std::memcpy(&m_env, &m_fuse_saved_env, sizeof(m_env));
+	m_v = m_fuse_saved_v;
+	temp_draw_rect = m_fuse_saved_draw_rect;
+	temp_native_draw_rect = m_fuse_saved_native_draw_rect;
+	m_draw_env = &m_prev_env;
+	PRIM = &m_prev_env.PRIM;
+	UpdateContext();
+	s_n = m_fuse_saved_serial;
+	m_backed_up_ctx = m_fuse_saved_backed_up_ctx;
+	m_dirty_gs_regs = m_fuse_saved_dirty_regs;
+	m_state_flush_reason = static_cast<GSFlushReason>(m_fuse_saved_flush_reason);
+	m_channel_shuffle_finish = m_fuse_saved_shuffle_finish;
+	m_isPackedUV_HackFlag = m_fuse_saved_uv_hack;
+	m_draw_priv = m_fuse_saved_priv;
+	m_vt.m_alpha.valid = false;
+}
+
+void GSRendererHW::FuseInstallVerifyPass(const GSBackQueue::DrawNode::FusePassState& st)
+{
+	// Zero-copy: the live slots borrow the stash vectors. Draw() provably does
+	// not write vertex/index bytes under the template + B1/B2 (ST rounding,
+	// ST/Q divide, sprite/shuffle/HLE rewrites all gated off), and dev builds
+	// memcmp below to catch any future writer.
+	m_vertex->buff = const_cast<GSVertex*>(st.verts.data());
+	m_vertex->head = st.vhead;
+	m_vertex->tail = st.vtail;
+	m_vertex->next = st.vnext;
+	m_vertex->maxcount = st.vtail;
+	m_index->buff = const_cast<u16*>(st.indices.data());
+	m_index->tail = st.itail;
+	std::memcpy(&m_prev_env, &st.draw_env, sizeof(m_prev_env));
+	std::memcpy(&m_env, &st.next_env, sizeof(m_env));
+	m_v = st.next_v;
+	temp_draw_rect = st.draw_rect;
+	temp_native_draw_rect = st.native_draw_rect;
+	m_draw_env = &m_prev_env;
+	PRIM = &m_prev_env.PRIM;
+	UpdateContext();
+	s_n = st.draw_serial;
+	m_backed_up_ctx = st.backed_up_ctx;
+	m_dirty_gs_regs = st.dirty_gs_regs;
+	m_state_flush_reason = static_cast<GSFlushReason>(st.flush_reason);
+	m_channel_shuffle_finish = st.channel_shuffle_finish;
+	m_isPackedUV_HackFlag = st.packed_uv_hack_flag;
+	m_draw_priv = st.priv;
+	m_vt.m_alpha.valid = false;
+	// DrawRecordTail order per draw: scissor refresh, trace, then (in Draw(),
+	// not here) the draw. Rounding/blits replicate the tail exactly.
+	m_env.CTXT[PRIM->CTXT].UpdateScissor();
+	m_vt.Update(m_vertex->buff, m_index->buff, m_vertex->tail, m_index->tail,
+		GSUtil::GetPrimClass(PRIM->PRIM));
+	const u32 FRAME_FBP = m_context->FRAME.FBP;
+	if ((st.priv.dispfb_fbp[0] == FRAME_FBP && st.priv.display_enabled[0]) ||
+	    (st.priv.dispfb_fbp[1] == FRAME_FBP && st.priv.display_enabled[1]))
+	{
+		g_perfmon.AddDisplayFramebufferSpriteBlit();
+	}
+}
+
+bool GSRendererHW::FuseVerifyPass(int pass, const GSBackQueue::DrawNode::FusePassState& st, FuseVerifySnapshot& snap)
+{
+	pxAssert(pass == 1 || pass == 2);
+	FuseInstallVerifyPass(st);
+	if (m_vt.m_eq.z)
+	{
+		FuseCountAbort(FuseAbort::EqZ);
+		return false;
+	}
+	if (m_vt.m_accurate_stq && m_vt.m_eq.stq)
+	{
+		FuseCountAbort(FuseAbort::EqSTQ);
+		return false;
+	}
+#ifdef PCSX2_DEVBUILD
+	const size_t vbytes = sizeof(GSVertex) * st.vtail;
+	const size_t ibytes = sizeof(u16) * st.itail;
+	std::vector<u8> vcopy(vbytes), icopy(ibytes);
+	std::memcpy(vcopy.data(), st.verts.data(), vbytes);
+	std::memcpy(icopy.data(), st.indices.data(), ibytes);
+#endif
+	m_fuse_verify_reached_submit = false;
+	Draw();
+	snap.conf = m_conf;
+	snap.reached_submit = m_fuse_verify_reached_submit;
+	snap.using_temp_z = m_using_temp_z;
+	snap.channel_shuffle = m_channel_shuffle;
+	snap.texture_shuffle = !!m_texture_shuffle;
+#ifdef PCSX2_DEVBUILD
+	pxAssertRel(std::memcmp(vcopy.data(), st.verts.data(), vbytes) == 0, "TPF1: verify pass mutated verts");
+	pxAssertRel(std::memcmp(icopy.data(), st.indices.data(), ibytes) == 0, "TPF1: verify pass mutated indices");
+#endif
+	if (!snap.reached_submit)
+	{
+		FuseCountAbort(FuseAbort::NoSubmit);
+		return false;
+	}
+	return true;
+}
+
+#define FUSE_CHECK(cond, reason) \
+	do \
+	{ \
+		if (!(cond)) \
+		{ \
+			FuseCountAbort(FuseAbort::reason); \
+			return false; \
+		} \
+	} while (0)
+
+bool GSRendererHW::FuseSnapshotsCompatible(
+	const FuseVerifySnapshot& s0, const FuseVerifySnapshot& s1, const FuseVerifySnapshot& s2)
+{
+	// s0 = T1 base, s1 = T3 shadow, s2 = T2 light.
+	const GSHWDrawConfig& c0 = s0.conf;
+	const GSHWDrawConfig& c1 = s1.conf;
+	const GSHWDrawConfig& c2 = s2.conf;
+
+	// B6 absolute per pass: blend primaries. T1's A==B rewrite to (0,0,0,0) is
+	// the REPLACE the chain needs; T3/T2 must be unrewritten (any Cs-kill,
+	// As-const or Ad→Af rewrite changes the formula stock executes).
+	FUSE_CHECK(c0.ps.blend_a == 0 && c0.ps.blend_b == 0 && c0.ps.blend_c == 0 && c0.ps.blend_d == 0, BlendPattern);
+	FUSE_CHECK(c1.ps.blend_a == 1 && c1.ps.blend_b == 0 && c1.ps.blend_c == 0 && c1.ps.blend_d == 2, BlendPattern);
+	FUSE_CHECK(c2.ps.blend_a == 0 && c2.ps.blend_b == 2 && c2.ps.blend_c == 1 && c2.ps.blend_d == 1, BlendPattern);
+	FUSE_CHECK(!c0.blend_multi_pass.enable && !c1.blend_multi_pass.enable && !c2.blend_multi_pass.enable, MultiPass);
+	FUSE_CHECK(!c0.blend.constant_enable && !c1.blend.constant_enable && !c2.blend.constant_enable, BlendConst);
+	// B6: no dual-source emulations (the triple is device-blend-off, and the
+	// INV_SRC1 policy requires bs.enable, so OMS1 can never arm the rewrite here).
+	FUSE_CHECK(!c0.ps.af_in_src1 && !c0.ps.blend_factor_in_alpha && !c0.ps.round_inv, BlendConst);
+	FUSE_CHECK(!c1.ps.af_in_src1 && !c1.ps.blend_factor_in_alpha && !c1.ps.round_inv, BlendConst);
+	FUSE_CHECK(!c2.ps.af_in_src1 && !c2.ps.blend_factor_in_alpha && !c2.ps.round_inv, BlendConst);
+	FUSE_CHECK(!c0.ps.inv_src1_rewrite && !c1.ps.inv_src1_rewrite && !c2.ps.inv_src1_rewrite, BlendConst);
+	FUSE_CHECK(c0.blend.src != GSDevice::CONST_COLOR && c0.blend.src != GSDevice::INV_CONST_COLOR, BlendConst);
+	FUSE_CHECK(c0.blend.dst != GSDevice::CONST_COLOR && c0.blend.dst != GSDevice::INV_CONST_COLOR, BlendConst);
+	FUSE_CHECK(c1.blend.src != GSDevice::CONST_COLOR && c1.blend.src != GSDevice::INV_CONST_COLOR, BlendConst);
+	FUSE_CHECK(c1.blend.dst != GSDevice::CONST_COLOR && c1.blend.dst != GSDevice::INV_CONST_COLOR, BlendConst);
+	FUSE_CHECK(c2.blend.src != GSDevice::CONST_COLOR && c2.blend.src != GSDevice::INV_CONST_COLOR, BlendConst);
+	FUSE_CHECK(c2.blend.dst != GSDevice::CONST_COLOR && c2.blend.dst != GSDevice::INV_CONST_COLOR, BlendConst);
+	// B6 absolute per pass: write masks (T1 full, T3/T2 alpha-held) + no logic op.
+	FUSE_CHECK(c0.colormask.wrgba == 0xF && c0.colormask.logic_op == 0, BlendPattern);
+	FUSE_CHECK(c1.colormask.wrgba == 0x7 && c1.colormask.logic_op == 0, BlendPattern);
+	FUSE_CHECK(c2.colormask.wrgba == 0x7 && c2.colormask.logic_op == 0, BlendPattern);
+	// B6 absolute per pass: no visible RT alpha scaling (else the Ad the chain
+	// reads and the alpha it writes need the ×2 protocol the fused draw skips).
+	FUSE_CHECK(!c0.ps.rta_correction && !c0.ps.rta_source_correction, RTA);
+	FUSE_CHECK(!c1.ps.rta_correction && !c1.ps.rta_source_correction, RTA);
+	FUSE_CHECK(!c2.ps.rta_correction && !c2.ps.rta_source_correction, RTA);
+	// B6 absolute per pass: no masked-merge roads (they read post-T1 RT content).
+	FUSE_CHECK(!c0.ps.fbmask && !c0.ps.quantize_color && !c0.ps.substitute_alpha, FbmaskRoad);
+	FUSE_CHECK(!c1.ps.fbmask && !c1.ps.quantize_color && !c1.ps.substitute_alpha, FbmaskRoad);
+	FUSE_CHECK(!c2.ps.fbmask && !c2.ps.quantize_color && !c2.ps.substitute_alpha, FbmaskRoad);
+	// B6 absolute per pass: no DATE, no alpha second pass.
+	FUSE_CHECK(c0.ps.date == 0 && !c0.alpha_second_pass.enable, SecondPass);
+	FUSE_CHECK(c1.ps.date == 0 && !c1.alpha_second_pass.enable, SecondPass);
+	FUSE_CHECK(c2.ps.date == 0 && !c2.alpha_second_pass.enable, SecondPass);
+	// B6 roads: stock T3/T2 read Cd/Ad in-shader (SW_BLEND_NEEDS_RT), so they take
+	// feedback roads (rt_loop ± one_barrier, ROV on fetch-only backends, clone on
+	// no-barrier ones) — all allowed, none inherited: the fused draw is a REPLACE
+	// with staged intermediates, so it needs no road at all. Asserted off are only
+	// the roads the fused draw cannot stage past: full barriers, depth loops, and
+	// texture hazards (tex-vs-RT aliasing, which would be a true dependency).
+	FUSE_CHECK(!c0.require_full_barrier && !c1.require_full_barrier && !c2.require_full_barrier, ROVBarrierRoad);
+	FUSE_CHECK(!c0.road.depth_loop && !c0.road.depth_read, ROVBarrierRoad);
+	FUSE_CHECK(!c1.road.depth_loop && !c1.road.depth_read, ROVBarrierRoad);
+	FUSE_CHECK(!c2.road.depth_loop && !c2.road.depth_read, ROVBarrierRoad);
+	FUSE_CHECK(c0.tex_hazard == GSHWDrawConfig::TEX_HAZARD_NONE, ROVBarrierRoad);
+	FUSE_CHECK(c1.tex_hazard == GSHWDrawConfig::TEX_HAZARD_NONE, ROVBarrierRoad);
+	FUSE_CHECK(c2.tex_hazard == GSHWDrawConfig::TEX_HAZARD_NONE, ROVBarrierRoad);
+	FUSE_CHECK(!c0.offset_read_hits_write && !c1.offset_read_hits_write && !c2.offset_read_hits_write, ROVBarrierRoad);
+	FUSE_CHECK(!c0.raster_order && !c1.raster_order && !c2.raster_order, ROVBarrierRoad);
+	// B6 absolute per pass: no RT-reading blends, no HLE roads.
+	FUSE_CHECK(!c0.ps.tex_is_fb && !c0.ps.urban_chaos_hle && !c0.ps.tales_of_abyss_hle, TexIsFBHLE);
+	FUSE_CHECK(!c1.ps.tex_is_fb && !c1.ps.urban_chaos_hle && !c1.ps.tales_of_abyss_hle, TexIsFBHLE);
+	FUSE_CHECK(!c2.ps.tex_is_fb && !c2.ps.urban_chaos_hle && !c2.ps.tales_of_abyss_hle, TexIsFBHLE);
+	// B6 absolute per pass: no stencil/shuffle/channel/depth-texture roads.
+	FUSE_CHECK(!c0.ps.stencil_counter && c0.ps.channel == 0, StencilChannel);
+	FUSE_CHECK(!c1.ps.stencil_counter && c1.ps.channel == 0, StencilChannel);
+	FUSE_CHECK(!c2.ps.stencil_counter && c2.ps.channel == 0, StencilChannel);
+	FUSE_CHECK(!c0.ps.shuffle && !c0.ps.shuffle_same && !c0.ps.real16src, StencilChannel);
+	FUSE_CHECK(!c1.ps.shuffle && !c1.ps.shuffle_same && !c1.ps.real16src, StencilChannel);
+	FUSE_CHECK(!c2.ps.shuffle && !c2.ps.shuffle_same && !c2.ps.real16src, StencilChannel);
+	FUSE_CHECK(!c0.ps.shuffle_across && !c0.ps.write_rg && c0.ps.depth_fmt == 0, StencilChannel);
+	FUSE_CHECK(!c1.ps.shuffle_across && !c1.ps.write_rg && c1.ps.depth_fmt == 0, StencilChannel);
+	FUSE_CHECK(!c2.ps.shuffle_across && !c2.ps.write_rg && c2.ps.depth_fmt == 0, StencilChannel);
+	// B6 absolute per pass: fixed-function template (matches the front policy).
+	FUSE_CHECK(!c0.ps.fog && c0.ps.iip == 1 && !c0.ps.fst, FixedFunction);
+	FUSE_CHECK(!c1.ps.fog && c1.ps.iip == 1 && !c1.ps.fst, FixedFunction);
+	FUSE_CHECK(!c2.ps.fog && c2.ps.iip == 1 && !c2.ps.fst, FixedFunction);
+	FUSE_CHECK(c0.ps.tfx == 0 && c0.ps.tcc == 1, FixedFunction);
+	FUSE_CHECK(c1.ps.tfx == 0 && c1.ps.tcc == 1, FixedFunction);
+	FUSE_CHECK(c2.ps.tfx == 0 && c2.ps.tcc == 1, FixedFunction);
+	FUSE_CHECK(c0.ps.dither == 0 && c0.ps.scanmsk == 0, FixedFunction);
+	FUSE_CHECK(c1.ps.dither == 0 && c1.ps.scanmsk == 0, FixedFunction);
+	FUSE_CHECK(c2.ps.dither == 0 && c2.ps.scanmsk == 0, FixedFunction);
+	FUSE_CHECK(!c0.ps.colclip && !c0.ps.colclip_hw, FixedFunction);
+	FUSE_CHECK(!c1.ps.colclip && !c1.ps.colclip_hw, FixedFunction);
+	FUSE_CHECK(!c2.ps.colclip && !c2.ps.colclip_hw, FixedFunction);
+	FUSE_CHECK(!c0.ps.point_sampler && !c0.ps.region_rect, FixedFunction);
+	FUSE_CHECK(!c1.ps.point_sampler && !c1.ps.region_rect, FixedFunction);
+	FUSE_CHECK(!c2.ps.point_sampler && !c2.ps.region_rect, FixedFunction);
+	FUSE_CHECK(!c0.ps.native_texel_grid && !c0.ps.sprite_edge_clamp && !c0.ps.no_color, FixedFunction);
+	FUSE_CHECK(!c1.ps.native_texel_grid && !c1.ps.sprite_edge_clamp && !c1.ps.no_color, FixedFunction);
+	FUSE_CHECK(!c2.ps.native_texel_grid && !c2.ps.sprite_edge_clamp && !c2.ps.no_color, FixedFunction);
+	// B6 absolute per pass: no coverage-alpha overwrite (it would rewrite the
+	// alphas the chain reads).
+	FUSE_CHECK(!c0.ps.fixed_one_a && !c1.ps.fixed_one_a && !c2.ps.fixed_one_a, FixedFunction);
+	FUSE_CHECK(c0.topology == GSHWDrawConfig::Topology::Triangle && c0.indices_per_prim == 3, FixedFunction);
+	FUSE_CHECK(c1.topology == GSHWDrawConfig::Topology::Triangle && c1.indices_per_prim == 3, FixedFunction);
+	FUSE_CHECK(c2.topology == GSHWDrawConfig::Topology::Triangle && c2.indices_per_prim == 3, FixedFunction);
+	// B6 absolute per pass: no software depth test (the fused shader runs the HW
+	// depth path and never samples the depth texture).
+	FUSE_CHECK(c0.ps.ztst == ZTST_ALWAYS && c1.ps.ztst == ZTST_ALWAYS && c2.ps.ztst == ZTST_ALWAYS, FixedFunction);
+	// B6 absolute per pass: no alpha test (a per-pass discard would break the
+	// chain; TEST.ATST=ALWAYS maps to PS_ATST::NONE).
+	FUSE_CHECK(c0.ps.atst == 0 && c1.ps.atst == 0 && c2.ps.atst == 0, FixedFunction);
+	// B6: T1 is a pure REPLACE (no shader blend assist, single output).
+	FUSE_CHECK(c0.ps.blend_hw == 0 && c0.ps.blend_mix == 0 && c0.ps.no_color1 == 1, BlendPattern);
+	// B6: T3/T2 are pure software blends (the chain evaluates the pinned formulas
+	// itself; any HW assist, mix, or device blend has no fused spelling). T1's
+	// device state is off too: the fused draw outputs through it.
+	FUSE_CHECK(c1.ps.blend_hw == 0 && c1.ps.blend_mix == 0 && c1.blend.key == 0, BlendPattern);
+	FUSE_CHECK(c2.ps.blend_hw == 0 && c2.ps.blend_mix == 0 && c2.blend.key == 0, BlendPattern);
+	FUSE_CHECK(c0.blend.key == 0, BlendPattern);
+	// B6 absolute per pass: no coverage alpha (the chain has no AA1 term; the
+	// Fuse3 VS leaves inv_cov/interior unwritten exactly like stock expand-None).
+	FUSE_CHECK(c0.ps.aa1 == GSHWDrawConfig::PS_AA1::NONE && c1.ps.aa1 == GSHWDrawConfig::PS_AA1::NONE &&
+		c2.ps.aa1 == GSHWDrawConfig::PS_AA1::NONE, FixedFunction);
+	// B6 absolute per pass: no PABE (the front pins the register 0; the chain has
+	// no per-pixel blend-enable term).
+	FUSE_CHECK(!c0.ps.pabe && !c1.ps.pabe && !c2.ps.pabe, FixedFunction);
+	// B6 absolute per pass: LOD mode is single (the FuseMode pack encodes
+	// manual?2:auto?1:0 while stock prefers automatic; both set has no spelling).
+	FUSE_CHECK(!(c0.ps.manual_lod && c0.ps.automatic_lod), FixedFunction);
+	FUSE_CHECK(!(c1.ps.manual_lod && c1.ps.automatic_lod), FixedFunction);
+	FUSE_CHECK(!(c2.ps.manual_lod && c2.ps.automatic_lod), FixedFunction);
+	// B6 members: no temp-Z, no shuffles anywhere in the triple.
+	FUSE_CHECK(!s0.using_temp_z && !s1.using_temp_z && !s2.using_temp_z, TempZShuffle);
+	FUSE_CHECK(!s0.channel_shuffle && !s1.channel_shuffle && !s2.channel_shuffle, TempZShuffle);
+	FUSE_CHECK(!s0.texture_shuffle && !s1.texture_shuffle && !s2.texture_shuffle, TempZShuffle);
+	// B6 textures: all textured; T1 paletted, T3/T2 plain; T3/T2 share one sampler.
+	FUSE_CHECK(c0.tex && c1.tex && c2.tex, PalSampler);
+	FUSE_CHECK(c0.pal && !c1.pal && !c2.pal, PalSampler);
+	FUSE_CHECK(c1.ps.pal_fmt == 0 && c2.ps.pal_fmt == 0, PalSampler);
+	FUSE_CHECK(c1.sampler.key == c2.sampler.key, PalSampler);
+
+	// B5: the triple renders into the same targets throughout (no mid-triple
+	// realloc/replacement; the fused draw inherits them).
+	FUSE_CHECK(c0.rt == c1.rt && c0.rt == c2.rt && c0.rt != nullptr, TargetChange);
+	FUSE_CHECK(c0.ds == c1.ds && c0.ds == c2.ds, TargetChange);
+
+	// B6 shared: vertex selectors identical (all expand-None triangles).
+	FUSE_CHECK(c0.vs.key == c1.vs.key && c0.vs.key == c2.vs.key, SharedMismatch);
+	// B6 shared: stock VS is the plain textured path (the Fuse3 loader replicates
+	// load_vertex's TME spelling exactly and has no sprite-edge term; point_size
+	// would skip the Metal VS cache entry the fused key needs).
+	FUSE_CHECK(c0.vs.tme == 1 && c1.vs.tme == 1 && c2.vs.tme == 1, SharedMismatch);
+	FUSE_CHECK(c0.vs.expand == GSHWDrawConfig::VSExpand::None && c1.vs.expand == GSHWDrawConfig::VSExpand::None &&
+		c2.vs.expand == GSHWDrawConfig::VSExpand::None, SharedMismatch);
+	FUSE_CHECK(c0.vs.point_size == 0 && c1.vs.point_size == 0 && c2.vs.point_size == 0, SharedMismatch);
+	FUSE_CHECK(c0.vs.sprite_edge_clamp == 0 && c1.vs.sprite_edge_clamp == 0 && c2.vs.sprite_edge_clamp == 0, SharedMismatch);
+	// B6 shared: pixel selectors identical outside the canonicalized-diverging set.
+	{
+		GSHWDrawConfig::PSSelector p0 = c0.ps, p1 = c1.ps, p2 = c2.ps;
+		FuseCanonicalizeDiverging(p0);
+		FuseCanonicalizeDiverging(p1);
+		FuseCanonicalizeDiverging(p2);
+		FUSE_CHECK(p0.key_lo == p1.key_lo && p0.key_hi == p1.key_hi, SharedMismatch);
+		FUSE_CHECK(p0.key_lo == p2.key_lo && p0.key_hi == p2.key_hi, SharedMismatch);
+	}
+	// B6 shared: fog/AREF, target-scale halves, shuffle-zeroes, dither phase,
+	// line coverage (all target/vertex-derived, never per-pass under the template).
+	FUSE_CHECK(FuseVecEq(c0.cb_ps.FogColor_AREF, c1.cb_ps.FogColor_AREF), SharedMismatch);
+	FUSE_CHECK(FuseVecEq(c0.cb_ps.FogColor_AREF, c2.cb_ps.FogColor_AREF), SharedMismatch);
+	// B6 shared: pixel-shader max-depth (zclamp input; ZBUF+XYZ derived, equal
+	// across the triple by the front policy + EqZ abort; TA.xy/Af vary per pass).
+	FUSE_CHECK(c0.cb_ps.TA_MaxDepth_Af.z == c1.cb_ps.TA_MaxDepth_Af.z, SharedMismatch);
+	FUSE_CHECK(c0.cb_ps.TA_MaxDepth_Af.z == c2.cb_ps.TA_MaxDepth_Af.z, SharedMismatch);
+	FUSE_CHECK(std::memcmp(&c0.cb_ps.ScaleFactor.z, &c1.cb_ps.ScaleFactor.z, sizeof(float) * 2) == 0, SharedMismatch);
+	FUSE_CHECK(std::memcmp(&c0.cb_ps.ScaleFactor.z, &c2.cb_ps.ScaleFactor.z, sizeof(float) * 2) == 0, SharedMismatch);
+	FUSE_CHECK(c0.cb_ps.ChannelShuffle.eq(c1.cb_ps.ChannelShuffle), SharedMismatch);
+	FUSE_CHECK(c0.cb_ps.ChannelShuffle.eq(c2.cb_ps.ChannelShuffle), SharedMismatch);
+	FUSE_CHECK(FuseVecEq(c0.cb_ps.ChannelShuffleOffset, c1.cb_ps.ChannelShuffleOffset), SharedMismatch);
+	FUSE_CHECK(FuseVecEq(c0.cb_ps.ChannelShuffleOffset, c2.cb_ps.ChannelShuffleOffset), SharedMismatch);
+	FUSE_CHECK(c0.cb_ps.DitherPhase == c1.cb_ps.DitherPhase && c0.cb_ps.DitherPhase == c2.cb_ps.DitherPhase,
+		SharedMismatch);
+	FUSE_CHECK(c0.cb_ps.LineCovScale == c1.cb_ps.LineCovScale && c0.cb_ps.LineCovScale == c2.cb_ps.LineCovScale,
+		SharedMismatch);
+	// B6 shared: VS position/depth constants.
+	FUSE_CHECK(FuseVecEq(c0.cb_vs.vertex_scale, c1.cb_vs.vertex_scale) &&
+			FuseVecEq(c0.cb_vs.vertex_scale, c2.cb_vs.vertex_scale),
+		SharedMismatch);
+	FUSE_CHECK(FuseVecEq(c0.cb_vs.vertex_offset, c1.cb_vs.vertex_offset) &&
+			FuseVecEq(c0.cb_vs.vertex_offset, c2.cb_vs.vertex_offset),
+		SharedMismatch);
+	FUSE_CHECK(FuseVecEq(c0.cb_vs.point_size, c1.cb_vs.point_size) && FuseVecEq(c0.cb_vs.point_size, c2.cb_vs.point_size),
+		SharedMismatch);
+	FUSE_CHECK(c0.cb_vs.max_depth == c1.cb_vs.max_depth && c0.cb_vs.max_depth == c2.cb_vs.max_depth, SharedMismatch);
+	FUSE_CHECK(c0.cb_vs.line_aa1_width == c1.cb_vs.line_aa1_width && c0.cb_vs.line_aa1_width == c2.cb_vs.line_aa1_width,
+		SharedMismatch);
+	// B6 shared: depth, scissor, drawarea, stream shape, misc lanes.
+	FUSE_CHECK(c0.depth.key == c1.depth.key && c0.depth.key == c2.depth.key, SharedMismatch);
+	FUSE_CHECK(c0.scissor.eq(c1.scissor) && c0.scissor.eq(c2.scissor), SharedMismatch);
+	FUSE_CHECK(c0.drawarea.eq(c1.drawarea) && c0.drawarea.eq(c2.drawarea), SharedMismatch);
+	FUSE_CHECK(c0.nverts == c1.nverts && c0.nverts == c2.nverts && c0.nverts > 0, SharedMismatch);
+	FUSE_CHECK(c0.nindices == c1.nindices && c0.nindices == c2.nindices, SharedMismatch);
+	FUSE_CHECK(c0.date_copy == c1.date_copy && c0.date_copy == c2.date_copy, SharedMismatch);
+	FUSE_CHECK(c0.line_expand == c1.line_expand && c0.line_expand == c2.line_expand, SharedMismatch);
+	return true;
+}
+
+#undef FUSE_CHECK
+
+void GSRendererHW::FuseAssembleAndSubmit(const FuseVerifySnapshot& s0, const FuseVerifySnapshot& s1,
+	const FuseVerifySnapshot& s2, const GSVertex* v0, const GSVertex* v1, const GSVertex* v2, u32 nverts,
+	const u16* indices, u32 nindices)
+{
+	const GSHWDrawConfig& c0 = s0.conf;
+	const GSHWDrawConfig& c1 = s1.conf;
+	const GSHWDrawConfig& c2 = s2.conf;
+
+	// Base = T2: depth, scissor, drawarea, topology, hazards-off lanes, row lane.
+	// Roads are not inherited (the fused REPLACE needs none): clear ROV and the
+	// barrier flags stock's feedback passes may carry.
+	m_conf = c2;
+	m_conf.ps.rov_color = 0;
+	m_conf.ps.rov_depth = static_cast<decltype(m_conf.ps.rov_depth)>(0);
+	m_conf.require_one_barrier = false;
+	m_conf.require_full_barrier = false;
+	// Blend config = T1's bitwise (the fused draw outputs the final chained color
+	// through the same device-REPLACE T1 used; T1's selector blend_* are already
+	// the (0,0,0,0) primary).
+	m_conf.blend = c0.blend;
+	m_conf.blend_multi_pass = c0.blend_multi_pass;
+	m_conf.colormask = c0.colormask;
+	m_conf.ps.fuse3 = 1;
+	m_conf.ps.blend_a = m_conf.ps.blend_b = m_conf.ps.blend_c = m_conf.ps.blend_d = 0;
+	m_conf.ps.blend_hw = c0.ps.blend_hw;
+	m_conf.ps.blend_mix = c0.ps.blend_mix;
+	m_conf.ps.no_color1 = c0.ps.no_color1;
+	m_conf.ps.af_in_src1 = c0.ps.af_in_src1;
+	m_conf.ps.blend_factor_in_alpha = c0.ps.blend_factor_in_alpha;
+	m_conf.ps.inv_src1_rewrite = c0.ps.inv_src1_rewrite;
+	m_conf.ps.round_inv = c0.ps.round_inv;
+	// Source-0 texture lanes = T1's (shared fields drive source 0 in the shader).
+	m_conf.ps.wms = c0.ps.wms;
+	m_conf.ps.wmt = c0.ps.wmt;
+	m_conf.ps.ltf = c0.ps.ltf;
+	m_conf.ps.manual_lod = c0.ps.manual_lod;
+	m_conf.ps.automatic_lod = c0.ps.automatic_lod;
+	m_conf.ps.sw_aniso = c0.ps.sw_aniso;
+	m_conf.ps.aem_fmt = c0.ps.aem_fmt;
+	m_conf.ps.pal_fmt = c0.ps.pal_fmt;
+	m_conf.ps.aem = c0.ps.aem;
+	m_conf.ps.adjs = c0.ps.adjs;
+	m_conf.ps.adjt = c0.ps.adjt;
+	m_conf.ps.replacement_alpha_snap = c0.ps.replacement_alpha_snap;
+	m_conf.sampler = c0.sampler;
+	m_conf.sampler_fuse = c1.sampler;
+	m_conf.tex = c0.tex;
+	m_conf.pal = c0.pal;
+	m_conf.tex_fuse1 = c1.tex;
+	m_conf.tex_fuse2 = c2.tex;
+	m_conf.cb_ps.WH = c0.cb_ps.WH;
+	m_conf.cb_ps.TA_MaxDepth_Af = c0.cb_ps.TA_MaxDepth_Af;
+	m_conf.cb_ps.HalfTexel = c0.cb_ps.HalfTexel;
+	m_conf.cb_ps.MinMax = c0.cb_ps.MinMax;
+	m_conf.cb_ps.LODParams = c0.cb_ps.LODParams;
+	m_conf.cb_ps.STRange = c0.cb_ps.STRange;
+	m_conf.cb_ps.STScale = c0.cb_ps.STScale;
+	m_conf.cb_ps.TCOffsetHack = c0.cb_ps.TCOffsetHack;
+	m_conf.cb_ps.ScaleFactor = c0.cb_ps.ScaleFactor;
+	m_conf.cb_vs.texture_scale = c0.cb_vs.texture_scale;
+	m_conf.cb_vs.texture_offset = c0.cb_vs.texture_offset;
+	// Sources 1/2 ride the Fuse arrays (bit-identical copies of their verifies).
+	const GSHWDrawConfig* cs[2] = {&c1, &c2};
+	for (int i = 0; i < 2; i++)
+	{
+		const GSHWDrawConfig& c = *cs[i];
+		m_conf.cb_ps.FuseWH[i] = c.cb_ps.WH;
+		m_conf.cb_ps.FuseTA[i] = c.cb_ps.TA_MaxDepth_Af;
+		m_conf.cb_ps.FuseHalfTexel[i] = c.cb_ps.HalfTexel;
+		m_conf.cb_ps.FuseMinMax[i] = c.cb_ps.MinMax;
+		m_conf.cb_ps.FuseLODParams[i] = c.cb_ps.LODParams;
+		m_conf.cb_ps.FuseSTRange[i] = c.cb_ps.STRange;
+		m_conf.cb_ps.FuseSTScaleTCO[i] =
+			GSVector4(c.cb_ps.STScale.x, c.cb_ps.STScale.y, c.cb_ps.TCOffsetHack.x, c.cb_ps.TCOffsetHack.y);
+		m_conf.cb_ps.FuseScaleXY[i] = GSVector4(c.cb_ps.ScaleFactor.x, c.cb_ps.ScaleFactor.y, 0.0f, 0.0f);
+		const int lodmode = c.ps.manual_lod ? 2 : (c.ps.automatic_lod ? 1 : 0);
+		m_conf.cb_ps.FuseMode[i] = GSVector4i(c.ps.wms, c.ps.wmt, c.ps.ltf, lodmode);
+		m_conf.cb_ps.FuseFlags[i] = GSVector4i(static_cast<int>(FusePackFlags(c.ps)), 0, 0, 0);
+		m_conf.cb_ps.FuseBlend[i] = GSVector4i(static_cast<int>(FusePackBlend(c)), 0, 0, 0);
+		m_conf.cb_vs.FuseTexScaleOffset[i] = GSVector4(
+			c.cb_vs.texture_scale.x, c.cb_vs.texture_scale.y, c.cb_vs.texture_offset.x, c.cb_vs.texture_offset.y);
+	}
+	// 48-byte vertices: one ST per source + T1's shared RGBAQ/XYZ/UV/FOG.
+	m_fuse_vert_scratch.resize(static_cast<size_t>(nverts) * sizeof(GSVertexFuse3));
+	GSVertexFuse3* fv = reinterpret_cast<GSVertexFuse3*>(m_fuse_vert_scratch.data());
+	for (u32 i = 0; i < nverts; i++)
+	{
+		fv[i].ST[0] = v0[i].ST;
+		fv[i].ST[1] = v1[i].ST;
+		fv[i].ST[2] = v2[i].ST;
+		fv[i].RGBAQ = v0[i].RGBAQ;
+		fv[i].XYZ = v0[i].XYZ;
+		fv[i].UV = v0[i].UV;
+		fv[i].FOG = v0[i].FOG;
+	}
+	m_conf.vs.expand = GSHWDrawConfig::VSExpand::Fuse3;
+	m_conf.verts = nullptr;
+	m_conf.verts_fuse3 = fv;
+	m_conf.indices = indices;
+	m_conf.nverts = nverts;
+	m_conf.nindices = nindices;
+	m_conf.samplearea = c0.samplearea.runion(c1.samplearea).runion(c2.samplearea);
+	m_conf.road = DecideDrawRoad(m_conf, g_gs_device->Features());
+	pxAssertRel(FuseRoadIsClear(m_conf.road), "TPF1: fused draw took a road");
+	if (FuseStatsEnabled())
+	{
+		static bool fuse_tuple_printed = false;
+		if (!fuse_tuple_printed)
+		{
+			fuse_tuple_printed = true;
+			std::fprintf(stderr,
+				"TPF1: first fused triple blend tuples:\n"
+				"  T1 abcd=(%u,%u,%u,%u) hw=%u mix=%u nc1=%u dev=(en=%u op=%u src=%u dst=%u) lod=(m=%u a=%u) aniso=%u wms/wmt=(%u,%u) ltf=%u aem_fmt=%u\n"
+				"  T3 abcd=(%u,%u,%u,%u) hw=%u mix=%u nc1=%u afin=%u bfin=%u inv=%u rinv=%u dev=(en=%u op=%u src=%u dst=%u) lod=(m=%u a=%u) aniso=%u wms/wmt=(%u,%u) ltf=%u aem_fmt=%u pal_fmt=%u flags=0x%x blend=0x%x\n"
+				"  T2 abcd=(%u,%u,%u,%u) hw=%u mix=%u nc1=%u afin=%u bfin=%u inv=%u rinv=%u dev=(en=%u op=%u src=%u dst=%u) lod=(m=%u a=%u) aniso=%u wms/wmt=(%u,%u) ltf=%u aem_fmt=%u pal_fmt=%u flags=0x%x blend=0x%x\n",
+				c0.ps.blend_a, c0.ps.blend_b, c0.ps.blend_c, c0.ps.blend_d, static_cast<unsigned>(c0.ps.blend_hw),
+				static_cast<unsigned>(c0.ps.blend_mix), c0.ps.no_color1, c0.blend.enable ? 1u : 0u,
+				static_cast<unsigned>(c0.blend.op), static_cast<unsigned>(c0.blend.src), static_cast<unsigned>(c0.blend.dst),
+				c0.ps.manual_lod, c0.ps.automatic_lod, c0.ps.sw_aniso, c0.ps.wms, c0.ps.wmt, c0.ps.ltf, c0.ps.aem_fmt,
+				c1.ps.blend_a, c1.ps.blend_b, c1.ps.blend_c, c1.ps.blend_d, static_cast<unsigned>(c1.ps.blend_hw),
+				static_cast<unsigned>(c1.ps.blend_mix), c1.ps.no_color1, c1.ps.af_in_src1, c1.ps.blend_factor_in_alpha,
+				c1.ps.inv_src1_rewrite, c1.ps.round_inv, c1.blend.enable ? 1u : 0u, static_cast<unsigned>(c1.blend.op),
+				static_cast<unsigned>(c1.blend.src), static_cast<unsigned>(c1.blend.dst), c1.ps.manual_lod,
+				c1.ps.automatic_lod, c1.ps.sw_aniso, c1.ps.wms, c1.ps.wmt, c1.ps.ltf, c1.ps.aem_fmt, c1.ps.pal_fmt,
+				FusePackFlags(c1.ps), FusePackBlend(c1), c2.ps.blend_a, c2.ps.blend_b, c2.ps.blend_c, c2.ps.blend_d,
+				static_cast<unsigned>(c2.ps.blend_hw), static_cast<unsigned>(c2.ps.blend_mix), c2.ps.no_color1,
+				c2.ps.af_in_src1, c2.ps.blend_factor_in_alpha, c2.ps.inv_src1_rewrite, c2.ps.round_inv,
+				c2.blend.enable ? 1u : 0u, static_cast<unsigned>(c2.blend.op), static_cast<unsigned>(c2.blend.src),
+				static_cast<unsigned>(c2.blend.dst), c2.ps.manual_lod, c2.ps.automatic_lod, c2.ps.sw_aniso, c2.ps.wms,
+				c2.ps.wmt, c2.ps.ltf, c2.ps.aem_fmt, c2.ps.pal_fmt, FusePackFlags(c2.ps), FusePackBlend(c2));
+		}
+	}
+
+	// One draw-log row: T2-front regs (live, from the last verify) + fused back.
+	if (GSDrawLog::IsActive()) [[unlikely]]
+		RecordDrawLogEntry();
+	g_gs_device->RenderHW(m_conf);
+	GSDrawLog::EndDraw(m_conf, static_cast<u8>(m_prim_overlap));
+	FuseCountFused();
+
+	// Post-state is stock-post-T2 bitwise.
+	m_conf = c2;
+}
+
+void GSRendererHW::FuseSerialFallback(
+	const GSBackQueue::DrawNode::FusePassState& t3, const GSBackQueue::DrawNode::FusePassState& t2)
+{
+	if (m_fuse_targets_captured)
+	{
+		if (m_fuse_cap_rt)
+		{
+			m_fuse_cap_rt->m_rt_alpha_scale = m_fuse_cap_rt_scaled;
+			m_fuse_cap_rt->m_last_draw = m_fuse_cap_rt_last_draw;
+		}
+		if (m_fuse_cap_ds)
+		{
+			m_fuse_cap_ds->m_rt_alpha_scale = m_fuse_cap_ds_scaled;
+			m_fuse_cap_ds->m_last_draw = m_fuse_cap_ds_last_draw;
+		}
+		m_fuse_targets_captured = false;
+	}
+	m_fuse_verify_active = false;
+	// Stock replay per pass: T1 from the entry save (its bytes never moved),
+	// T3/T2 via the copying install. Tails re-run rounding/blits/perfmon/dumps.
+	FuseRestoreLiveT1();
+	DrawRecordTail(m_fuse_saved_serial);
+	InstallHeldTerrainDraw(t3);
+	m_draw_priv = t3.priv;
+	DrawRecordTail(t3.draw_serial);
+	InstallHeldTerrainDraw(t2);
+	m_draw_priv = t2.priv;
+	DrawRecordTail(t2.draw_serial);
+}
+
+void GSRendererHW::FuseDraw()
+{
+	pxAssert(!m_fuse_verify_active);
+	// Live = T1 (installed by ExecDrawRecord; its DrawRecordTail already ran the
+	// scissor/trace/blits/dumps and any ST rounding). The payload member holds
+	// the T3/T2 stashes (the tail consumed the active flag on dispatch).
+	FuseSaveLiveT1();
+	m_fuse_targets_captured = false;
+	m_fuse_cap_rt = nullptr;
+	m_fuse_cap_ds = nullptr;
+	m_quad_check_valid = false;
+	m_quad_check_valid_shuffle = false;
+	m_drawlist.clear();
+	m_drawlist_bbox.clear();
+	const GSBackQueue::DrawNode::FusePassState& t3 = m_fuse_offpath.passes[0];
+	const GSBackQueue::DrawNode::FusePassState& t2 = m_fuse_offpath.passes[1];
+
+	FuseVerifySnapshot s0, s1, s2;
+	bool ok = false;
+	m_fuse_verify_active = true;
+	for (;;)
+	{
+		// T1 verifies from live (no install: live IS T1).
+		if (m_vt.m_eq.z)
+		{
+			FuseCountAbort(FuseAbort::EqZ);
+			break;
+		}
+		if (m_vt.m_accurate_stq && m_vt.m_eq.stq)
+		{
+			FuseCountAbort(FuseAbort::EqSTQ);
+			break;
+		}
+#ifdef PCSX2_DEVBUILD
+		const size_t t1vbytes = sizeof(GSVertex) * m_vertex->tail;
+		const size_t t1ibytes = sizeof(u16) * m_index->tail;
+		std::vector<u8> t1vcopy(t1vbytes), t1icopy(t1ibytes);
+		std::memcpy(t1vcopy.data(), m_vertex->buff, t1vbytes);
+		std::memcpy(t1icopy.data(), m_index->buff, t1ibytes);
+#endif
+		m_fuse_verify_reached_submit = false;
+		Draw();
+		s0.conf = m_conf;
+		s0.reached_submit = m_fuse_verify_reached_submit;
+		s0.using_temp_z = m_using_temp_z;
+		s0.channel_shuffle = m_channel_shuffle;
+		s0.texture_shuffle = !!m_texture_shuffle;
+#ifdef PCSX2_DEVBUILD
+		pxAssertRel(std::memcmp(t1vcopy.data(), m_vertex->buff, t1vbytes) == 0, "TPF1: T1 verify mutated verts");
+		pxAssertRel(std::memcmp(t1icopy.data(), m_index->buff, t1ibytes) == 0, "TPF1: T1 verify mutated indices");
+#endif
+		if (!s0.reached_submit)
+		{
+			FuseCountAbort(FuseAbort::NoSubmit);
+			break;
+		}
+		if (!FuseVerifyPass(1, t3, s1))
+			break;
+		if (!FuseVerifyPass(2, t2, s2))
+			break;
+		if (!FuseSnapshotsCompatible(s0, s1, s2))
+			break;
+		// Stream shape: SetupIA draws m_vertex->next verts; the front asserted
+		// vnext/vtail/itail equality, the snapshots asserted nverts/nindices
+		// equality; guard the assembly reads all the same.
+		const u32 nverts = s2.conf.nverts;
+		if (nverts > m_fuse_saved_vb.tail || nverts > t3.vtail || nverts > t2.vtail ||
+		    s2.conf.nindices > m_fuse_saved_ib.tail || s2.conf.nindices > t3.itail || s2.conf.nindices > t2.itail)
+		{
+			FuseCountAbort(FuseAbort::SharedMismatch);
+			break;
+		}
+		FuseAssembleAndSubmit(s0, s1, s2, m_fuse_saved_vb.buff, t3.verts.data(), t2.verts.data(), nverts,
+			t2.indices.data(), s2.conf.nindices);
+		ok = true;
+		break;
+	}
+	m_fuse_verify_active = false;
+	if (ok)
+	{
+		FuseRestoreLiveT1();
+	}
+	else
+	{
+		FuseSerialFallback(t3, t2);
+	}
 }

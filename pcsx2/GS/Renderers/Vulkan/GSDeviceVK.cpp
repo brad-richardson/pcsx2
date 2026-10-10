@@ -1157,16 +1157,16 @@ bool GSDeviceVK::ProcessDeviceExtensions()
 		m_optional_extensions.vk_ext_attachment_feedback_loop_layout;
 
 	// The rule resolver exempts malisx2 from the Mali avoid at the descriptor count checked below.
-	static_assert(NUM_TFX_TEXTURES == VULKAN_PUSH_DESCRIPTORS_REQUIRED);
+	static_assert(NUM_TFX_TEXTURES + 1 == VULKAN_PUSH_DESCRIPTORS_REQUIRED);
 
 	// Decide whether to bind textures via VK_KHR_push_descriptor. It's optional
 	// now — when it's absent (some Mali, e.g. Mali-G52), unusable, or known-buggy
 	// we fall back to per-frame allocated descriptor sets so Vulkan still runs.
 	m_use_push_descriptors = m_optional_extensions.vk_khr_push_descriptor;
-	if (m_use_push_descriptors && push_descriptor_properties.maxPushDescriptors < NUM_TFX_TEXTURES)
+	if (m_use_push_descriptors && push_descriptor_properties.maxPushDescriptors < VULKAN_PUSH_DESCRIPTORS_REQUIRED)
 	{
 		Console.Warning("VK: maxPushDescriptors (%u) below required (%u) - using descriptor-set fallback.",
-			push_descriptor_properties.maxPushDescriptors, NUM_TFX_TEXTURES);
+			push_descriptor_properties.maxPushDescriptors, VULKAN_PUSH_DESCRIPTORS_REQUIRED);
 		m_use_push_descriptors = false;
 	}
 	// Arm's Mali blob crashes in vkCmdPushDescriptorSetKHR even where it advertises the extension, and
@@ -7155,6 +7155,7 @@ void GSDeviceVK::ClearSamplerCache()
 	m_linear_sampler = GetSampler(GSHWDrawConfig::SamplerSelector::Linear());
 	m_utility_sampler = m_point_sampler;
 	m_tfx_sampler = m_point_sampler;
+	m_tfx_fuse_sampler = m_point_sampler;
 }
 
 static void AddMacro(std::stringstream& ss, const char* name, int value)
@@ -7464,11 +7465,17 @@ bool GSDeviceVK::CreatePipelineLayouts()
 		(m_features.texture_barrier && !UseFeedbackLoopLayout() && IsDeviceMali()) ?
 			VK_DESCRIPTOR_TYPE_INPUT_ATTACHMENT :
 			VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
+	// TPF1: the fused draw samples sources 1/2 through the RT/PRIMID image slots;
+	// an input-attachment RT slot cannot take a sampler, so Mali subpass feedback
+	// opts out (keep this condition identical to the one above).
+	m_features.tfx_fuse3 = (feedback_descriptor_type == VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE);
 	dslb.AddBinding(TFX_TEXTURE_RT, feedback_descriptor_type, 1, VK_SHADER_STAGE_FRAGMENT_BIT);
 	dslb.AddBinding(TFX_TEXTURE_PRIMID, VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, 1, VK_SHADER_STAGE_FRAGMENT_BIT);
 	dslb.AddBinding(TFX_TEXTURE_DEPTH, feedback_descriptor_type, 1, VK_SHADER_STAGE_FRAGMENT_BIT);
 	dslb.AddBinding(TFX_TEXTURE_RT_ROV, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_FRAGMENT_BIT);
 	dslb.AddBinding(TFX_TEXTURE_DEPTH_ROV, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_FRAGMENT_BIT);
+	// TPF1: sampler-only binding for the fused draw's sources 1/2.
+	dslb.AddBinding(TFX_SAMPLER_FUSE, VK_DESCRIPTOR_TYPE_SAMPLER, 1, VK_SHADER_STAGE_FRAGMENT_BIT);
 	if ((m_tfx_texture_ds_layout = dslb.Create(dev)) == VK_NULL_HANDLE)
 		return false;
 	Vulkan::SetObjectName(dev, m_tfx_texture_ds_layout, "TFX texture descriptor layout");
@@ -8877,6 +8884,7 @@ VkShaderModule GSDeviceVK::GetTFXFragmentShader(const GSHWDrawConfig::PSSelector
 	AddMacro(ss, "PS_ANISOTROPIC_FILTERING", sel.sw_aniso);
 	AddMacro(ss, "PS_ROV_COLOR", sel.rov_color);
 	AddMacro(ss, "PS_ROV_DEPTH", static_cast<u32>(sel.rov_depth));
+	AddMacro(ss, "PS_FUSE3", sel.fuse3); // TPF1.
 	ss << m_tfx_source;
 	std::string source = ss.str();
 	source_timer.reset();
@@ -9692,6 +9700,8 @@ void GSDeviceVK::InitializeState()
 
 	m_tfx_sampler_sel = GSHWDrawConfig::SamplerSelector::Point().key;
 	m_tfx_sampler = m_point_sampler;
+	m_tfx_fuse_sampler_sel = GSHWDrawConfig::SamplerSelector::Point().key;
+	m_tfx_fuse_sampler = m_point_sampler;
 
 	InvalidateCachedState();
 	SetInitialState(m_current_command_buffer);
@@ -10068,6 +10078,16 @@ void GSDeviceVK::PSSetSampler(GSHWDrawConfig::SamplerSelector sel)
 	m_dirty_flags |= DIRTY_FLAG_TFX_TEXTURE_0;
 }
 
+void GSDeviceVK::PSSetFuseSampler(GSHWDrawConfig::SamplerSelector sel)
+{
+	if (m_tfx_fuse_sampler_sel == sel.key)
+		return;
+
+	m_tfx_fuse_sampler_sel = sel.key;
+	m_tfx_fuse_sampler = GetSampler(sel);
+	m_dirty_flags |= DIRTY_FLAG_TFX_FUSE_SAMPLER;
+}
+
 void GSDeviceVK::SetUtilityTexture(GSTexture* tex, VkSampler sampler)
 {
 	GSTextureVK* vkTex = static_cast<GSTextureVK*>(tex);
@@ -10431,6 +10451,11 @@ bool GSDeviceVK::ApplyTFXState(bool already_execed)
 			dsub.AddImageDescriptorWrite(ds, TFX_TEXTURE_DEPTH_ROV, m_tfx_textures[TFX_TEXTURE_DEPTH_ROV]->GetView(),
 				m_tfx_textures[TFX_TEXTURE_DEPTH_ROV]->GetVkLayout(), true);
 		}
+		if (flags & DIRTY_FLAG_TFX_FUSE_SAMPLER)
+		{
+			// TPF1: sampler-only binding; always valid (defaults to point).
+			dsub.AddSamplerDescriptorWrite(ds, TFX_SAMPLER_FUSE, m_tfx_fuse_sampler);
+		}
 
 		if (m_use_push_descriptors)
 		{
@@ -10750,6 +10775,15 @@ void GSDeviceVK::DoRenderHW(GSHWDrawConfig& config)
 	}
 	if (config.pal)
 		PSSetShaderResource(TFX_TEXTURE_PALETTE, config.pal, true);
+
+	// TPF1: fused sources 1/2 ride the RT/PRIMID image slots (their draws use
+	// neither: DATE/feedbackloop asserted off) plus the binding-7 sampler.
+	if (config.ps.fuse3)
+	{
+		PSSetShaderResource(TFX_TEXTURE_RT, config.tex_fuse1, true);
+		PSSetShaderResource(TFX_TEXTURE_PRIMID, config.tex_fuse2, true);
+		PSSetFuseSampler(config.sampler_fuse);
+	}
 
 	if (config.blend.constant_enable)
 		SetBlendConstants(config.blend.constant);
@@ -11413,7 +11447,11 @@ void GSDeviceVK::UpdateHWPipelineSelector(GSHWDrawConfig& config, PipelineSelect
 
 void GSDeviceVK::UploadHWDrawVerticesAndIndices(GSHWDrawConfig& config)
 {
-	IASetVertexBuffer(config.verts, sizeof(GSVertex), config.nverts, GetVertexAlignment(config.vs.expand));
+	// TPF1: the fused draw uploads 48-byte vertices (one ST per source).
+	if (config.ps.fuse3)
+		IASetVertexBuffer(config.verts_fuse3, sizeof(GSVertexFuse3), config.nverts, GetVertexAlignment(config.vs.expand));
+	else
+		IASetVertexBuffer(config.verts, sizeof(GSVertex), config.nverts, GetVertexAlignment(config.vs.expand));
 
 	if (config.vs.UseFixedExpandIndexBuffer())
 	{

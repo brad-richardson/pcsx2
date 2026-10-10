@@ -83,6 +83,7 @@ constant bool PS_ABE                [[function_constant(GSMTLConstantIndex_PS_AB
 constant uint PS_SW_ANISO           [[function_constant(GSMTLConstantIndex_PS_SW_ANISO)]];
 constant bool PS_ROV_COLOR          [[function_constant(GSMTLConstantIndex_PS_ROV_COLOR)]];
 constant uint PS_ROV_DEPTH_RAW      [[function_constant(GSMTLConstantIndex_PS_ROV_DEPTH)]];
+constant bool PS_FUSE3              [[function_constant(GSMTLConstantIndex_PS_FUSE3)]];
 
 using GSShader::VSExpand;
 using AFAIL = GSShader::PS_AFAIL;
@@ -162,6 +163,10 @@ struct MainVSOut
 	float inv_cov [[function_constant(VS_COVERAGE)]];
 	uint interior [[function_constant(VS_INTERIOR)]];
 	float point_size [[point_size, function_constant(VS_POINT_SIZE)]];
+	// TPF1: sources 1/2 carry only what the PS reads (t.xy, ti.zw); ti.xy is
+	// dead under FST=0 and Q/fog/color are shared with source 0.
+	float4 fuseA [[function_constant(PS_FUSE3)]]; // xy = t1.xy, zw = ti1.zw
+	float4 fuseB [[function_constant(PS_FUSE3)]]; // xy = t2.xy, zw = ti2.zw
 };
 
 struct MainPSIn
@@ -173,6 +178,8 @@ struct MainPSIn
 	float4 fc [[flat, function_constant(NOT_IIP)]];
 	float inv_cov [[function_constant(PS_COVERAGE)]];
 	uint interior [[function_constant(PS_INTERIOR)]];
+	float4 fuseA [[function_constant(PS_FUSE3)]];
+	float4 fuseB [[function_constant(PS_FUSE3)]];
 };
 
 struct MainResult
@@ -273,6 +280,20 @@ static MainVSIn load_vertex(GSMTLMainVertex base)
 {
 	MainVSIn out;
 	out.st = base.st;
+	out.c = float4(base.rgba);
+	out.q = base.q;
+	out.p = uint2(base.xy);
+	out.z = base.z;
+	out.uv = uint2(base.uv);
+	out.f = float4(static_cast<float>(base.fog) / 255.f);
+	return out;
+}
+
+// TPF1: source-0 input from a 48-byte fused vertex (ST0 + the shared fields).
+static MainVSIn load_vertex_fuse3(GSMTLMainVertexFuse3 base)
+{
+	MainVSIn out;
+	out.st = base.st[0];
 	out.c = float4(base.rgba);
 	out.q = base.q;
 	out.p = uint2(base.xy);
@@ -405,6 +426,23 @@ vertex MainVSOut vs_main_expand(
 	{
 		case VSExpand::None:
 			return vs_main_run(load_vertex(vertices[vid]), cb);
+		case VSExpand::Fuse3:
+		{
+			// TPF1: indexed triangles; vid is the index value (0-based into the
+			// uploaded 48-byte array). Source 0 runs the stock math (vs_main_run);
+			// sources 1/2 carry t.xy + ti.zw in the FST=0 spelling the PS imitates.
+			device const GSMTLMainVertexFuse3* fuseverts = (device const GSMTLMainVertexFuse3*)vertices;
+			GSMTLMainVertexFuse3 fv = fuseverts[vid];
+			MainVSOut out = vs_main_run(load_vertex_fuse3(fv), cb);
+			if (PS_FUSE3)
+			{
+				float2 st1 = fv.st[1] - cb.fuse_tex_scale_offset[0].zw;
+				out.fuseA = float4(st1, st1 / cb.fuse_tex_scale_offset[0].xy);
+				float2 st2 = fv.st[2] - cb.fuse_tex_scale_offset[1].zw;
+				out.fuseB = float4(st2, st2 / cb.fuse_tex_scale_offset[1].xy);
+			}
+			return out;
+		}
 		case VSExpand::Point:
 		{
 			MainVSOut point = vs_main_run(load_vertex(vertices[vid >> 2]), cb);
@@ -583,7 +621,10 @@ struct PSMain
 	depth2d<float> tex_depth;
 	texture2d<float> palette;
 	texture2d<float> prim_id_tex;
+	texture2d<float> fuse1; // TPF1: T3 shadow source (bound only when PS_FUSE3).
+	texture2d<float> fuse2; // TPF1: T2 light source (bound only when PS_FUSE3).
 	sampler tex_sampler;
+	sampler fuse_samp; // TPF1: shared T3/T2 sampler at index 1.
 	float4 current_color;
 	float current_depth;
 	uint prim_id;
@@ -1184,7 +1225,7 @@ struct PSMain
 		// The 0.05f helps to fix the overbloom of sotc
 		// I think the issue is related to the rounding of texture coodinate. The linear (from fixed unit)
 		// interpolation could be slightly below the correct one.
-		
+
 		t = trunc(t * 255.f + 0.05f);
 
 		// A pack texture's opaque alpha, which ASTC moves off 0x80 (GSReplacementAlphaSnap.h).
@@ -1192,6 +1233,290 @@ struct PSMain
 			t.a = 128.f;
 
 		return t;
+	}
+
+	// TPF1: per-source sampling for the fused draw (src 0 = T3 shadow on fuse1,
+	// src 1 = T2 light on fuse2; source 0 runs the stock path above). Each method
+	// mirrors its stock twin with the pass's own constants (fuse_* uniforms) and
+	// runtime mode (fuse_mode/fuse_flags); every branch condition is draw-uniform.
+	// Omitted template bits are back-asserted: pal_fmt=0, region_rect=0, FST=0,
+	// shuffle=0, HLE=0, tex_is_fb=0, rta=0, lod-single.
+	float fuse_manual_lod(uint src, float uv_w)
+	{
+		float4 lp = cb.fuse_lod_params[src];
+		float gs_lod = lp.x - log2(abs(uv_w)) * lp.y;
+		return min(gs_lod, lp.w) - lp.z;
+	}
+
+	float4 fuse_sample_c_af(uint src, texture2d<float> t, float2 uv, float uv_w, uint aniso, uint lodmode)
+	{
+		uv = any(isnan(uv) | isinf(uv)) ? float2(0.0f, 0.0f) : uv;
+		uv = clamp(uv, -8388608.0f, 8388608.0f);
+
+		float2 sz = float2(t.get_width(), t.get_height());
+		float2 dX = dfdx(uv) * sz;
+		float2 dY = dfdy(uv) * sz;
+
+		float length_x = length(dX);
+		float length_y = length(dY);
+
+		bool d_zero = length_x < 0.001f || length_y < 0.001f;
+		float f = (dX.x * dY.y - dX.y * dY.x);
+		bool d_par = f < 0.001f;
+		bool d_per = dot(dX, dY) < 0.001f;
+		bool d_inf_nan = any(isinf(dX) | isinf(dY) | isnan(dX) | isnan(dY));
+
+		if (!(d_zero || d_par || d_per || d_inf_nan))
+		{
+			float A = dX.y * dX.y + dY.y * dY.y;
+			float B = -2 * (dX.x * dX.y + dY.x * dY.y);
+			float C = dX.x * dX.x + dY.x * dY.x;
+			float F = f * f;
+
+			float p = A - C;
+			float q = A + C;
+			float tt = sqrt(p * p + B * B);
+
+			float signB = sign(B);
+			float denom_plus  = tt * (q + tt);
+			float denom_minus = tt * (q - tt);
+
+			float sqrtA = sqrt(F * (tt + p));
+			float sqrtB = sqrt(F * (tt - p));
+
+			float inv_sqrt_denom_plus  = rsqrt(denom_plus);
+			float inv_sqrt_denom_minus = rsqrt(denom_minus);
+
+			float2 new_dX = float2(
+				sqrtA * inv_sqrt_denom_plus,
+				sqrtB * inv_sqrt_denom_plus * signB
+			);
+
+			float2 new_dY = float2(
+				sqrtB * inv_sqrt_denom_minus * -signB,
+				sqrtA * inv_sqrt_denom_minus
+			);
+
+			d_inf_nan = any(isinf(new_dX) | isinf(new_dY) | isnan(new_dX) | isnan(new_dY));
+			if (!d_inf_nan)
+			{
+				dX = new_dX;
+				dY = new_dY;
+				length_x = length(dX);
+				length_y = length(dY);
+			}
+		}
+
+		bool is_major_x = length_x > length_y;
+		float length_major = is_major_x ? length_x : length_y;
+		float length_minor = is_major_x ? length_y : length_x;
+
+		float aniso_ratio;
+		float length_lod;
+		float2 aniso_line;
+		if (length_major <= 1.0f)
+		{
+			aniso_ratio = 1.0f;
+			length_lod = length_major;
+			aniso_line = float2(0.0f, 0.0f);
+		}
+		else
+		{
+			float2 aniso_line_dir = is_major_x ? dX : dY;
+
+			aniso_ratio = min(length_major / length_minor, float(aniso));
+			length_lod = length_major / aniso_ratio;
+
+			if (length_lod < 1.0f)
+				aniso_ratio = max(1.0f, aniso_ratio * length_lod);
+
+			aniso_ratio = round(aniso_ratio);
+
+			aniso_line = aniso_line_dir * 0.5f * (1.0f / sz);
+		}
+
+		float lod = (lodmode == 1) ? log2(length_lod) : (lodmode == 2) ? fuse_manual_lod(src, uv_w) : 0.0f;
+
+		float4 colour;
+		if (aniso_ratio == 1.0f)
+		{
+			colour = t.sample(fuse_samp, uv, level(lod));
+		}
+		else
+		{
+			float4 num = float4(0.0f, 0.0f, 0.0f, 0.0f);
+			float2 segment = (2.0f * aniso_line) / aniso_ratio;
+			for (int i = 0; i < aniso_ratio; i++)
+			{
+				float2 d = -aniso_line + (0.5f + i) * segment;
+				float2 uv_sample = uv + d;
+				float4 sample_colour = t.sample(fuse_samp, uv_sample, level(lod));
+				num += sample_colour;
+			}
+
+			colour = num / aniso_ratio;
+		}
+		return colour;
+	}
+
+	float4 fuse_sample_c(uint src, texture2d<float> t, float2 uv)
+	{
+		uint flags = uint(cb.fuse_flags[src].x);
+		bool adjs = ((flags >> 5) & 1) != 0;
+		bool adjt = ((flags >> 6) & 1) != 0;
+		float2 stscale = cb.fuse_stscale_tco[src].xy;
+		float4 str = cb.fuse_st_range[src];
+
+		if (!adjs && !adjt)
+		{
+			uv *= stscale;
+		}
+		else
+		{
+			if (adjs)
+				uv.x = (uv.x - str.x) * str.z;
+			else
+				uv.x = uv.x * stscale.x;
+			if (adjt)
+				uv.y = (uv.y - str.y) * str.w;
+			else
+				uv.y = uv.y * stscale.y;
+		}
+
+		uint aniso = (flags >> 7) & 31;
+		uint lodmode = uint(cb.fuse_mode[src].w);
+		if (aniso > 1)
+			return fuse_sample_c_af(src, t, uv, in.t.w, aniso, lodmode);
+		else if (lodmode == 1)
+			return t.sample(fuse_samp, uv);
+		else if (lodmode == 2)
+			return t.sample(fuse_samp, uv, level(fuse_manual_lod(src, in.t.w)));
+		else
+			return t.sample(fuse_samp, uv, level(0));
+	}
+
+	float4 fuse_clamp_wrap_uv(uint src, float4 uv)
+	{
+		uint wms = uint(cb.fuse_mode[src].x);
+		uint wmt = uint(cb.fuse_mode[src].y);
+		float4 tex_size = cb.fuse_wh[src].xyxy;
+		float4 mm = cb.fuse_min_max[src];
+		uint4 msk = as_type<uint4>(mm);
+
+		// FST=0 asserted: the mask path always wraps negatives first.
+		if (wms == wmt)
+		{
+			if (wms == 2)
+			{
+				uv = clamp(uv, mm.xyxy, mm.zwzw);
+			}
+			else if (wms == 3)
+			{
+				uv = fract(uv);
+				uv = float4((ushort4(uv * tex_size) & ushort4(msk.xyxy)) | ushort4(msk.zwzw)) / tex_size;
+			}
+		}
+		else
+		{
+			if (wms == 2)
+			{
+				uv.xz = clamp(uv.xz, mm.xx, mm.zz);
+			}
+			else if (wms == 3)
+			{
+				uv.xz = fract(uv.xz);
+				uv.xz = float2((ushort2(uv.xz * tex_size.xx) & ushort2(msk.xx)) | ushort2(msk.zz)) / tex_size.xx;
+			}
+
+			if (wmt == 2)
+			{
+				uv.yw = clamp(uv.yw, mm.yy, mm.ww);
+			}
+			else if (wmt == 3)
+			{
+				uv.yw = fract(uv.yw);
+				uv.yw = float2((ushort2(uv.yw * tex_size.yy) & ushort2(msk.yy)) | ushort2(msk.ww)) / tex_size.yy;
+			}
+		}
+
+		return uv;
+	}
+
+	float4 fuse_sample_color(uint src, float2 st)
+	{
+		texture2d<float> t = src == 0 ? fuse1 : fuse2;
+		if (PS_TCOFFSETHACK)
+			st += cb.fuse_stscale_tco[src].zw;
+
+		float4 Tx;
+		float4x4 c;
+		float2 dd;
+
+		uint ltf = uint(cb.fuse_mode[src].z);
+		uint flags = uint(cb.fuse_flags[src].x);
+		uint aem_fmt = flags & 3;
+		bool aem = ((flags >> 4) & 1) != 0;
+		uint wms = uint(cb.fuse_mode[src].x);
+		uint wmt = uint(cb.fuse_mode[src].y);
+		float2 ta = cb.fuse_ta[src].xy;
+
+		if (ltf == 0 && aem_fmt == FMT_32 && wms < 2 && wmt < 2)
+		{
+			c[0] = fuse_sample_c(src, t, st);
+		}
+		else
+		{
+			float4 uv;
+			if (ltf != 0)
+			{
+				uv = st.xyxy + cb.fuse_half_texel[src];
+				dd = fract(uv.xy * cb.fuse_wh[src].zw);
+				dd = saturate(dd); // FST=0 asserted (stock clamps, never wraps)
+			}
+			else
+			{
+				uv = st.xyxy;
+			}
+
+			uv = fuse_clamp_wrap_uv(src, uv);
+
+			// pal_fmt=0 asserted: never sample_4p.
+			c[0] = fuse_sample_c(src, t, uv.xy);
+			c[1] = fuse_sample_c(src, t, uv.zy);
+			c[2] = fuse_sample_c(src, t, uv.xw);
+			c[3] = fuse_sample_c(src, t, uv.zw);
+		}
+
+		for (int i = 0; i < 4; i++)
+		{
+			if (aem_fmt == FMT_24)
+				c[i].a = !aem || any(c[i].rgb != 0) ? ta.x : 0.f;
+			else if (aem_fmt == FMT_16)
+				c[i].a = c[i].a >= 0.5 ? ta.y : !aem || any((int3(c[i].rgb * 255.0f) & 0xF8) != 0) ? ta.x : 0.f;
+		}
+
+		if (ltf != 0)
+			Tx = mix(mix(c[0], c[1], dd.x), mix(c[2], c[3], dd.x), dd.y);
+		else
+			Tx = c[0];
+
+		// RTA_SRC_CORRECTION=0 asserted: no 128.5/255 rescale.
+		Tx = trunc(Tx * 255.f + 0.05f);
+		if ((((flags >> 12) & 1) != 0) && abs(Tx.a - 128.f) <= 8.f)
+			Tx.a = 128.f;
+
+		return Tx;
+	}
+
+	// Stock T3/T2 post-blend clamp (their SW_BLEND is true by the pinned (1,0,0,2)/
+	// (0,2,1,1) primaries; the fused draw's own SW_BLEND is false so its tail takes
+	// the elif). Asserts: dither=0, mix=0, round_inv=0, colclip=0/0 on T3/T2.
+	float3 fuse3_clamp(float3 C)
+	{
+		C = clamp(C, 0.f, 255.f);
+		if (PS_DST_FMT == FMT_16)
+			C = float3(short3(C) & 0xF8);
+		return C;
 	}
 
 	float4 tfx(float4 T, float4 C)
@@ -1751,6 +2076,28 @@ struct PSMain
 		// Color clamp/wrap needs to be done after sw blending and dithering
 		ps_color_clamp_wrap(C);
 
+		// TPF1: chain T3 (shadow) and T2 (light) over the T1 base in C. C.rgb/C.a
+		// are T1-post (REPLACE + T1's own clamp above); the staged intermediates are
+		// what stock's per-pass device round-trips carried (integral + the same
+		// clamp, so no quantize gap). Asserts pin the pure-SW template per pass:
+		// T3 (1,0,0,2)/hw0/mix0/devoff, T2 (0,2,1,1)/hw0/mix0/devoff, colormasks
+		// 0xF/0x7/0x7 (alpha stays T1's), FST=0. Formula spellings mirror stock's
+		// trunc((A - B) * C + D) exactly (same contraction shape).
+		if (PS_FUSE3)
+		{
+			float3 c1 = C.rgb;
+			float a1 = C.a;
+			float2 st1 = in.fuseA.xy / in.t.w;
+			float4 C3 = tfx(fuse_sample_color(0, st1), IIP ? in.c : in.fc);
+			float As3 = C3.a / 128.f;
+			float3 c2 = fuse3_clamp(trunc((c1 - C3.rgb) * As3 + float3(0.f)));
+			float2 st2 = in.fuseB.xy / in.t.w;
+			float4 C2 = tfx(fuse_sample_color(1, st2), IIP ? in.c : in.fc);
+			float Ad = a1 / 128.f;
+			C.rgb = fuse3_clamp(trunc((C2.rgb - float3(0.f)) * Ad + c2));
+			C.a = a1;
+		}
+
 		ps_fbmask(C);
 
 		// Use alpha blend factor to determine whether to update A.
@@ -1812,6 +2159,7 @@ fragment MainPSOut ps_main(
 	MainPSIn in [[stage_in]],
 	constant GSMTLMainPSUniform& cb [[buffer(GSMTLBufferIndexHWUniforms)]],
 	sampler s [[sampler(0)]],
+	sampler fuse_samp [[sampler(1), function_constant(PS_FUSE3)]],
 #if PRIMID_SUPPORT
 	uint primid [[primitive_id, function_constant(NEEDS_PRIMID)]],
 #endif
@@ -1822,6 +2170,8 @@ fragment MainPSOut ps_main(
 	texture2d<float> tex       [[texture(GSMTLTextureIndexTex),          function_constant(PS_TEX_IS_COLOR)]],
 	depth2d<float>   depth     [[texture(GSMTLTextureIndexTex),          function_constant(PS_TEX_IS_DEPTH)]],
 	texture2d<float> palette   [[texture(GSMTLTextureIndexPalette),      function_constant(PS_HAS_PALETTE)]],
+	texture2d<float> fuse1     [[texture(GSMTLTextureIndexFuse1),        function_constant(PS_FUSE3)]],
+	texture2d<float> fuse2     [[texture(GSMTLTextureIndexFuse2),        function_constant(PS_FUSE3)]],
 	texture2d<float> rt        [[texture(GSMTLTextureIndexRenderTarget), function_constant(NEEDS_RT_TEX)]],
 	texture2d<float> primidtex [[texture(GSMTLTextureIndexPrimIDs),      function_constant(PS_PRIM_CHECKING_READ)]],
 	texture2d<float> ds_tex    [[texture(GSMTLTextureIndexDepthTarget),  function_constant(NEEDS_DS_TEX)]],
@@ -1838,6 +2188,12 @@ fragment MainPSOut ps_main(
 		main.tex_depth = depth;
 	if (PS_HAS_PALETTE)
 		main.palette = palette;
+	if (PS_FUSE3)
+	{
+		main.fuse1 = fuse1;
+		main.fuse2 = fuse2;
+		main.fuse_samp = fuse_samp;
+	}
 	if (PS_PRIM_CHECKING_READ)
 		main.prim_id_tex = primidtex;
 #if PRIMID_SUPPORT

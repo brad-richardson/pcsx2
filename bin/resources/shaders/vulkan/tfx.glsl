@@ -14,6 +14,7 @@
 #define VS_EXPAND_SPRITE 3
 #define VS_EXPAND_LINE_AA1 4
 #define VS_EXPAND_TRIANGLE_AA1 5
+#define VS_EXPAND_FUSE3 6
 #endif
 
 layout(std140, set = 0, binding = 0) uniform cb0
@@ -25,6 +26,9 @@ layout(std140, set = 0, binding = 0) uniform cb0
 	vec2 PointSize;
 	uint MaxDepth;
 	float LineAA1Width;
+	// TPF1 VS_FUSE3: texture_scale/texture_offset for sources 1/2 (xy = scale,
+	// zw = offset). Order must match VSConstantBuffer exactly.
+	vec4 FuseTexScaleOffset[2];
 };
 
 layout(location = 0) out VSOutput
@@ -40,6 +44,12 @@ layout(location = 0) out VSOutput
 
 	float inv_cov; // We use the inverse to make it simpler to interpolate.
 	flat uint interior; // 1 for triangle interior; 0 for edge;
+#if VS_EXPAND == VS_EXPAND_FUSE3
+	// TPF1: sources 1/2 carry only what the PS reads (t.xy, ti.zw); ti.xy is
+	// dead under FST=0 and Q/fog/color are shared with source 0.
+	vec4 fuseA; // xy = t1.xy, zw = ti1.zw
+	vec4 fuseB; // xy = t2.xy, zw = ti2.zw
+#endif
 } vsOut;
 
 #if VS_EXPAND == VS_EXPAND_NONE
@@ -121,6 +131,20 @@ struct RawVertex
 	uint FOG;
 };
 
+// TPF1: one ST pair per source pass plus the shared fields (48 bytes).
+struct RawVertexFuse3
+{
+	vec2 ST0;
+	vec2 ST1;
+	vec2 ST2;
+	uint RGBA;
+	float Q;
+	uint XY;
+	uint Z;
+	uint UV;
+	uint FOG;
+};
+
 layout(push_constant) uniform cb2
 {
 	uint BaseVertex;
@@ -130,7 +154,11 @@ layout(push_constant) uniform cb2
 };
 
 layout(std140, set = 0, binding = 2) readonly buffer VertexBuffer {
+#if VS_EXPAND == VS_EXPAND_FUSE3
+	RawVertexFuse3 vertex_buffer[];
+#else
 	RawVertex vertex_buffer[];
+#endif
 };
 
 // Warning: use std430 instead of std140 so that the ints are tightly packed.
@@ -203,6 +231,53 @@ ProcessedVertex load_vertex(uint index)
 
 	return vtx;
 }
+
+#if VS_EXPAND == VS_EXPAND_FUSE3
+// TPF1: same ops as load_vertex, once per source ST (same expression spelling,
+// so the driver contracts identically). ti.xy is dead under FST=0 and is not
+// carried for sources 1/2; Q/fog/color are shared with source 0.
+ProcessedVertex load_vertex_fuse3(uint index, out vec4 fuseA, out vec4 fuseB)
+{
+	RawVertexFuse3 rvtx = vertex_buffer[BaseVertex + index];
+
+	vec2 a_st = rvtx.ST0;
+	uvec4 a_c = uvec4(bitfieldExtract(rvtx.RGBA, 0, 8), bitfieldExtract(rvtx.RGBA, 8, 8),
+	                  bitfieldExtract(rvtx.RGBA, 16, 8), bitfieldExtract(rvtx.RGBA, 24, 8));
+	float a_q = rvtx.Q;
+	uvec2 a_p = uvec2(bitfieldExtract(rvtx.XY, 0, 16), bitfieldExtract(rvtx.XY, 16, 16));
+	uint a_z = rvtx.Z;
+	uvec2 a_uv = uvec2(bitfieldExtract(rvtx.UV, 0, 16), bitfieldExtract(rvtx.UV, 16, 16));
+	vec4 a_f = unpackUnorm4x8(rvtx.FOG);
+
+	ProcessedVertex vtx;
+
+	uint z = min(a_z, MaxDepth);
+	vtx.p = vec4(a_p, float(z), 1.0f) - vec4(0.05f, 0.05f, 0, 0);
+	vtx.p.xy = vtx.p.xy * vec2(VertexScale.x, -VertexScale.y) - vec2(VertexOffset.x, -VertexOffset.y);
+	vtx.p.z *= exp2(-32.0f);
+	vtx.p.y = -vtx.p.y;
+
+	vec2 uv = a_uv - TextureOffset;
+	vec2 st = a_st - TextureOffset;
+	vtx.ti.xy = uv * TextureScale;
+	vtx.ti.zw = st / TextureScale;
+	vtx.t.xy = st;
+	vtx.t.w = a_q;
+
+	vec2 st1 = rvtx.ST1 - FuseTexScaleOffset[0].zw;
+	fuseA.xy = st1;
+	fuseA.zw = st1 / FuseTexScaleOffset[0].xy;
+
+	vec2 st2 = rvtx.ST2 - FuseTexScaleOffset[1].zw;
+	fuseB.xy = st2;
+	fuseB.zw = st2 / FuseTexScaleOffset[1].xy;
+
+	vtx.c = a_c;
+	vtx.t.z = a_f.r;
+
+	return vtx;
+}
+#endif
 
 // Convert XY from NDC to GS pixel coordinates (i.e. 1.0 = 1 GS pixel).
 vec2 get_xy_unscaled(vec2 xy)
@@ -313,7 +388,16 @@ void main()
 	ProcessedVertex vtx;
 	uint vid = uint(gl_VertexIndex);
 
-#if VS_EXPAND == VS_EXPAND_POINT
+#if VS_EXPAND == VS_EXPAND_FUSE3
+
+	// TPF1: indexed triangles; gl_VertexIndex is the index value (0-based into
+	// the uploaded 48-byte array), exactly like the stock triangle path.
+	vec4 fuseA, fuseB;
+	vtx = load_vertex_fuse3(vid, fuseA, fuseB);
+	vsOut.fuseA = fuseA;
+	vsOut.fuseB = fuseB;
+
+#elif VS_EXPAND == VS_EXPAND_POINT
 
 	vtx = load_vertex(vid >> 2);
 
@@ -604,6 +688,7 @@ void main()
 #define PS_ROV_COLOR 0
 #define PS_ROV_DEPTH 0
 #define PS_STENCIL_COUNTER 0
+#define PS_FUSE3 0
 #endif
 
 #define SW_BLEND (PS_BLEND_A || PS_BLEND_B || PS_BLEND_D)
@@ -653,6 +738,19 @@ layout(std140, set = 0, binding = 1) uniform cb1
 	uint SubstituteAlphaValue;
 	uint DitherPhase;
 	vec4 NativeTexelGrid;
+	// TPF1 PS_FUSE3 per-source texture constants (sources 1/2; source 0 uses the
+	// shared fields above). Order must match PSConstantBuffer exactly.
+	vec4 FuseWH[2];
+	vec4 FuseTA[2];
+	vec4 FuseHalfTexel[2];
+	vec4 FuseMinMax[2];
+	vec4 FuseLODParams[2];
+	vec4 FuseSTRange[2];
+	vec4 FuseSTScaleTCO[2];
+	vec4 FuseScaleXY[2];
+	ivec4 FuseMode[2];
+	ivec4 FuseFlags[2];
+	ivec4 FuseBlend[2];
 };
 
 layout(location = 0) in VSOutput
@@ -666,6 +764,10 @@ layout(location = 0) in VSOutput
 	#endif
 	float inv_cov; // We use the inverse to make it simpler to interpolate.
 	flat uint interior; // 1 for triangle interior; 0 for edge;
+#if PS_FUSE3
+	vec4 fuseA;
+	vec4 fuseB;
+#endif
 } vsIn;
 
 #if PS_RETURN_COLOR
@@ -694,6 +796,14 @@ layout(location = 0) in VSOutput
 #if NEEDS_TEX
 layout(set = 1, binding = 0) uniform sampler2D Texture;
 layout(set = 1, binding = 1) uniform texture2D Palette;
+#endif
+
+#if PS_FUSE3
+// TPF1: fused sources 1/2 (their draws use neither slot: DATE/feedbackloop
+// asserted off, so no RtSampler/PrimMinTexture is declared).
+layout(set = 1, binding = 2) uniform texture2D FuseTex1;
+layout(set = 1, binding = 3) uniform texture2D FuseTex2;
+layout(set = 1, binding = 7) uniform sampler FuseSamp;
 #endif
 
 #if PS_FEEDBACK_LOOP_IS_NEEDED_RT || PS_FEEDBACK_LOOP_IS_NEEDED_DEPTH
@@ -1363,6 +1473,281 @@ vec4 sample_color(vec2 st)
 	return t;
 }
 
+#if PS_FUSE3
+// TPF1: per-source sampling for the fused draw (src 0 = T3 shadow on FuseTex1,
+// src 1 = T2 light on FuseTex2; source 0 runs the stock path above). Each
+// function mirrors its stock twin with the pass's own constants (Fuse* UBO)
+// and runtime mode (FuseMode/FuseFlags); every branch condition is draw-uniform.
+// Omitted template bits are back-asserted: pal_fmt=0, region_rect=0, FST=0,
+// shuffle=0, HLE=0, tex_is_fb=0, rta=0, lod-single.
+float fuse_manual_lod(int src, float uv_w)
+{
+	vec4 lp = FuseLODParams[src];
+	float gs_lod = lp.x - log2(abs(uv_w)) * lp.y;
+	return min(gs_lod, lp.w) - lp.z;
+}
+
+vec4 fuse_sample_c_af(int src, texture2D t, vec2 uv, float uv_w, int aniso, int lodmode)
+{
+	uv = (any(isnan(uv)) || any(isinf(uv))) ? vec2(0.0f, 0.0f) : uv;
+	uv = clamp(uv, -8388608.0f, 8388608.0f);
+
+	vec2 sz = textureSize(t, 0);
+	vec2 dX = dFdx(uv) * sz;
+	vec2 dY = dFdy(uv) * sz;
+
+	float length_x = length(dX);
+	float length_y = length(dY);
+
+	bool d_zero = length_x < 0.001f || length_y < 0.001f;
+	float f = (dX.x * dY.y - dX.y * dY.x);
+	bool d_par = f < 0.001f;
+	bool d_per = dot(dX, dY) < 0.001f;
+	bool d_inf_nan = any(isinf(dX)) || any(isinf(dY)) || any(isnan(dX)) || any(isnan(dY));
+
+	if (!(d_zero || d_par || d_per || d_inf_nan))
+	{
+		float A = dX.y * dX.y + dY.y * dY.y;
+		float B = -2 * (dX.x * dX.y + dY.x * dY.y);
+		float C = dX.x * dX.x + dY.x * dY.x;
+		float F = f * f;
+
+		float p = A - C;
+		float q = A + C;
+		float tt = sqrt(p * p + B * B);
+
+		float signB = sign(B);
+		float denom_plus  = tt * (q + tt);
+		float denom_minus = tt * (q - tt);
+
+		float sqrtA = sqrt(F * (tt + p));
+		float sqrtB = sqrt(F * (tt - p));
+
+		float inv_sqrt_denom_plus  = inversesqrt(denom_plus);
+		float inv_sqrt_denom_minus = inversesqrt(denom_minus);
+
+		vec2 new_dX = vec2(
+			sqrtA * inv_sqrt_denom_plus,
+			sqrtB * inv_sqrt_denom_plus * signB
+		);
+
+		vec2 new_dY = vec2(
+			sqrtB * inv_sqrt_denom_minus * -signB,
+			sqrtA * inv_sqrt_denom_minus
+		);
+
+		d_inf_nan = any(isinf(new_dX)) || any(isinf(new_dY)) || any(isnan(new_dX)) || any(isnan(new_dY));
+		if (!d_inf_nan)
+		{
+			dX = new_dX;
+			dY = new_dY;
+			length_x = length(dX);
+			length_y = length(dY);
+		}
+	}
+
+	bool is_major_x = length_x > length_y;
+	float length_major = is_major_x ? length_x : length_y;
+	float length_minor = is_major_x ? length_y : length_x;
+
+	float aniso_ratio;
+	float length_lod;
+	vec2 aniso_line;
+	if (length_major <= 1.0f)
+	{
+		aniso_ratio = 1.0f;
+		length_lod = length_major;
+		aniso_line = vec2(0.0f, 0.0f);
+	}
+	else
+	{
+		vec2 aniso_line_dir = is_major_x ? dX : dY;
+
+		aniso_ratio = min(length_major / length_minor, float(aniso));
+		length_lod = length_major / aniso_ratio;
+
+		if (length_lod < 1.0f)
+			aniso_ratio = max(1.0f, aniso_ratio * length_lod);
+
+		aniso_ratio = round(aniso_ratio);
+
+		aniso_line = aniso_line_dir * 0.5f * (1.0f / sz);
+	}
+
+	float lod = (lodmode == 1) ? log2(length_lod) : (lodmode == 2) ? fuse_manual_lod(src, uv_w) : 0.0f;
+
+	vec4 colour;
+	if (aniso_ratio == 1.0f)
+		colour = textureLod(sampler2D(t, FuseSamp), uv, lod);
+	else
+	{
+		vec4 num = vec4(0.0f, 0.0f, 0.0f, 0.0f);
+		vec2 segment = (2.0f * aniso_line) / aniso_ratio;
+		for (int i = 0; i < aniso_ratio; i++)
+		{
+			vec2 d = -aniso_line + (0.5f + i) * segment;
+			vec2 uv_sample = uv + d;
+			vec4 sample_colour = textureLod(sampler2D(t, FuseSamp), uv_sample, lod);
+			num += sample_colour;
+		}
+
+		colour = num / aniso_ratio;
+	}
+	return colour;
+}
+
+vec4 fuse_sample_c(int src, texture2D t, vec2 uv)
+{
+	int flags = FuseFlags[src].x;
+	int adjs = (flags >> 5) & 1;
+	int adjt = (flags >> 6) & 1;
+	vec2 stscale = FuseSTScaleTCO[src].xy;
+	vec4 str = FuseSTRange[src];
+
+	if (adjs == 0 && adjt == 0)
+		uv *= stscale;
+	else
+	{
+		if (adjs != 0)
+			uv.x = (uv.x - str.x) * str.z;
+		else
+			uv.x = uv.x * stscale.x;
+		if (adjt != 0)
+			uv.y = (uv.y - str.y) * str.w;
+		else
+			uv.y = uv.y * stscale.y;
+	}
+
+	int aniso = (flags >> 7) & 31;
+	int lodmode = FuseMode[src].w;
+	if (aniso > 1)
+		return fuse_sample_c_af(src, t, uv, vsIn.t.w, aniso, lodmode);
+	else if (lodmode == 1)
+		return texture(sampler2D(t, FuseSamp), uv);
+	else if (lodmode == 2)
+		return textureLod(sampler2D(t, FuseSamp), uv, fuse_manual_lod(src, vsIn.t.w));
+	else
+		return textureLod(sampler2D(t, FuseSamp), uv, 0);
+}
+
+vec4 fuse_clamp_wrap_uv(int src, vec4 uv)
+{
+	int wms = FuseMode[src].x;
+	int wmt = FuseMode[src].y;
+	vec4 tex_size = FuseWH[src].xyxy;
+	vec4 mm = FuseMinMax[src];
+
+	// FST=0 asserted: the mask path always wraps negatives first.
+	if (wms == wmt)
+	{
+		if (wms == 2)
+			uv = clamp(uv, mm.xyxy, mm.zwzw);
+		else if (wms == 3)
+		{
+			uv = fract(uv);
+			uv = vec4(gpu_bitwise_and(uvec4(uv * tex_size), floatBitsToUint(mm.xyxy)) | floatBitsToUint(mm.zwzw)) / tex_size;
+		}
+	}
+	else
+	{
+		if (wms == 2)
+			uv.xz = clamp(uv.xz, mm.xx, mm.zz);
+		else if (wms == 3)
+		{
+			uv.xz = fract(uv.xz);
+			uv.xz = vec2(gpu_bitwise_and(uvec2(uv.xz * tex_size.xx), floatBitsToUint(mm.xx)) | floatBitsToUint(mm.zz)) / tex_size.xx;
+		}
+		if (wmt == 2)
+			uv.yw = clamp(uv.yw, mm.yy, mm.ww);
+		else if (wmt == 3)
+		{
+			uv.yw = fract(uv.yw);
+			uv.yw = vec2(gpu_bitwise_and(uvec2(uv.yw * tex_size.yy), floatBitsToUint(mm.yy)) | floatBitsToUint(mm.ww)) / tex_size.yy;
+		}
+	}
+
+	return uv;
+}
+
+vec4 fuse_sample_color(int src, texture2D t, vec2 st)
+{
+#if PS_TCOFFSETHACK
+	st += FuseSTScaleTCO[src].zw;
+#endif
+
+	vec4 Tx;
+	mat4 c;
+	vec2 dd;
+
+	int ltf = FuseMode[src].z;
+	int flags = FuseFlags[src].x;
+	int aem_fmt = flags & 3;
+	int aem = (flags >> 4) & 1;
+	int wms = FuseMode[src].x;
+	int wmt = FuseMode[src].y;
+	vec2 ta = FuseTA[src].xy;
+
+	if (ltf == 0 && aem_fmt == FMT_32 && wms < 2 && wmt < 2)
+	{
+		c[0] = fuse_sample_c(src, t, st);
+	}
+	else
+	{
+		vec4 uv;
+
+		if (ltf != 0)
+		{
+			uv = st.xyxy + FuseHalfTexel[src];
+			dd = fract(uv.xy * FuseWH[src].zw);
+			dd = clamp(dd, vec2(0.0f), vec2(0.9999999f)); // FST=0 asserted
+		}
+		else
+		{
+			uv = st.xyxy;
+		}
+
+		uv = fuse_clamp_wrap_uv(src, uv);
+
+		// pal_fmt=0 asserted: never sample_4p.
+		c[0] = fuse_sample_c(src, t, uv.xy);
+		c[1] = fuse_sample_c(src, t, uv.zy);
+		c[2] = fuse_sample_c(src, t, uv.xw);
+		c[3] = fuse_sample_c(src, t, uv.zw);
+	}
+
+	for (uint i = 0; i < 4; i++)
+	{
+		if (aem_fmt == FMT_24)
+			c[i].a = (aem == 0 || any(bvec3(c[i].rgb))) ? ta.x : 0.0f;
+		else if (aem_fmt == FMT_16)
+			c[i].a = (c[i].a >= 0.5) ? ta.y : ((aem == 0 || any(bvec3(gpu_bitwise_and(ivec3(c[i].rgb * 255.0f), ivec3(0xF8))))) ? ta.x : 0.0f);
+	}
+
+	if (ltf != 0)
+		Tx = mix(mix(c[0], c[1], dd.x), mix(c[2], c[3], dd.x), dd.y);
+	else
+		Tx = c[0];
+
+	// RTA_SRC_CORRECTION=0 asserted: no 128.5/255 rescale.
+	Tx = trunc(Tx * 255.0f + 0.05f);
+	if ((((flags >> 12) & 1) != 0) && abs(Tx.a - 128.0f) <= 8.0f)
+		Tx.a = 128.0f;
+	return Tx;
+}
+
+// Stock T3/T2 post-blend clamp (their SW_BLEND is true by the pinned (1,0,0,2)/
+// (0,2,1,1) primaries; the fused draw's own SW_BLEND is false so its tail takes
+// the elif). Asserts: dither=0, mix=0, round_inv=0, colclip=0/0 on T3/T2.
+vec3 fuse3_clamp(vec3 C)
+{
+	C = clamp(C, vec3(0.0f), vec3(255.0f));
+#if PS_DST_FMT == FMT_16
+	C = vec3(gpu_bitwise_and(ivec3(C), ivec3(0xF8)));
+#endif
+	return C;
+}
+#endif // PS_FUSE3
+
 #endif // NEEDS_TEX
 
 vec4 tfx(vec4 T, vec4 C)
@@ -2030,6 +2415,29 @@ void main()
 
 	// Color clamp/wrap needs to be done after sw blending and dithering
 	ps_color_clamp_wrap(C.rgb);
+
+#if PS_FUSE3
+	// TPF1: chain T3 (shadow) and T2 (light) over the T1 base in C. C.rgb/C.a
+	// are T1-post (REPLACE + T1's own clamp above); the staged intermediates are
+	// what stock's per-pass device round-trips carried (integral + the same
+	// clamp, so no quantize gap). Asserts pin the pure-SW template per pass:
+	// T3 (1,0,0,2)/hw0/mix0/devoff, T2 (0,2,1,1)/hw0/mix0/devoff, colormasks
+	// 0xF/0x7/0x7 (alpha stays T1's), FST=0. Formula spellings mirror stock's
+	// trunc((A - B) * C + D) exactly (same contraction shape).
+	{
+		vec3 c1 = C.rgb;
+		float a1 = C.a;
+		vec2 st1 = vsIn.fuseA.xy / vsIn.t.w;
+		vec4 C3 = tfx(fuse_sample_color(0, FuseTex1, st1), vsIn.c);
+		float As3 = C3.a / 128.0f;
+		vec3 c2 = fuse3_clamp(trunc((c1 - C3.rgb) * As3 + vec3(0.0f)));
+		vec2 st2 = vsIn.fuseB.xy / vsIn.t.w;
+		vec4 C2 = tfx(fuse_sample_color(1, FuseTex2, st2), vsIn.c);
+		float Ad = a1 / 128.0f;
+		C.rgb = fuse3_clamp(trunc((C2.rgb - vec3(0.0f)) * Ad + c2));
+		C.a = a1;
+	}
+#endif
 
 	ps_fbmask(C);
 

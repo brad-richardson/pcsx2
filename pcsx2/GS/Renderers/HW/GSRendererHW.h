@@ -540,4 +540,85 @@ public:
 
 	/// Does the current draw allow using AA1 coverage (if AA1 is enabled).
 	bool IsCoverageAlphaSupported() override;
+
+	// TPF1 terrain pass-fusion (GE1_TERRAIN_FUSE=1, Vulkan/Metal only). The front
+	// withholds T1+T3 and stages (T3,T2) in m_fuse_offpath; the back lands T1 live
+	// and DrawRecordTail dispatches here instead of Draw(). Runs stock Draw() per
+	// pass with submit suppressed (RenderHW/row/dump gated by m_fuse_verify_active),
+	// snapshots each pass's m_conf, asserts the fused template (blend primaries, no
+	// RT-reading roads, no scaling, equal shared state), then submits one fused draw
+	// (PS_FUSE3/VSExpand::Fuse3) that chains the three stock blends in-shader with
+	// an emulated intermediate round. Any surprise aborts to a serial replay that is
+	// stock DrawRecordTail per pass, after restoring the two cache fields a verify
+	// can move non-idempotently (rt/ds m_last_draw, rt m_rt_alpha_scale).
+	bool SupportsTerrainFuse() const override { return true; }
+	void FuseDraw() override;
+
+	/// Post-Draw() snapshot of one verify pass (m_conf is plain data + stable
+	/// member pointers, so a struct copy suffices).
+	struct FuseVerifySnapshot
+	{
+		GSHWDrawConfig conf = {};
+		bool reached_submit = false;
+		bool using_temp_z = false;
+		bool channel_shuffle = false;
+		bool texture_shuffle = false;
+	};
+
+	/// Runs stock Draw() for one stashed pass (zero-copy: vertex/index buffers are
+	/// pointer-assigned, never copied; Draw() provably does not mutate them under
+	/// the template + B1/B2 aborts) and snapshots m_conf. Returns false with a
+	/// counted reason when the pass itself refuses (B1/B2/B3).
+	bool FuseVerifyPass(int pass, const GSBackQueue::DrawNode::FusePassState& st, FuseVerifySnapshot& snap);
+
+	/// Zero-copy per-pass install for verifies (pointer-assigns the live buffer
+	/// slots at the stash vectors; env/scalars by value; trace + scissor + the
+	/// display-FB blit count exactly as DrawRecordTail would).
+	void FuseInstallVerifyPass(const GSBackQueue::DrawNode::FusePassState& st);
+
+	/// Asserts all three snapshots match the fused template (B5/B6). Returns false
+	/// with a counted reason on the first mismatch.
+	bool FuseSnapshotsCompatible(const FuseVerifySnapshot& s0, const FuseVerifySnapshot& s1, const FuseVerifySnapshot& s2);
+
+	/// Assembles the fused m_conf from compatible snapshots + 48-byte vertices and
+	/// submits it (one RenderHW + the draw-log row). Restores m_conf to the T2
+	/// snapshot after, so post-state is stock-post-T2 bitwise.
+	void FuseAssembleAndSubmit(const FuseVerifySnapshot& s0, const FuseVerifySnapshot& s1, const FuseVerifySnapshot& s2,
+		const GSVertex* v0, const GSVertex* v1, const GSVertex* v2, u32 nverts, const u16* indices, u32 nindices);
+
+	/// Abort path: restores the captured cache fields, restores live T1 (pointer +
+	/// env save from entry; its bytes are never moved), then replays the triple as
+	/// stock DrawRecordTail per pass (T3/T2 via InstallHeldTerrainDraw).
+	void FuseSerialFallback(const GSBackQueue::DrawNode::FusePassState& t3, const GSBackQueue::DrawNode::FusePassState& t2);
+
+	/// Live-T1 save/restore (entry/exit of every FuseDraw; the fallback restores it
+	/// too). Buffer structs by value (pointers, not bytes: verifies repoint the
+	/// live slots at stashed vectors and never write through), envs/scalars by value.
+	void FuseSaveLiveT1();
+	void FuseRestoreLiveT1();
+
+	GSVertexBuff m_fuse_saved_vb = {};
+	GSIndexBuff m_fuse_saved_ib = {};
+	GSDrawingEnvironment m_fuse_saved_prev_env = {};
+	GSDrawingEnvironment m_fuse_saved_env = {};
+	GSVertex m_fuse_saved_v = {};
+	GSVector4i m_fuse_saved_draw_rect = GSVector4i::zero();
+	GSVector4i m_fuse_saved_native_draw_rect = GSVector4i::zero();
+	u64 m_fuse_saved_serial = 0;
+	GSBackQueue::DrawPrivRegs m_fuse_saved_priv = {};
+	int m_fuse_saved_backed_up_ctx = 0;
+	u32 m_fuse_saved_dirty_regs = 0;
+	int m_fuse_saved_flush_reason = 0;
+	bool m_fuse_saved_shuffle_finish = false;
+	bool m_fuse_saved_uv_hack = false;
+
+	bool m_fuse_verify_active = false;
+	bool m_fuse_verify_reached_submit = false;
+	bool m_fuse_targets_captured = false;
+	GSTextureCache::Target* m_fuse_cap_rt = nullptr;
+	GSTextureCache::Target* m_fuse_cap_ds = nullptr;
+	bool m_fuse_cap_rt_scaled = false;
+	bool m_fuse_cap_ds_scaled = false;
+	u64 m_fuse_cap_rt_last_draw = 0;
+	u64 m_fuse_cap_ds_last_draw = 0;
 };

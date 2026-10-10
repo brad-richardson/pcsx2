@@ -4,6 +4,7 @@
 #include "GS/GSState.h"
 #include "GS/GSDump.h"
 #include "GS/Renderers/Common/GSFastStencilShadow.h"
+#include "GS/Renderers/Common/GSTerrainFusePolicy.h"
 #include "GS/GSSpriteCover.h"
 #include "GS/GSGL.h"
 #include "GS/GSPerfMon.h"
@@ -439,6 +440,9 @@ void GSState::Reset(bool hardware_reset)
 	DrainBackQueue();
 
 	Flush(GSFlushReason::RESET);
+
+	// TPF1: the reset flush above may have withheld draws; emit before teardown.
+	FlushHeldTerrainDraws();
 
 	// FIXME: bios logo not shown cut in half after reset, missing graphics in GoW after first FMV
 	memset(&m_path, 0, sizeof(m_path));
@@ -3978,6 +3982,11 @@ void GSState::FlushDraw(GSFlushReason reason)
 {
 	FlushWrite();
 
+	// TPF1: vsync executes — held draws must land first (and anything the
+	// pending draw's own flush withholds is emitted right after it below).
+	if (reason == VSYNC)
+		FlushHeldTerrainDraws();
+
 	if (m_index->tail > 0)
 	{
 		// Unless Vsync really needs the pending draw, don't do it when VSync happens as it can really screw up our heuristics when looking ahead.
@@ -4019,6 +4028,11 @@ void GSState::FlushDraw(GSFlushReason reason)
 		UpdateContext();
 
 		FlushPrim();
+
+		// TPF1: a vsync-boundary draw the flush above just withheld still has
+		// to execute before the sync.
+		if (reason == VSYNC)
+			FlushHeldTerrainDraws();
 
 		m_draw_env = &m_env;
 		PRIM = &m_env.PRIM;
@@ -4069,6 +4083,7 @@ void GSState::FlushWrite()
 	// transfer Init rotates it out instead of reusing it.
 	m_tr_payload_referenced = m_back_records;
 
+	FlushHeldTerrainDraws(); // TPF1: order held draws before the transfer.
 	if (m_back_records)
 		PushRecord(GSBackQueue::RecordType::Transfer, rec);
 	else
@@ -4254,6 +4269,346 @@ u32 GSState::CalcMask(int exp, int max_exp)
 	return (1 << std::min(amount, 23)) - 1;
 }
 
+// TPF1: terrain pass fusion (GE1_TERRAIN_FUSE=1). SSX3 draws each terrain patch
+// as three consecutive draws over byte-identical XYZ (T1 base, T3 shadow, T2
+// light); the fused draw evaluates all three stages in one dispatch. The front
+// withholds a T1 (then a T1+T3 pair) in m_held_terrain; a completed triple
+// emits one fused draw, any pattern break (or any non-draw seam) emits the
+// held draws unchanged first, so order is always preserved.
+static bool TerrainFuseKnob()
+{
+	static const bool on = [] {
+		const char* e = std::getenv("GE1_TERRAIN_FUSE");
+		return e && e[0] == '1';
+	}();
+	return on;
+}
+
+static bool TerrainFuseStats()
+{
+	static const bool on = [] {
+		const char* e = std::getenv("GE1_TPF1_STATS");
+		return e && e[0] == '1';
+	}();
+	return on;
+}
+
+void GSState::FuseDraw()
+{
+	Draw();
+}
+
+bool GSState::TerrainFuseArmed() const
+{
+	if (!TerrainFuseKnob())
+		return false;
+	if (!SupportsTerrainFuse())
+		return false;
+	if (!g_gs_device)
+		return false;
+	const RenderAPI api = g_gs_device->GetRenderAPI();
+	if (api != RenderAPI::Vulkan && api != RenderAPI::Metal)
+		return false;
+	return g_gs_device->Features().tfx_fuse3;
+}
+
+static GSTerrainFusePolicy::DrawRegs FillFuseRegs(const GSDrawingEnvironment& env)
+{
+	GSTerrainFusePolicy::DrawRegs r = {};
+	r.prim = env.PRIM.U32[0];
+	const GSDrawingContext& ctx = env.CTXT[env.PRIM.CTXT];
+	r.tex0 = ctx.TEX0.U64;
+	r.tex1 = static_cast<u32>(ctx.TEX1.U64 & 0xFFFFFFu); // high word is game garbage
+	r.clamp = ctx.CLAMP.U64;
+	r.alpha = ctx.ALPHA.U64;
+	r.test = ctx.TEST.U64;
+	r.frame = ctx.FRAME.U64;
+	r.zbuf = ctx.ZBUF.U64;
+	r.texa = env.TEXA.U64;
+	r.texclut = env.TEXCLUT.U64;
+	r.xyoffset = ctx.XYOFFSET.U64;
+	r.scissor = ctx.SCISSOR.U64;
+	r.miptbp2 = ctx.MIPTBP2.U64;
+	r.tex2 = ctx.TEX2.U64;
+	r.fogcol = env.FOGCOL.U64;
+	r.fba = ctx.FBA.FBA;
+	r.pabe = env.PABE.PABE;
+	r.colclamp = env.COLCLAMP.CLAMP;
+	r.dthe = env.DTHE.DTHE;
+	r.scanmsk = env.SCANMSK.MSK;
+	r.dimx = env.DIMX.U64;
+	return r;
+}
+
+// Captures the live draw (env snapshots, vertex/index streams, draw scalars)
+// into a hold slot. Buffers copy [0..tail) so absolute indexing survives.
+void GSState::StashHeldTerrainDraw(GSBackQueue::DrawNode::FusePassState& st, const GSBackQueue::DrawPrivRegs& priv)
+{
+	std::memcpy(&st.draw_env, &m_prev_env, sizeof(st.draw_env));
+	std::memcpy(&st.next_env, &m_env, sizeof(st.next_env));
+	st.next_v = m_v;
+	st.draw_rect = temp_draw_rect;
+	st.native_draw_rect = temp_native_draw_rect;
+	st.verts.assign(m_vertex->buff, m_vertex->buff + m_vertex->tail);
+	st.indices.assign(m_index->buff, m_index->buff + m_index->tail);
+	st.vhead = m_vertex->head;
+	st.vtail = m_vertex->tail;
+	st.vnext = m_vertex->next;
+	st.itail = m_index->tail;
+	st.draw_serial = s_n;
+	st.backed_up_ctx = m_backed_up_ctx;
+	st.dirty_gs_regs = m_dirty_gs_regs;
+	st.flush_reason = static_cast<int>(m_state_flush_reason);
+	st.channel_shuffle_finish = m_channel_shuffle_finish;
+	st.packed_uv_hack_flag = m_isPackedUV_HackFlag;
+	st.priv = priv;
+}
+
+// Installs a stashed draw over live state for (re-)emission. The caller saves
+// live state first when it must survive (break path, non-draw seams).
+void GSState::InstallHeldTerrainDraw(const GSBackQueue::DrawNode::FusePassState& st)
+{
+	while (m_vertex->maxcount < st.vtail || m_vertex->maxcount * 6u < st.itail)
+		GrowVertexBuffer();
+	std::memcpy(m_vertex->buff, st.verts.data(), sizeof(GSVertex) * st.vtail);
+	std::memcpy(m_index->buff, st.indices.data(), sizeof(u16) * st.itail);
+	m_vertex->head = st.vhead;
+	m_vertex->tail = st.vtail;
+	m_vertex->next = st.vnext;
+	m_index->tail = st.itail;
+	std::memcpy(&m_prev_env, &st.draw_env, sizeof(m_prev_env));
+	std::memcpy(&m_env, &st.next_env, sizeof(m_env));
+	m_v = st.next_v;
+	temp_draw_rect = st.draw_rect;
+	temp_native_draw_rect = st.native_draw_rect;
+	m_draw_env = &m_prev_env;
+	PRIM = &m_prev_env.PRIM;
+	UpdateContext();
+	s_n = st.draw_serial;
+	m_backed_up_ctx = st.backed_up_ctx;
+	m_dirty_gs_regs = st.dirty_gs_regs;
+	m_state_flush_reason = static_cast<GSFlushReason>(st.flush_reason);
+	m_channel_shuffle_finish = st.channel_shuffle_finish;
+	m_isPackedUV_HackFlag = st.packed_uv_hack_flag;
+	m_vt.m_alpha.valid = false;
+}
+
+// FlushPrim's normal-emit path (record handoff or direct tail), extracted so
+// held and fused draws re-emit it. Reads live state (buffers, env, scalars).
+void GSState::EmitDrawInternal(const GSBackQueue::DrawPrivRegs& priv)
+{
+	if (m_back_records)
+	{
+		// Hand the live buffers to a pool node: snapshot the buffer structs into
+		// the node, then exchange heap arrays — the node keeps the draw's data
+		// for the consumer, the parse slot takes the node's recycled arrays as
+		// its fresh buffers. Everything else about the slot (xy ring, counters)
+		// is untouched, and the reset below re-initializes it exactly as today.
+		GSBackQueue::DrawNode* node = AcquireDrawNode();
+		GSVertex* fresh_vbuff = node->vb.buff;
+		GSVertex* fresh_vcopy = node->vb.buff_copy;
+		const u32 fresh_maxcount = node->vb.maxcount;
+		u16* fresh_ibuff = node->ib.buff;
+
+		node->vb = *m_vertex;
+		node->ib = *m_index;
+
+		m_vertex->buff = fresh_vbuff;
+		m_vertex->buff_copy = fresh_vcopy;
+		m_vertex->maxcount = fresh_maxcount;
+		m_index->buff = fresh_ibuff;
+
+		GSBackQueue::DrawRecord rec;
+		std::memcpy(&rec.draw_env, &m_prev_env, sizeof(rec.draw_env));
+		std::memcpy(&rec.next_env, &m_env, sizeof(rec.next_env));
+		rec.next_v = m_v;
+		rec.draw_rect = temp_draw_rect;
+		rec.native_draw_rect = temp_native_draw_rect;
+		rec.vertex = &node->vb;
+		rec.index = &node->ib;
+		rec.node = node;
+		rec.draw_serial = s_n;
+		rec.backed_up_ctx = m_backed_up_ctx;
+		rec.dirty_gs_regs = m_dirty_gs_regs;
+		rec.flush_reason = m_state_flush_reason;
+		rec.channel_shuffle_finish = m_channel_shuffle_finish;
+		rec.packed_uv_hack_flag = m_isPackedUV_HackFlag;
+		rec.priv = priv;
+
+		// m_channel_shuffle_finish is written on BOTH sides: the front's
+		// ApplyTEX0 sets it as a one-shot "abort shuffle skip" message, while
+		// the draw path sets AND clears it as back-persistent shuffle state.
+		// On the split front the capture above delivers the message, so clear
+		// our copy (edge semantics) — the executor ORs it into the back's
+		// authoritative copy instead of level-installing. On a single object
+		// the member IS the authoritative copy: leave it alone.
+		if (m_mem_target != this)
+			m_channel_shuffle_finish = false;
+
+		// TPF1: staged fused-triple payload rides in the node (recycled nodes
+		// must reset the flag every emit); the consumer picks it up in
+		// ExecDrawRecord. Copies reuse both sides' vectors after warmup.
+		node->fuse.active = m_fuse_offpath.active;
+		if (m_fuse_offpath.active)
+		{
+			node->fuse.passes[0] = m_fuse_offpath.passes[0];
+			node->fuse.passes[1] = m_fuse_offpath.passes[1];
+			m_fuse_offpath.active = false;
+		}
+
+		// The consumer releases the node after the tail runs.
+		PushRecord(GSBackQueue::RecordType::Draw, rec);
+
+		// GSC_IRem clears SCANMSK in the parse environment at the start of the draw, and on a
+		// single object that clear lasts until the game writes SCANMSK again. On the split the
+		// hook clears the back's installed copy, which the next record overwrites, so repeat it
+		// here for every draw that reaches Draw(). Not exact for a draw the hook's own skip
+		// counter lets through (back-side state): a single object leaves the mask set there.
+		if (m_mem_target != this && m_mem_target->DrawClearsScanMask() &&
+			!(m_context->TEST.ZTE && m_context->TEST.ZTST == ZTST_NEVER))
+		{
+			m_env.SCANMSK.MSK = 0;
+			m_prev_env.SCANMSK.MSK = 0;
+		}
+
+		// GS10: the executor's tail refreshes the live m_env's scissor for the
+		// draw's context (DrawRecordTail: "it may have been modified by a
+		// previous draw"). On a single object that write lands in the parse
+		// state; draw buffering is where it matters, because FlushBuffers
+		// stages buffered environments into m_env by register bytes only (and
+		// a base-only flush leaves them staged), so the derived scissor can
+		// lag its registers. The split front owns the parse env, so it applies
+		// the same pure refresh itself; the back's copy is its record's.
+		if (m_mem_target != this)
+			m_env.CTXT[PRIM->CTXT].UpdateScissor();
+	}
+	else
+	{
+		// Off path: every field the record would carry is captured from live
+		// state and installed back over the same live state, so the round-trip
+		// is an identity — skip it and run the tail directly.
+		m_draw_priv = priv;
+		DrawRecordTail(s_n);
+		// TPF1: the off-path tail above consumed any staged fuse payload.
+		m_fuse_offpath.active = false;
+	}
+}
+
+// Emits every held draw in original order, preserving live state (pending
+// kicks on a seam, or the current draw on a break). Leaves m_vt as the last
+// emitted draw's trace (closest to unfused post-state for seam checks).
+void GSState::FlushHeldTerrainDraws()
+{
+	if (m_held_terrain_count == 0)
+		return;
+	GSBackQueue::DrawNode::FusePassState saved;
+	StashHeldTerrainDraw(saved, CaptureDrawPrivRegs());
+	for (u32 i = 0; i < m_held_terrain_count; i++)
+	{
+		InstallHeldTerrainDraw(m_held_terrain[i]);
+		EmitDrawInternal(m_held_terrain[i].priv);
+	}
+	m_held_terrain_count = 0;
+	InstallHeldTerrainDraw(saved);
+}
+
+static bool PrivRegsEqual(const GSBackQueue::DrawPrivRegs& a, const GSBackQueue::DrawPrivRegs& b)
+{
+	// Field compare (the struct has bool padding; memcmp would be unreliable).
+	return a.dispfb_fbp[0] == b.dispfb_fbp[0] && a.dispfb_fbp[1] == b.dispfb_fbp[1] &&
+	       a.display_enabled[0] == b.display_enabled[0] && a.display_enabled[1] == b.display_enabled[1] &&
+	       a.field_render == b.field_render;
+}
+
+bool GSState::ConsiderTerrainFuse(const GSBackQueue::DrawPrivRegs& priv)
+{
+	using namespace GSTerrainFusePolicy;
+	if (!TerrainFuseArmed())
+		return false;
+
+	const DrawRegs cur = FillFuseRegs(m_prev_env);
+	const Pass p = ClassifyPass(cur);
+
+	if (m_held_terrain_count == 0)
+	{
+		if (p != Pass::Base)
+			return false;
+		StashHeldTerrainDraw(m_held_terrain[0], priv);
+		m_held_terrain_count = 1;
+		if (m_mem_target != this)
+			m_channel_shuffle_finish = false; // edge captured; mirror emit block
+		return true;
+	}
+
+	const GSVertex* hv0 = m_held_terrain[0].verts.data();
+	const u16* hi0 = m_held_terrain[0].indices.data();
+
+	if (m_held_terrain_count == 1)
+	{
+		if (p == Pass::Shadow && m_held_terrain[0].vtail == m_vertex->tail &&
+			m_held_terrain[0].vnext == m_vertex->next && m_held_terrain[0].itail == m_index->tail &&
+			PrivRegsEqual(m_held_terrain[0].priv, priv) &&
+			VertexStreamsMatch(hv0, m_vertex->buff, m_vertex->tail, hi0, m_index->buff, m_index->tail))
+		{
+			StashHeldTerrainDraw(m_held_terrain[1], priv);
+			m_held_terrain_count = 2;
+			if (m_mem_target != this)
+				m_channel_shuffle_finish = false;
+			return true;
+		}
+		FlushHeldTerrainDraws();
+		if (p != Pass::Base)
+			return false;
+		StashHeldTerrainDraw(m_held_terrain[0], priv);
+		m_held_terrain_count = 1;
+		if (m_mem_target != this)
+			m_channel_shuffle_finish = false;
+		return true;
+	}
+
+	// Count == 2: complete the triple or break.
+	const DrawRegs held0 = FillFuseRegs(m_held_terrain[0].draw_env);
+	const DrawRegs held1 = FillFuseRegs(m_held_terrain[1].draw_env);
+	const GSVertex* hv1 = m_held_terrain[1].verts.data();
+	const u16* hi1 = m_held_terrain[1].indices.data();
+	if (p == Pass::Light && StatesCompatible(held0, held1, cur) &&
+		m_held_terrain[0].vtail == m_vertex->tail && m_held_terrain[0].vnext == m_vertex->next &&
+		m_held_terrain[0].itail == m_index->tail &&
+		PrivRegsEqual(m_held_terrain[0].priv, priv) && PrivRegsEqual(m_held_terrain[1].priv, priv) &&
+		VertexStreamsMatch(hv0, m_vertex->buff, m_vertex->tail, hi0, m_index->buff, m_index->tail) &&
+		VertexStreamsMatch(hv1, m_vertex->buff, m_vertex->tail, hi1, m_index->buff, m_index->tail))
+	{
+		// Stage T3 + live-T2 payload, install T1, emit once. Env/scalars are
+		// restored to the live (T2) draw after; the shared buffer reset only
+		// needs the carry-over locals and PRIM (restored).
+		GSBackQueue::DrawNode::FusePassState live;
+		StashHeldTerrainDraw(live, priv);
+		m_fuse_offpath.passes[0] = m_held_terrain[1];
+		m_fuse_offpath.passes[1] = live;
+		m_fuse_offpath.active = true;
+		m_held_terrain_count = 0;
+		InstallHeldTerrainDraw(m_held_terrain[0]);
+		EmitDrawInternal(m_held_terrain[0].priv);
+		InstallHeldTerrainDraw(live);
+		// The fused draw consumed the live T2 (same XYZ as T1): leave T2's
+		// vertex trace, the exact unfused post-state for downstream checks.
+		m_vt.Update(live.verts.data(), live.indices.data(), live.vtail, live.itail,
+			GSUtil::GetPrimClass(live.draw_env.PRIM.PRIM));
+		m_vt.m_alpha.valid = false;
+		if (TerrainFuseStats())
+			std::fprintf(stderr, "TPF1: fused triple at s_n=%llu\n", (unsigned long long)live.draw_serial);
+		return true;
+	}
+	FlushHeldTerrainDraws();
+	if (p != Pass::Base)
+		return false;
+	StashHeldTerrainDraw(m_held_terrain[0], priv);
+	m_held_terrain_count = 1;
+	if (m_mem_target != this)
+		m_channel_shuffle_finish = false;
+	return true;
+}
+
 void GSState::FlushPrim()
 {
 	if (m_index->tail == 0)
@@ -4315,88 +4670,11 @@ void GSState::FlushPrim()
 
 	const GSBackQueue::DrawPrivRegs priv = CaptureDrawPrivRegs();
 
-	if (m_back_records)
-	{
-		// Hand the live buffers to a pool node: snapshot the buffer structs into
-		// the node, then exchange heap arrays — the node keeps the draw's data
-		// for the consumer, the parse slot takes the node's recycled arrays as
-		// its fresh buffers. Everything else about the slot (xy ring, counters)
-		// is untouched, and the reset below re-initializes it exactly as today.
-		GSBackQueue::DrawNode* node = AcquireDrawNode();
-		GSVertex* fresh_vbuff = node->vb.buff;
-		GSVertex* fresh_vcopy = node->vb.buff_copy;
-		const u32 fresh_maxcount = node->vb.maxcount;
-		u16* fresh_ibuff = node->ib.buff;
-
-		node->vb = *m_vertex;
-		node->ib = *m_index;
-
-		m_vertex->buff = fresh_vbuff;
-		m_vertex->buff_copy = fresh_vcopy;
-		m_vertex->maxcount = fresh_maxcount;
-		m_index->buff = fresh_ibuff;
-
-		GSBackQueue::DrawRecord rec;
-		std::memcpy(&rec.draw_env, &m_prev_env, sizeof(rec.draw_env));
-		std::memcpy(&rec.next_env, &m_env, sizeof(rec.next_env));
-		rec.next_v = m_v;
-		rec.draw_rect = temp_draw_rect;
-		rec.native_draw_rect = temp_native_draw_rect;
-		rec.vertex = &node->vb;
-		rec.index = &node->ib;
-		rec.node = node;
-		rec.draw_serial = s_n;
-		rec.backed_up_ctx = m_backed_up_ctx;
-		rec.dirty_gs_regs = m_dirty_gs_regs;
-		rec.flush_reason = m_state_flush_reason;
-		rec.channel_shuffle_finish = m_channel_shuffle_finish;
-		rec.packed_uv_hack_flag = m_isPackedUV_HackFlag;
-		rec.priv = priv;
-
-		// m_channel_shuffle_finish is written on BOTH sides: the front's
-		// ApplyTEX0 sets it as a one-shot "abort shuffle skip" message, while
-		// the draw path sets AND clears it as back-persistent shuffle state.
-		// On the split front the capture above delivers the message, so clear
-		// our copy (edge semantics) — the executor ORs it into the back's
-		// authoritative copy instead of level-installing. On a single object
-		// the member IS the authoritative copy: leave it alone.
-		if (m_mem_target != this)
-			m_channel_shuffle_finish = false;
-
-		// The consumer releases the node after the tail runs.
-		PushRecord(GSBackQueue::RecordType::Draw, rec);
-
-		// GSC_IRem clears SCANMSK in the parse environment at the start of the draw, and on a
-		// single object that clear lasts until the game writes SCANMSK again. On the split the
-		// hook clears the back's installed copy, which the next record overwrites, so repeat it
-		// here for every draw that reaches Draw(). Not exact for a draw the hook's own skip
-		// counter lets through (back-side state): a single object leaves the mask set there.
-		if (m_mem_target != this && m_mem_target->DrawClearsScanMask() &&
-			!(m_context->TEST.ZTE && m_context->TEST.ZTST == ZTST_NEVER))
-		{
-			m_env.SCANMSK.MSK = 0;
-			m_prev_env.SCANMSK.MSK = 0;
-		}
-
-		// GS10: the executor's tail refreshes the live m_env's scissor for the
-		// draw's context (DrawRecordTail: "it may have been modified by a
-		// previous draw"). On a single object that write lands in the parse
-		// state; draw buffering is where it matters, because FlushBuffers
-		// stages buffered environments into m_env by register bytes only (and
-		// a base-only flush leaves them staged), so the derived scissor can
-		// lag its registers. The split front owns the parse env, so it applies
-		// the same pure refresh itself; the back's copy is its record's.
-		if (m_mem_target != this)
-			m_env.CTXT[PRIM->CTXT].UpdateScissor();
-	}
-	else
-	{
-		// Off path: every field the record would carry is captured from live
-		// state and installed back over the same live state, so the round-trip
-		// is an identity — skip it and run the tail directly.
-		m_draw_priv = priv;
-		DrawRecordTail(s_n);
-	}
+	// TPF1: withhold/fuse terrain triples (held/break/fused draws re-emit
+	// inside); the shared buffer reset below runs in both cases.
+	const bool skip_emit = ConsiderTerrainFuse(priv);
+	if (!skip_emit)
+		EmitDrawInternal(priv);
 
 	// Front side: reset the buffer and rebuild the carry-over window. Inline this
 	// must run after the executor (Draw reads the buffer); with the pool handoff
@@ -4465,6 +4743,14 @@ void GSState::ExecDrawRecord(const GSBackQueue::DrawRecord& rec)
 		m_channel_shuffle_finish = rec.channel_shuffle_finish;
 	m_isPackedUV_HackFlag = rec.packed_uv_hack_flag;
 	m_draw_priv = rec.priv;
+	// TPF1: fused-triple payload rides in the node; land it in the member the
+	// tail consumes (copies reuse vectors after warmup).
+	m_fuse_offpath.active = rec.node && rec.node->fuse.active;
+	if (m_fuse_offpath.active)
+	{
+		m_fuse_offpath.passes[0] = rec.node->fuse.passes[0];
+		m_fuse_offpath.passes[1] = rec.node->fuse.passes[1];
+	}
 
 	// On a split back object nobody ran FlushDraw here — aim the draw pointers
 	// at the installed draw env exactly as FlushDraw does on the front, and
@@ -4593,7 +4879,15 @@ void GSState::DrawRecordTail(u64 draw_serial)
 			DumpTransferImages();
 	}
 
-	if (!skip_draw)
+	// TPF1: a staged triple runs the fused draw (payload consumed above so
+	// abort re-execution and later draws never see it). Perfmon counts one.
+	if (m_fuse_offpath.active)
+	{
+		m_fuse_offpath.active = false;
+		if (!skip_draw)
+			FuseDraw();
+	}
+	else if (!skip_draw)
 		Draw();
 
 	g_perfmon.Put(GSPerfMon::Draw, 1);
@@ -4873,6 +5167,7 @@ void GSState::Write(const u8* mem, int len)
 			if (m_mem_target != this)
 				s_transfer_n++;
 
+			FlushHeldTerrainDraws(); // TPF1: order held draws before the transfer.
 			if (m_back_records)
 				PushRecord(GSBackQueue::RecordType::Transfer, rec);
 			else
@@ -4969,6 +5264,7 @@ void GSState::SubmitProbe(const GSBackQueue::ProbeRecord& rec)
 	m_env.TRXPOS = saved_pos;
 	m_env.TRXREG = saved_reg;
 
+	FlushHeldTerrainDraws(); // TPF1: order held draws before the probe.
 	if (m_back_records)
 		PushRecord(GSBackQueue::RecordType::Probe, rec);
 	else
@@ -5083,6 +5379,7 @@ void GSState::SubmitMove()
 	rec.dir = m_env.TRXDIR;
 	rec.draw_serial = s_n;
 
+	FlushHeldTerrainDraws(); // TPF1: order held draws before the move.
 	if (m_back_records)
 		PushRecord(GSBackQueue::RecordType::Move, rec);
 	else
@@ -5129,6 +5426,7 @@ void GSState::SubmitClutLoad(const GIFRegTEX0& TEX0, const GIFRegTEXCLUT& TEXCLU
 	rec.TEX0 = TEX0;
 	rec.TEXCLUT = TEXCLUT;
 
+	FlushHeldTerrainDraws(); // TPF1: order held draws before the CLUT load.
 	if (m_back_records)
 		PushRecord(GSBackQueue::RecordType::ClutLoad, rec);
 	else
@@ -5196,6 +5494,7 @@ void GSState::SubmitPcrtcSync()
 	std::memcpy(&rec.displays, &PCRTCDisplays, sizeof(rec.displays));
 	rec.scanmask_used = m_scanmask_used;
 
+	FlushHeldTerrainDraws(); // TPF1: order held draws before the PCRTC sync.
 	if (m_back_records)
 		PushRecord(GSBackQueue::RecordType::PcrtcSync, rec);
 	else
@@ -5738,6 +6037,10 @@ int GSState::Freeze(freezeData* fd, bool sizeonly)
 
 	Flush(GSFlushReason::SAVESTATE);
 
+	// TPF1: the savestate flush above may have withheld draws; emit so the
+	// serialized frame is complete.
+	FlushHeldTerrainDraws();
+
 	// The flush may have pushed draw records; they must land before the local
 	// memory bytes are serialized.
 	DrainBackQueue();
@@ -5833,6 +6136,10 @@ int GSState::Freeze(freezeData* fd, bool sizeonly)
 int GSState::Defrost(const freezeData* fd)
 {
 	DrainBackQueue();
+
+	// TPF1: held draws are host-side pending work, never serialized.
+	m_held_terrain_count = 0;
+	m_fuse_offpath.active = false;
 
 	if (!fd || !fd->data || fd->size == 0)
 		return -1;

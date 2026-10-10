@@ -78,6 +78,7 @@ add_pcsx2_test(gs_vertex_tests
 	gs_sw_texture_dirty_tests.cpp
 	gs_blend_constant_policy_tests.cpp
 	gs_inv_src1_policy_tests.cpp
+	gs_terrain_fuse_policy_tests.cpp
 	gs_over_one_two_pass_tests.cpp
 	gs_autoflush_engine_level_tests.cpp
 	gs_draw_buffer_overlap_tests.cpp

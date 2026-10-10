@@ -635,6 +635,11 @@ public:
 		NUM_TFX_TEXTURES
 	};
 
+	// TPF1: sampler-only binding for the fused draw's sources 1/2 (their
+	// textures ride the RT/PRIMID image slots). Outside NUM_TFX_TEXTURES (that
+	// sizes the texture array); the push-descriptor budget counts it separately.
+	static constexpr u32 TFX_SAMPLER_FUSE = 7;
+
 private:
 	std::unique_ptr<VKSwapChain> m_swap_chain;
 	bool m_resize_requested = false;
@@ -1036,6 +1041,7 @@ public:
 	void PSSetROVs(GSTexture* rt, GSTexture* ds, bool write_rt, bool write_ds);
 	void PSSetShaderResource(int i, GSTexture* sr, bool check_state, ResourceType type = ResourceType::SRV);
 	void PSSetSampler(GSHWDrawConfig::SamplerSelector sel);
+	void PSSetFuseSampler(GSHWDrawConfig::SamplerSelector sel); // TPF1: binding 7.
 
 	void OMSetRenderTargets(GSTexture* rt, GSTexture* ds, const GSVector4i& scissor,
 		FeedbackLoopFlag feedback_loop = FeedbackLoopFlag_None, const GSVector2i& viewport_size = {});
@@ -1127,6 +1133,7 @@ private:
 		DIRTY_FLAG_VS_CONSTANT_BUFFER = (1 << 15),
 		DIRTY_FLAG_PS_CONSTANT_BUFFER = (1 << 16),
 		DIRTY_FLAG_VS_PUSH_CONSTANTS = (1 << 17),
+		DIRTY_FLAG_TFX_FUSE_SAMPLER = (1 << 18),
 
 		DIRTY_FLAG_TFX_TEXTURE_TEX = (DIRTY_FLAG_TFX_TEXTURE_0 << 0),
 		DIRTY_FLAG_TFX_TEXTURE_PALETTE = (DIRTY_FLAG_TFX_TEXTURE_0 << 1),
@@ -1139,7 +1146,7 @@ private:
 		DIRTY_FLAG_TFX_TEXTURES = DIRTY_FLAG_TFX_TEXTURE_TEX | DIRTY_FLAG_TFX_TEXTURE_PALETTE |
 		                          DIRTY_FLAG_TFX_TEXTURE_RT | DIRTY_FLAG_TFX_TEXTURE_PRIMID |
 		                          DIRTY_FLAG_TFX_TEXTURE_DEPTH | DIRTY_FLAG_TFX_TEXTURE_RT_ROV |
-		                          DIRTY_FLAG_TFX_TEXTURE_DEPTH_ROV,
+		                          DIRTY_FLAG_TFX_TEXTURE_DEPTH_ROV | DIRTY_FLAG_TFX_FUSE_SAMPLER,
 
 		DIRTY_BASE_STATE = DIRTY_FLAG_INDEX_BUFFER | DIRTY_FLAG_PIPELINE | DIRTY_FLAG_VIEWPORT | DIRTY_FLAG_SCISSOR |
 		                   DIRTY_FLAG_BLEND_CONSTANTS | DIRTY_FLAG_LINE_WIDTH,
@@ -1227,6 +1234,9 @@ private:
 	std::array<GSTextureVK*, NUM_TFX_TEXTURES> m_tfx_textures{};
 	VkSampler m_tfx_sampler = VK_NULL_HANDLE;
 	u32 m_tfx_sampler_sel = 0;
+	// TPF1: shared sampler for the fused draw's sources 1/2 (binding 7).
+	VkSampler m_tfx_fuse_sampler = VK_NULL_HANDLE;
+	u32 m_tfx_fuse_sampler_sel = 0;
 	VkDescriptorSet m_tfx_ubo_descriptor_set = VK_NULL_HANDLE;
 	VkDescriptorSet m_tfx_texture_descriptor_set = VK_NULL_HANDLE;
 	VkDescriptorSet m_tfx_rt_descriptor_set = VK_NULL_HANDLE;

@@ -1496,6 +1496,7 @@ bool GSDeviceMTL::Create(GSVSyncMode vsync_mode, bool allow_present_throttle)
 	m_features.point_expand = true;
 	m_features.line_expand = false;
 	m_features.prefer_new_textures = true;
+	m_features.tfx_fuse3 = true; // TPF1: fused sources bind to free texture/sampler indices.
 	// Only Apple9 and some iPads sample BC on iOS; without it the replacement loader decodes on the CPU.
 	m_features.dxt_textures = [m_dev.dev supportsBCTextureCompression];
 	m_features.bptc_textures = m_features.dxt_textures;
@@ -1686,10 +1687,15 @@ bool GSDeviceMTL::Create(GSVSyncMode vsync_mode, bool allow_present_throttle)
 		sel.key = i;
 		if (sel.point_size && sel.expand != GSShader::VSExpand::None)
 			continue;
+		if (static_cast<u8>(sel.expand) > static_cast<u8>(GSShader::VSExpand::Fuse3))
+			continue;
 		setFnConstantB(m_fn_constants, sel.fst,        GSMTLConstantIndex_FST);
 		setFnConstantB(m_fn_constants, sel.iip,        GSMTLConstantIndex_IIP);
 		setFnConstantB(m_fn_constants, sel.point_size, GSMTLConstantIndex_VS_POINT_SIZE);
 		setFnConstantI(m_fn_constants, sel.expand,     GSMTLConstantIndex_VS_EXPAND_TYPE);
+		// TPF1: the VS bakes FUSE3 from its own key (expand==Fuse3 ⟺ the PS bakes
+		// it from pssel.fuse3), so the fuseA/fuseB varyings exist on both sides.
+		setFnConstantB(m_fn_constants, sel.expand == GSShader::VSExpand::Fuse3, GSMTLConstantIndex_PS_FUSE3);
 		m_hw_vs[i] = LoadShader(sel.expand == GSShader::VSExpand::None ? @"vs_main" : @"vs_main_expand");
 	}
 
@@ -2619,6 +2625,7 @@ MRCOwned<id<MTLRenderPipelineState>> GSDeviceMTL::BuildTFXPipeline(const Pipelin
 		setFnConstantI(m_fn_constants, pssel.sw_aniso,              GSMTLConstantIndex_PS_SW_ANISO);
 		setFnConstantB(m_fn_constants, pssel.rov_color,             GSMTLConstantIndex_PS_ROV_COLOR);
 		setFnConstantI(m_fn_constants, pssel.rov_depth,             GSMTLConstantIndex_PS_ROV_DEPTH);
+		setFnConstantB(m_fn_constants, pssel.fuse3,                 GSMTLConstantIndex_PS_FUSE3);
 		bool eft = pssel.HasColorROV() && !pssel.HasDepthROV() && !pssel.HasDepthOutput();
 		auto newps = LoadShader(eft ? @"ps_main_rov_eft" : @"ps_main");
 		ps = newps;
@@ -2792,6 +2799,17 @@ void GSDeviceMTL::MRESetSampler(SamplerSelector sel)
 	m_current_render.has.sampler = true;
 }
 
+void GSDeviceMTL::MRESetFuseSampler(SamplerSelector sel)
+{
+	if (m_current_render.has.fuse_sampler && m_current_render.fuse_sampler_sel.key == sel.key)
+		return;
+	if (!m_sampler_hw[sel.key]) [[unlikely]]
+		m_sampler_hw[sel.key] = CreateSampler(m_dev.dev, sel);
+	[m_current_render.encoder setFragmentSamplerState:m_sampler_hw[sel.key] atIndex:1];
+	m_current_render.fuse_sampler_sel = sel;
+	m_current_render.has.fuse_sampler = true;
+}
+
 static void textureBarrier(id<MTLRenderCommandEncoder> enc)
 {
 #if TARGET_OS_IPHONE
@@ -2956,6 +2974,25 @@ static_assert(offsetof(GSHWDrawConfig::PSConstantBuffer, DitherMatrix)     == of
 static_assert(offsetof(GSHWDrawConfig::PSConstantBuffer, ScaleFactor)      == offsetof(GSMTLMainPSUniform, scale_factor));
 static_assert(offsetof(GSHWDrawConfig::PSConstantBuffer, DitherPhase)      == offsetof(GSMTLMainPSUniform, dither_phase));
 static_assert(offsetof(GSHWDrawConfig::PSConstantBuffer, NativeTexelGrid)  == offsetof(GSMTLMainPSUniform, native_texel_grid));
+// TPF1: fused-draw constant layouts (whole-buffer memcpy relies on them).
+static_assert(offsetof(GSHWDrawConfig::VSConstantBuffer, FuseTexScaleOffset) == offsetof(GSMTLMainVSUniform, fuse_tex_scale_offset));
+static_assert(offsetof(GSHWDrawConfig::PSConstantBuffer, FuseWH)         == offsetof(GSMTLMainPSUniform, fuse_wh));
+static_assert(offsetof(GSHWDrawConfig::PSConstantBuffer, FuseTA)         == offsetof(GSMTLMainPSUniform, fuse_ta));
+static_assert(offsetof(GSHWDrawConfig::PSConstantBuffer, FuseHalfTexel)  == offsetof(GSMTLMainPSUniform, fuse_half_texel));
+static_assert(offsetof(GSHWDrawConfig::PSConstantBuffer, FuseMinMax)     == offsetof(GSMTLMainPSUniform, fuse_min_max));
+static_assert(offsetof(GSHWDrawConfig::PSConstantBuffer, FuseLODParams)  == offsetof(GSMTLMainPSUniform, fuse_lod_params));
+static_assert(offsetof(GSHWDrawConfig::PSConstantBuffer, FuseSTRange)    == offsetof(GSMTLMainPSUniform, fuse_st_range));
+static_assert(offsetof(GSHWDrawConfig::PSConstantBuffer, FuseSTScaleTCO) == offsetof(GSMTLMainPSUniform, fuse_stscale_tco));
+static_assert(offsetof(GSHWDrawConfig::PSConstantBuffer, FuseScaleXY)    == offsetof(GSMTLMainPSUniform, fuse_scale_xy));
+static_assert(offsetof(GSHWDrawConfig::PSConstantBuffer, FuseMode)       == offsetof(GSMTLMainPSUniform, fuse_mode));
+static_assert(offsetof(GSHWDrawConfig::PSConstantBuffer, FuseFlags)      == offsetof(GSMTLMainPSUniform, fuse_flags));
+static_assert(offsetof(GSHWDrawConfig::PSConstantBuffer, FuseBlend)      == offsetof(GSMTLMainPSUniform, fuse_blend));
+static_assert(sizeof(GSVertexFuse3) == sizeof(GSMTLMainVertexFuse3));
+static_assert(offsetof(GSVertexFuse3, ST) == offsetof(GSMTLMainVertexFuse3, st));
+static_assert(offsetof(GSVertexFuse3, RGBAQ) == offsetof(GSMTLMainVertexFuse3, rgba));
+static_assert(offsetof(GSVertexFuse3, XYZ) == offsetof(GSMTLMainVertexFuse3, xy));
+static_assert(offsetof(GSVertexFuse3, UV) == offsetof(GSMTLMainVertexFuse3, uv));
+static_assert(offsetof(GSVertexFuse3, FOG) == offsetof(GSMTLMainVertexFuse3, fog));
 
 // DoInterlace hands the shader the whole InterlaceConstantBuffer, so the two layouts have to agree.
 static_assert(sizeof(InterlaceConstantBuffer) == sizeof(GSMTLInterlacePSUniform));
@@ -2996,6 +3033,13 @@ void GSDeviceMTL::MREInitHWDraw(GSHWDrawConfig& config, const Map& verts)
 	MRESetTexture(config.tex, GSMTLTextureIndexTex);
 	MRESetTexture(config.pal, GSMTLTextureIndexPalette);
 	MRESetSampler(config.sampler);
+	// TPF1: fused sources 1/2 (+ their shared sampler at index 1).
+	if (config.ps.fuse3)
+	{
+		MRESetTexture(config.tex_fuse1, GSMTLTextureIndexFuse1);
+		MRESetTexture(config.tex_fuse2, GSMTLTextureIndexFuse2);
+		MRESetFuseSampler(config.sampler_fuse);
+	}
 	MRESetCB(config.cb_vs);
 	MRESetCB(config.cb_ps);
 	MRESetVertices(verts.gpu_buffer, verts.gpu_offset);
@@ -3020,10 +3064,11 @@ void GSDeviceMTL::DoRenderHW(GSHWDrawConfig& config)
 	if (m_dev.features.broken_shader_depth && (config.depth.ztst >= ZTST_GEQUAL || config.depth.zwe))
 		config.ps.zfloor = true; // Depth must always go through shader (see tfx vs for comment with details)
 
-	size_t vertsize = config.nverts * sizeof(*config.verts);
+	// TPF1: the fused draw uploads 48-byte vertices (one ST per source).
+	size_t vertsize = config.nverts * (config.ps.fuse3 ? sizeof(GSVertexFuse3) : sizeof(*config.verts));
 	size_t idxsize = config.vs.UseFixedExpandIndexBuffer() ? 0 : (config.nindices * sizeof(*config.indices));
 	Map allocation = Allocate(m_vertex_upload_buf, vertsize + idxsize);
-	memcpy(allocation.cpu_buffer, config.verts, vertsize);
+	memcpy(allocation.cpu_buffer, config.ps.fuse3 ? config.verts_fuse3 : config.verts, vertsize);
 
 	id<MTLBuffer> index_buffer = nil;
 	size_t index_buffer_offset = 0;

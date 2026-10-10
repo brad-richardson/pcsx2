@@ -34,6 +34,23 @@ struct alignas(32) GSVertex
 
 static_assert(sizeof(GSVertex) == 32);
 
+// TPF1 terrain pass-fusion vertex: one ST pair per source pass (ST is the only
+// vertex field the template allows to differ) plus the shared RGBAQ/XYZ/UV/FOG
+// (byte-identical across the triple by VertexStreamsMatch). Consumed only by
+// VSExpand::Fuse3 shaders, which read it from the vertex storage buffer.
+struct GSVertexFuse3
+{
+	GIFRegST ST[3];      // bytes 0..24: S0/T0, S1/T1, S2/T2 (floats)
+	GIFRegRGBAQ RGBAQ;   // bytes 24..32: RGBA:24, Q:28
+	GIFRegXYZ XYZ;       // bytes 32..40: XY:32, Z:36
+	union { u32 UV; struct { u16 U, V; }; }; // UV:40
+	u32 FOG;             // FOG:44
+};
+
+static_assert(sizeof(GSVertexFuse3) == 48);
+static_assert(offsetof(GSVertexFuse3, RGBAQ) == 24);
+static_assert(offsetof(GSVertexFuse3, XYZ) == 32);
+
 struct alignas(32) GSVertexPT1
 {
 	GSVector4 p;

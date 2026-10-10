@@ -865,6 +865,12 @@ struct alignas(16) GSHWDrawConfig
 				// last native pixel did. The limit rides in the vertex ST, which an FST sprite does
 				// not otherwise use; see CorrectSpriteCoverageForUpscale.
 				u32 sprite_edge_clamp : 1;
+
+				// TPF1 terrain pass-fusion: chain three stock terrain passes in one
+				// draw (VSExpand::Fuse3). Source 0 uses the shared texture fields;
+				// sources 1/2 use the Fuse* constant arrays. wms/wmt/ltf are runtime
+				// per-source (FuseMode) and the selector copies are canonical zero.
+				u32 fuse3 : 1;
 			};
 
 			struct
@@ -1112,6 +1118,9 @@ struct alignas(16) GSHWDrawConfig
 		GSVector2 point_size;
 		u32 max_depth;
 		float line_aa1_width;
+		// TPF1 VS_FUSE3: texture_scale/texture_offset for sources 1/2 (source 0
+		// uses the shared fields). Packed xy = scale, zw = offset per source.
+		GSVector4 FuseTexScaleOffset[2];
 		__fi VSConstantBuffer()
 		{
 			memset(static_cast<void*>(this), 0, sizeof(*this));
@@ -1224,6 +1233,34 @@ struct alignas(16) GSHWDrawConfig
 		/// zero on an axis that does not minify. z is the render target's scale. See
 		/// GSNativeTexelGridPolicy.h.
 		GSVector4 NativeTexelGrid;
+
+		// TPF1 PS_FUSE3 per-source texture constants (sources 1/2; source 0 uses the
+		// shared WH/TA_MaxDepth_Af/HalfTexel/MinMax/LODParams/STRange/STScale/
+		// TCOffsetHack fields above). Bit-identical copies of what stock
+		// EmulateTextureSampler wrote for each pass. Ignored unless ps.fuse3.
+		GSVector4 FuseWH[2];
+		GSVector4 FuseTA[2];
+		GSVector4 FuseHalfTexel[2];
+		GSVector4 FuseMinMax[2];
+		GSVector4 FuseLODParams[2];
+		GSVector4 FuseSTRange[2];
+		// xy = STScale, z = TCOffsetHack.x, w = TCOffsetHack.y, per source.
+		GSVector4 FuseSTScaleTCO[2];
+		// xy = ScaleFactor.xy (texture-scale part; zw come from shared ScaleFactor).
+		GSVector4 FuseScaleXY[2];
+		// Per-source runtime mode: x = wms, y = wmt, z = ltf, w = lod mode
+		// (0 = none, 1 = automatic, 2 = manual), one row per source 1/2; source 0
+		// uses the selector wms/wmt/ltf/manual_lod/automatic_lod.
+		GSVector4i FuseMode[2];
+		// Per-source bitpack (x; yzw zero): aem_fmt[0-1] pal_fmt[2-3] aem[4]
+		// adjs[5] adjt[6] sw_aniso[7-11] repl_snap[12]. Source 0 uses the shared
+		// selector. See FusePackFlags.
+		GSVector4i FuseFlags[2];
+		// Per-source blend mapping (x; yzw zero): blend abcd[0-7] hw[8-10]
+		// mix[11-12] no_color1[13] af_in_src1[14] bf_in_alpha[15] inv_src1[16]
+		// round_inv[17] dev_enable[18] dev_op[19-20] dev_src[21-24] dev_dst[25-28].
+		// Source 0 is a pure REPLACE (asserted, needs no mapping). See FusePackBlend.
+		GSVector4i FuseBlend[2];
 
 		__fi PSConstantBuffer()
 		{
@@ -1339,7 +1376,15 @@ struct alignas(16) GSHWDrawConfig
 	GSTexture* ds;         ///< Depth stencil
 	GSTexture* tex;        ///< Source texture
 	GSTexture* pal;        ///< Palette texture
+	// TPF1 PS_FUSE3: sources 1/2 (source 0 is tex; pal stays T1's palette).
+	GSTexture* tex_fuse1 = nullptr;
+	GSTexture* tex_fuse2 = nullptr;
+	///< Shared sampler for fuse sources 1/2 (their selectors must be equal).
+	SamplerSelector sampler_fuse;
 	const GSVertex* verts; ///< Vertices to draw
+	// TPF1 VS_FUSE3: GSVertexFuse3 array (nverts entries); used instead of verts
+	// when ps.fuse3 is set.
+	const void* verts_fuse3 = nullptr;
 	const u16* indices;    ///< Indices to draw
 	u32 nverts;            ///< Number of vertices
 	u32 nindices;          ///< Number of indices
@@ -1607,6 +1652,7 @@ public:
 		bool broken_mad_deinterlace : 1; ///< Driver can't reliably preserve/read the two-bank FastMAD history target.
 		bool broken_blend_constant : 1; ///< Driver applies a CONST_COLOR / INV_CONST_COLOR blend factor as if the constant were zero. A fixed (AFIX) factor rides the second fragment output instead -- see GSBlendConstantPolicy.h.
 		bool inv_src1_rewrite : 1; ///< GE1_ADRENO_SRC1_REWRITE=1 on this backend: lopsided INV_SRC1_* blends ride SRC1_* factors with a complemented second output -- see GSInvSrc1Policy.h.
+		bool tfx_fuse3 : 1; ///< TPF1: backend binds the fused draw (extra sampler + RT/PRIMID image slots as filtered sources). Vulkan clears it when the RT slot is an input attachment (Mali subpass feedback).
 		GSFeedbackCarry feedback_carry; ///< Which draws may keep the open pass's feedback-loop bits. Vulkan only; see GSDrawRoad.h.
 		FeatureSupport()
 		{

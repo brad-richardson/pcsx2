@@ -17,6 +17,11 @@ enum class VSExpand : uint8_t
 	Sprite      = 3,
 	LineAA1     = 4,
 	TriangleAA1 = 5,
+	// TPF1: terrain pass-fusion. The vertex buffer holds GSVertexFuse3 (48 bytes:
+	// one ST pair per source pass plus the shared RGBAQ/XYZ/UV/FOG); the VS
+	// expands all three sources' UVs and the PS_FUSE3 pixel shader chains the
+	// three stock blends in-shader.
+	Fuse3       = 6,
 };
 
 enum class PS_ATST : uint32_t

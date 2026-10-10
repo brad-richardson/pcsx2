@@ -316,8 +316,9 @@ constexpr u32 Samsung = 0x144D;
 } // namespace GpuVendorID
 
 /// The push descriptors the Vulkan backend needs: one per texture slot of its TFX descriptor set
-/// (GSDeviceVK::NUM_TFX_TEXTURES, which a static_assert in GSDeviceVK.cpp holds equal to this).
-constexpr u32 VULKAN_PUSH_DESCRIPTORS_REQUIRED = 7;
+/// (GSDeviceVK::NUM_TFX_TEXTURES) plus the TPF1 fuse sampler binding, which a static_assert in
+/// GSDeviceVK.cpp holds equal to this.
+constexpr u32 VULKAN_PUSH_DESCRIPTORS_REQUIRED = 8;
 
 /// Vulkan device rules keyed on the device's own identity (vendor ID, device name, driver ID,
 /// driverInfo) rather than matched in the driver-bug database. Each keeps the exact condition the

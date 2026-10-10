@@ -22,6 +22,9 @@ enum GSMTLTextureIndex
 	GSMTLTextureIndexRenderTarget,
 	GSMTLTextureIndexPrimIDs,
 	GSMTLTextureIndexDepthTarget,
+	// TPF1: fused draw sources 1/2 (only bound when ps.fuse3).
+	GSMTLTextureIndexFuse1,
+	GSMTLTextureIndexFuse2,
 	GSMTLTextureIndexCount,
 };
 
@@ -91,6 +94,19 @@ struct GSMTLMainVertex
 	unsigned char fog;
 };
 
+// TPF1: 48-byte fused vertex (one ST pair per source pass plus the shared
+// RGBAQ/XYZ/UV/FOG). Layout must match GSVertexFuse3 exactly.
+struct GSMTLMainVertexFuse3
+{
+	vector_float2 st[3];
+	vector_uchar4 rgba;
+	float q;
+	vector_ushort2 xy;
+	uint z;
+	vector_ushort2 uv;
+	unsigned char fog;
+};
+
 struct GSMTLMainVSUniform
 {
 	vector_float2 vertex_scale;
@@ -100,6 +116,9 @@ struct GSMTLMainVSUniform
 	vector_float2 point_size;
 	uint max_depth;
 	float line_aa1_width;
+	// TPF1 VS_FUSE3: texture_scale/texture_offset for sources 1/2 (xy = scale,
+	// zw = offset). Order must match VSConstantBuffer exactly.
+	vector_float4 fuse_tex_scale_offset[2];
 };
 
 struct GSMTLMainPSUniform
@@ -148,6 +167,20 @@ struct GSMTLMainPSUniform
 	unsigned int dither_phase;
 
 	vector_float4 native_texel_grid;
+
+	// TPF1 PS_FUSE3 per-source texture constants (sources 1/2; source 0 uses the
+	// shared fields above). Order must match PSConstantBuffer exactly.
+	vector_float4 fuse_wh[2];
+	vector_float4 fuse_ta[2];
+	vector_float4 fuse_half_texel[2];
+	vector_float4 fuse_min_max[2];
+	vector_float4 fuse_lod_params[2];
+	vector_float4 fuse_st_range[2];
+	vector_float4 fuse_stscale_tco[2]; // xy = STScale, zw = TCOffsetHack.
+	vector_float4 fuse_scale_xy[2]; // xy = ScaleFactor.xy.
+	vector_int4 fuse_mode[2]; // x = wms, y = wmt, z = ltf, w = lod mode (0/1/2).
+	vector_int4 fuse_flags[2]; // x = bitpack (see FusePackFlags).
+	vector_int4 fuse_blend[2]; // x = bitpack (see FusePackBlend).
 };
 
 enum GSMTLAttributes
@@ -238,4 +271,5 @@ enum GSMTLFnConstants
 	GSMTLConstantIndex_PS_SW_ANISO,
 	GSMTLConstantIndex_PS_ROV_COLOR,
 	GSMTLConstantIndex_PS_ROV_DEPTH,
+	GSMTLConstantIndex_PS_FUSE3, // TPF1.
 };
