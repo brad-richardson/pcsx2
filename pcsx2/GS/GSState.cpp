@@ -532,7 +532,8 @@ void GSState::SetPrimHandlers()
 	m_fpGIFRegHandlerXYZ[P][2] = &GSState::GIFRegHandlerXYZ2<P, 0, auto_flush>; \
 	m_fpGIFRegHandlerXYZ[P][3] = &GSState::GIFRegHandlerXYZ2<P, 1, auto_flush>; \
 	m_fpGIFPackedRegHandlerSTQRGBAXYZF2[P] = &GSState::GIFPackedRegHandlerSTQRGBAXYZF2<P, auto_flush>; \
-	m_fpGIFPackedRegHandlerSTQRGBAXYZ2[P] = &GSState::GIFPackedRegHandlerSTQRGBAXYZ2<P, auto_flush>;
+	m_fpGIFPackedRegHandlerSTQRGBAXYZ2[P] = &GSState::GIFPackedRegHandlerSTQRGBAXYZ2<P, auto_flush>; \
+	m_fpGIFCompactHandler[P] = &GSState::GIFCompactHandlerSTQRGBAXYZF2<P, auto_flush>;
 
 // The stage-3c layouts, for the three prims the kernel carries. Everything else
 // keeps a null here and goes through Transfer's per-qword replay.
@@ -2968,6 +2969,305 @@ void GSState::GIFPackedRegHandlerSTQRGBAXYZF2(const GIFPackedReg* RESTRICT r, u3
 	}
 
 	m_q = r[size - 3].STQ.Q; // remember the last one, STQ outputs this to the temp Q each time
+}
+
+// NRS1: the compact twins of the STQRGBAXYZF2 handler and its batch shapes.
+// Same routing, same decisions, same emissions as the GIF arms above; the
+// input is dense 32-byte vertices, so there is no layout template and no
+// carry (compact is always the XYZF2 triple shape). The kernel entry runs
+// PassOneDense + the shared RunChunkPassTwo. Driven differentially against
+// the GIF arms by the adapter's ge1_compact_test.
+template <u32 prim>
+__noinline void GSState::KickCompactOneLegacy(const Ge1CompactVertex* RESTRICT dv, u32 uv, GSLimit24BitDepth depth_clamp)
+{
+	GSVector4i m0, m1;
+	GSVertexKernels::ParseCompactXYZF2(dv, uv, m0, m1);
+	ApplyDepthClampMode(depth_clamp, m1.U32[1]);
+
+	// Same as KickPackedOneLegacy: the seam leaves m_v behind it.
+	m_v.m[0] = m0;
+	m_v.m[1] = m1;
+
+	VertexKickCursor c;
+	c.Load(*this);
+	VertexKickDirect<prim, false>(dv->W3 & 0x8000u, dv->X & 0xFFFFu, dv->Y & 0xFFFFu, m0, m1, c);
+	c.Store();
+}
+
+template <u32 prim>
+__fi void GSState::KickCompactOneStaged(const Ge1CompactVertex* RESTRICT dv)
+{
+	GSVector4i m0, m1;
+	GSVertexKernels::ParseCompactXYZF2(dv, m_v.UV, m0, m1);
+
+	m_v.m[0] = m0;
+	m_v.m[1] = m1;
+
+	VertexKick<prim, true>(dv->W3 & 0x8000u);
+}
+
+template <u32 prim>
+__noinline void GSState::KickCompactStagedRun(const Ge1CompactVertex* RESTRICT d, u32 count)
+{
+	const Ge1CompactVertex* RESTRICT end = d + count;
+	while (d < end)
+	{
+		KickCompactOneStaged<prim>(d);
+		d++;
+	}
+}
+
+template <u32 prim>
+void GSState::KickCompactBatchLegacy(const Ge1CompactVertex* RESTRICT d, u32 count)
+{
+	u32 uv = m_v.UV; // compact XYZF2 vertices carry no UV, same as packed XYZF2
+	const GSLimit24BitDepth depth_clamp = GetDepthClampMode(); // batch-invariant
+
+	VertexKickCursor c;
+	c.Load(*this);
+
+	GSVector4i m0, m1;
+	for (u32 i = 0; i < count; i++)
+	{
+		const Ge1CompactVertex* RESTRICT dv = d + i;
+
+		GSVertexKernels::ParseCompactXYZF2(dv, uv, m0, m1);
+		ApplyDepthClampMode(depth_clamp, m1.U32[1]);
+
+		VertexKickDirect<prim, false>(dv->W3 & 0x8000u, dv->X & 0xFFFFu, dv->Y & 0xFFFFu, m0, m1, c);
+	}
+
+	c.Store();
+	m_v.m[0] = m0;
+	m_v.m[1] = m1;
+}
+
+template <u32 prim, bool auto_flush>
+void GSState::KickCompactBatchKernel(const Ge1CompactVertex* RESTRICT d, u32 count)
+{
+	constexpr u32 n = NumIndicesForPrim(prim);
+	constexpr u32 max_vertices = MaxVerticesForPrim(prim);
+
+	u32 uv = m_v.UV;
+	const GSLimit24BitDepth depth_clamp = GetDepthClampMode();
+
+	// Same invariant discipline as KickPackedBatchKernel: uv and the clamp
+	// mode are hoisted once (neither can change inside a batch); everything
+	// else is re-read before every kernel entry, because a seam kick can
+	// flush and restore a different environment.
+	GSVertexKickKernel::Invariants inv;
+	inv.uvfog = uv;
+	inv.clamp_enabled = (depth_clamp != GSLimit24BitDepth::Disabled);
+	if (inv.clamp_enabled)
+		GSVertexKickKernel::MakeDepthClampMasks(depth_clamp, inv.clamp_keep, inv.clamp_shifted);
+	inv.last_out = &m_v;
+	inv.track_native_rect = m_track_native_draw_rect;
+
+	bool snapshot_done = false;
+
+	u32 k = 0;
+	while (k < count)
+	{
+		const bool overlap_active = m_recent_buffer_switch && GSConfig.UserHacks_DrawBuffering;
+		const bool snapshot_pending = !snapshot_done && (m_index->tail == 0);
+		const bool cull_ok = !m_scissor_invalid && KickKernelApplies<prim>();
+
+		if constexpr (auto_flush)
+		{
+			if (!cull_ok)
+			{
+				const u32 run = std::min<u32>(count - k, GSVertexKickKernel::kChunkVertices);
+				GKV1NoteSeam(run);
+				KickCompactStagedRun<prim>(d + k, run);
+				k += run;
+				snapshot_done = false;
+				continue;
+			}
+		}
+
+		if (overlap_active || snapshot_pending || !cull_ok)
+		{
+			const bool fills = ((m_vertex->tail + 1) - m_vertex->head) >= n;
+			if constexpr (auto_flush)
+			{
+				KickCompactStagedRun<prim>(d + k, 1);
+			}
+			else
+			{
+				KickCompactOneLegacy<prim>(d + k, uv, depth_clamp);
+			}
+			GKV1NoteSeam(1);
+			k++;
+			snapshot_done = (!overlap_active && snapshot_pending && fills);
+			continue;
+		}
+
+		u32 chunk = std::min<u32>(count - k, GSVertexKickKernel::kChunkVertices);
+
+		// Stop short of the vertex whose accept would reach MaxVerticesForPrim, so
+		// the Flush(VERTEXCOUNT) it triggers happens inside a legacy kick. The live
+		// tail grows by at most one per vertex, so this bound is exact.
+		if constexpr (max_vertices != 0)
+		{
+			const u32 tail = m_vertex->tail;
+			const u32 room = (max_vertices > (tail + 1)) ? (max_vertices - 1 - tail) : 0;
+			chunk = std::min(chunk, room);
+		}
+
+		if (chunk == 0)
+		{
+			if constexpr (auto_flush)
+			{
+				KickCompactStagedRun<prim>(d + k, 1);
+			}
+			else
+			{
+				KickCompactOneLegacy<prim>(d + k, uv, depth_clamp);
+			}
+			GKV1NoteSeam(1);
+			k++;
+			snapshot_done = false;
+			continue;
+		}
+
+		if constexpr (auto_flush)
+		{
+			int tex_layer = 0;
+			if (IsAutoFlushDraw(prim, tex_layer))
+			{
+				GKV1NoteSeam(chunk);
+				KickCompactStagedRun<prim>(d + k, chunk);
+				k += chunk;
+				snapshot_done = false;
+				continue;
+			}
+		}
+
+		// Reserve room for the whole chunk plus a prim's worth of slack, so no
+		// store inside the kernel can land past maxcount and no growth is needed.
+		// Growth timing is not observable -- nothing reads the buffer between here
+		// and the flush that consumes it.
+		while ((m_vertex->tail + chunk + 3) > m_vertex->maxcount)
+			GrowVertexBuffer();
+
+		// Re-read across the seam: see the comment on inv above.
+		inv.xyof = m_xyof;
+		inv.grid = m_cull_grid;
+		inv.bounds = (inv.grid.shift == 4) ? m_cull_bounds_band : m_cull_bounds_raw;
+		inv.shift0_keepall = GKV1Shift0Kernel() &&
+		                     (((GSUtil::GetPrimClass(prim) == GS_SPRITE_CLASS) ? inv.grid.sprite_shift : inv.grid.shift) == 0);
+		inv.shade = (PRIM->TME ? 1u : 0u) | (PRIM->FST ? 2u : 0u) | (PRIM->IIP ? 4u : 0u);
+		inv.sprite_q_fix = (prim == GS_SPRITE) && (m_env.PRIM.FST == 0);
+
+		u32 acc_state = GSVertexKickKernel::kAccEmpty;
+		GSVector4i native_acc_rect = GSVector4i::zero();
+		const GSVector4i acc_rect = GSVertexKickKernel::RunChunkDense<prim>(d + k, chunk,
+			m_vertex, m_index, m_kick_side_xyp, m_kick_side_meta, inv, &acc_state, &native_acc_rect);
+
+		if (acc_state != GSVertexKickKernel::kAccEmpty)
+		{
+			const GSVector4i merged = (acc_state == GSVertexKickKernel::kAccReplace) ?
+										acc_rect :
+										temp_draw_rect.runion(acc_rect);
+			temp_draw_rect = merged.rintersect(m_context->scissor.in);
+
+			if (inv.track_native_rect)
+			{
+				const GSVector4i nat = (acc_state == GSVertexKickKernel::kAccReplace) ?
+				                           native_acc_rect :
+				                           temp_native_draw_rect.runion(native_acc_rect);
+				temp_native_draw_rect = nat.rintersect(m_context->scissor.in);
+			}
+		}
+
+		k += chunk;
+	}
+}
+
+template <u32 prim, bool auto_flush>
+void GSState::GIFCompactHandlerSTQRGBAXYZF2(const Ge1CompactVertex* RESTRICT d, u32 count)
+{
+	pxAssert(count > 0);
+
+	CheckFlushes();
+
+	if constexpr (auto_flush && !KickRoutesAutoFlush<prim>())
+	{
+		const Ge1CompactVertex* RESTRICT d_end = d + count;
+		while (d < d_end)
+		{
+			GSVector4i m0, m1;
+			GSVertexKernels::ParseCompactXYZF2(d, m_v.UV, m0, m1);
+
+			m_v.m[0] = m0;
+			m_v.m[1] = m1;
+
+			VertexKick<prim, auto_flush>(d->W3 & 0x8000u);
+
+			d++;
+		}
+
+		GKV1_NOTE(prim, count, 3, 6);
+		std::memcpy(&m_q, &d[-1].Q, sizeof(m_q));
+		return;
+	}
+
+	if constexpr (auto_flush)
+	{
+		if (count < GSVertexKickKernel::kMinKernelVertices || !s_fused_kick_use_kernel ||
+			!KickKernelApplies<prim>())
+		{
+			const Ge1CompactVertex* RESTRICT d_end = d + count;
+			while (d < d_end)
+			{
+				GSVector4i m0, m1;
+				GSVertexKernels::ParseCompactXYZF2(d, m_v.UV, m0, m1);
+
+				m_v.m[0] = m0;
+				m_v.m[1] = m1;
+
+				VertexKick<prim, auto_flush>(d->W3 & 0x8000u);
+
+				d++;
+			}
+
+			GKV1_NOTE(prim, count, 2, 0);
+			std::memcpy(&m_q, &d[-1].Q, sizeof(m_q));
+			return;
+		}
+	}
+
+	if constexpr (KickKernelCarriesPrim<prim>())
+	{
+		if (s_fused_kick_use_kernel && count >= GSVertexKickKernel::kMinKernelVertices &&
+			KickKernelApplies<prim>())
+		{
+			GKV1_NOTE(prim, count, 0, 0);
+			KickCompactBatchKernel<prim, auto_flush>(d, count);
+		}
+		else if constexpr (auto_flush)
+		{
+			GKV1_NOTE(prim, count, 2, 0);
+			KickCompactStagedRun<prim>(d, count);
+		}
+		else
+		{
+			GKV1_NOTE(prim, count, 1, 0);
+			KickCompactBatchLegacy<prim>(d, count);
+		}
+	}
+	else if constexpr (auto_flush)
+	{
+		GKV1_NOTE(prim, count, 2, 0);
+		KickCompactStagedRun<prim>(d, count);
+	}
+	else
+	{
+		GKV1_NOTE(prim, count, 1, 0);
+		KickCompactBatchLegacy<prim>(d, count);
+	}
+
+	std::memcpy(&m_q, &d[count - 1].Q, sizeof(m_q)); // the raw last Q, as STQ outputs it
 }
 
 template <u32 prim, bool auto_flush>
@@ -5706,6 +6006,62 @@ void GSState::Transfer(const u8* mem, u32 size)
 			path.nloop = 0;
 		}
 	}
+}
+
+// NRS1: one compact native record (GSCompactRecord.h) on PATH1. Each packet
+// is the tag verbatim plus dense vertices; the kick runs the compact twins
+// of the fused STQRGBAXYZF2 arms. Validate first, ingest second: a malformed
+// record (or a PATH1 tag left open, which whole-packet Transfers never leave)
+// refuses the whole call without changing any state, and the caller falls
+// back to GIF packets. No dump-sink feed: GE1 never opens one (the runtime
+// capture is the capture path, and it sees expanded packets at the frontend).
+bool GSState::TransferCompact(const u8* bytes, u32 size)
+{
+	GIFPath& path = m_path[3]; // PATH1, like GSgifTransfer -> Transfer<3>
+	if (path.nloop != 0)
+		return false;
+
+	struct Packet
+	{
+		const u8* tag;
+		const Ge1CompactVertex* verts;
+		u32 nloop;
+	};
+	Packet packets[64];
+	u32 npackets = 0;
+	const bool wellformed = ge1_compact_record_for_each(bytes, size,
+		[&](const u8* pkt, u32 n) {
+			if (npackets >= 64)
+				return false;
+			const u32 nv = (n - 16u) / 32u;
+			GIFPath probe{};
+			probe.SetTag(pkt);
+			if (!probe.tag.PRE || probe.tag.FLG != GIF_FLG_PACKED || probe.nreg != 3 ||
+				probe.type != GIFPath::TYPE_STQRGBAXYZF2 || probe.nloop != nv)
+				return false;
+			Packet p;
+			p.tag = pkt;
+			p.verts = reinterpret_cast<const Ge1CompactVertex*>(pkt + 16);
+			p.nloop = nv;
+			packets[npackets++] = p;
+			return true;
+		});
+	if (!wellformed)
+		return false;
+
+	for (u32 i = 0; i < npackets; i++)
+	{
+		path.SetTag(packets[i].tag);
+		// eeuser 7.2.2: NLOOP 0 outputs nothing (same as Transfer: no m_q,
+		// no PRIM, no handler call).
+		if (path.nloop == 0)
+			continue;
+		m_q = 1.0f;
+		ApplyPRIM(path.tag.PRIM);
+		(this->*m_fpGIFCompactHandler[PRIM->PRIM])(packets[i].verts, packets[i].nloop);
+		path.nloop = 0;
+	}
+	return true;
 }
 
 template <class T>

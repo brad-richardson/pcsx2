@@ -4,6 +4,7 @@
 #pragma once
 
 #include "GS/GSBackQueue.h"
+#include "GS/GSCompactRecord.h"
 #include "GS/GSUtil.h"
 #include "GS/GSVertexKick.h"
 #include "GS/Renderers/Common/GSVertex.h"
@@ -442,6 +443,134 @@ namespace GSVertexKickKernel
 	}
 
 	// ------------------------------------------------------------------------
+	// Pass one for compact (NRS1) vertices: the same (m0, m1, side entry) the
+	// TripleXYZF2 pass one above computes, from the dense 32-byte vertex
+	// instead of the 48-byte register triple. m0 is one vector load plus the
+	// Q fixup; m1 assembles XY/Z/FOG from the verbatim XYZF2 words with UV
+	// from inv (m_v.UV, which an XYZF2 run never changes); the mirror build
+	// runs on the same BuildMirrorQuad over the dense X/Y/W3 words. `clamp`
+	// is a template parameter for the same reason as above.
+	// ------------------------------------------------------------------------
+	template <bool clamp>
+	__forceinline_odr void PassOneDense(const Ge1CompactVertex* RESTRICT d, u32 count,
+		GSVertex* RESTRICT out, u64* RESTRICT side_xyp, u64* RESTRICT side_meta, const Invariants& inv)
+	{
+		const u32 uv = static_cast<u32>(inv.uvfog);
+		const int ofx = inv.xyof.I32[0];
+		const int ofy = inv.xyof.I32[1];
+		const int bl = inv.bounds.l, bt = inv.bounds.t, br = inv.bounds.r, bb = inv.bounds.b;
+		const int band_shift = inv.grid.shift;
+		const bool banded = (band_shift == 4);
+		const int band_bias_x = inv.grid.band_bias_x;
+		const int band_bias_y = inv.grid.band_bias_y;
+		const GSVector4i keep = inv.clamp_keep;
+		const GSVector4i shifted = inv.clamp_shifted;
+#ifdef ARCH_ARM64
+		const GSVertexKernels::PackedParseConsts kc = GSVertexKernels::MakePackedParseConsts();
+		const MirrorBounds mb = MakeMirrorBounds(inv.xyof, inv.bounds, band_shift, banded, band_bias_x, band_bias_y);
+#endif
+
+		// The mirror build is four at a time with the same back-quad remainder
+		// rule as the GIF pass one above (recomputed entries are the same
+		// values from the same inputs); only a run shorter than four vertices
+		// takes the scalar path. The XYZ words sit at dense offset 16, so each
+		// quad input is one aligned vector load of {X, Y, Z, W3}.
+		u32 i = 0;
+#ifdef ARCH_ARM64
+		for (const u32 quads = count & ~3u; i < quads; i += 4)
+		{
+			for (u32 j = 0; j < 4; j++)
+			{
+				uint32x4_t m0 = vld1q_u32(&d[i + j].S);
+				m0 = vorrq_u32(m0, vandq_u32(vceqzq_u32(m0), kc.q_fixup));
+				const u32 X = d[i + j].X, Y = d[i + j].Y;
+				const u32 Z = d[i + j].Z, W3 = d[i + j].W3;
+				GSVector4i m1(static_cast<int>((X & 0xFFFFu) | (Y << 16)),
+					static_cast<int>((Z >> 4) & 0x00FFFFFFu), static_cast<int>(uv),
+					static_cast<int>((W3 >> 4) & 0xFFu));
+
+				if constexpr (clamp)
+					m1 = (m1 & keep) | (m1.srl32<8>() & shifted);
+
+				out[i + j].m[0] = GSVector4i(vreinterpretq_s32_u32(m0));
+				out[i + j].m[1] = m1;
+			}
+
+			BuildMirrorQuad(
+				vld1q_u32(&d[i + 0].X),
+				vld1q_u32(&d[i + 1].X),
+				vld1q_u32(&d[i + 2].X),
+				vld1q_u32(&d[i + 3].X),
+				mb, side_xyp + i, side_meta + i);
+		}
+
+		if (i < count && count >= 4)
+		{
+			const u32 back = count - 4;
+			BuildMirrorQuad(
+				vld1q_u32(&d[back + 0].X),
+				vld1q_u32(&d[back + 1].X),
+				vld1q_u32(&d[back + 2].X),
+				vld1q_u32(&d[back + 3].X),
+				mb, side_xyp + back, side_meta + back);
+
+			for (; i < count; i++)
+			{
+				uint32x4_t m0 = vld1q_u32(&d[i].S);
+				m0 = vorrq_u32(m0, vandq_u32(vceqzq_u32(m0), kc.q_fixup));
+				const u32 X = d[i].X, Y = d[i].Y;
+				const u32 Z = d[i].Z, W3 = d[i].W3;
+				GSVector4i m1(static_cast<int>((X & 0xFFFFu) | (Y << 16)),
+					static_cast<int>((Z >> 4) & 0x00FFFFFFu), static_cast<int>(uv),
+					static_cast<int>((W3 >> 4) & 0xFFu));
+
+				if constexpr (clamp)
+					m1 = (m1 & keep) | (m1.srl32<8>() & shifted);
+
+				out[i].m[0] = GSVector4i(vreinterpretq_s32_u32(m0));
+				out[i].m[1] = m1;
+			}
+			return;
+		}
+#endif
+
+		for (; i < count; i++)
+		{
+			GSVector4i m0, m1;
+			GSVertexKernels::ParseCompactXYZF2(d + i, uv, m0, m1);
+
+			if constexpr (clamp)
+				m1 = (m1 & keep) | (m1.srl32<8>() & shifted);
+
+			out[i].m[0] = m0;
+			out[i].m[1] = m1;
+
+			// Same expressions as the GIF scalar tail (and BuildMirrorQuad
+			// lane-wise): the window position from the low halves, the ADC bit
+			// from bit 15 of the verbatim W3.
+			const u32 X = d[i].X, Y = d[i].Y, W3 = d[i].W3;
+			const int wx = static_cast<int>(X & 0xFFFFu) - ofx;
+			const int wy = static_cast<int>(Y & 0xFFFFu) - ofy;
+			const int bx = (wx - band_bias_x) >> band_shift;
+			const int by = (wy - band_bias_y) >> band_shift;
+			const int cx = banded ? bx : wx;
+			const int cy = banded ? by : wy;
+
+			u32 oc = 0;
+			oc |= (cx < bl) ? 1u : 0u;
+			oc |= (cx >= br) ? 2u : 0u;
+			oc |= (cy < bt) ? 4u : 0u;
+			oc |= (cy >= bb) ? 8u : 0u;
+
+			side_xyp[i] = static_cast<u64>(static_cast<u32>(wx)) | (static_cast<u64>(static_cast<u32>(wy)) << 32);
+			side_meta[i] = (static_cast<u64>(static_cast<u32>(bx)) & GSVertexKernels::kCullMetaBandXMask) |
+			               ((static_cast<u64>(static_cast<u32>(by)) << 28) & GSVertexKernels::kCullMetaBandYMask) |
+			               (static_cast<u64>(oc) << 56) |
+			               (static_cast<u64>(W3 & 0x8000u) << kAdcShift);
+		}
+	}
+
+	// ------------------------------------------------------------------------
 	// The kernel. `prim` is one of GS_TRIANGLESTRIP / GS_TRIANGLELIST /
 	// GS_SPRITE; `layout` says where the record's descriptors sit and which of
 	// them the tag omits -- the only per-layout part of the whole kernel is pass
@@ -466,6 +595,73 @@ namespace GSVertexKickKernel
 		u64* RESTRICT side_xyp, u64* RESTRICT side_meta, const Invariants& inv, u32* RESTRICT acc_state_out,
 		GSVector4i* RESTRICT native_acc_out)
 	{
+		static_assert(prim == GS_TRIANGLESTRIP || prim == GS_TRIANGLELIST || prim == GS_SPRITE);
+
+		GSVertex* RESTRICT vbuff = vertex_buf->buff;
+
+		const u32 tail0 = vertex_buf->tail;
+
+		if (inv.clamp_enabled)
+			PassOne<layout, true>(rin, count, vbuff + tail0, side_xyp, side_meta, inv);
+		else
+			PassOne<layout, false>(rin, count, vbuff + tail0, side_xyp, side_meta, inv);
+
+		// m_v carries the last parsed vertex out of the batch. Pass one has just
+		// written it to its provisional slot and pass two has not run yet, so
+		// nothing has moved it: the batch tail is a 32-byte copy from there rather
+		// than a second parse of the last record by the caller (which cost 25
+		// instructions a call). Taken per chunk rather than per call, which is
+		// redundant on a multi-chunk call and free on a single-chunk one.
+		*inv.last_out = vbuff[tail0 + count - 1];
+
+		return RunChunkPassTwo<prim>(count, vertex_buf, index_buf, side_xyp, side_meta, inv,
+			acc_state_out, native_acc_out);
+	}
+
+	// NRS1: the compact kernel entry. Same contract as RunChunk above (the
+	// caller guarantees are identical: itail != 0, no recent switch, valid
+	// scissor, scalar-outcode cull applies, room for the chunk plus slack, no
+	// VERTEXCOUNT flush inside); pass one reads dense vertices, pass two is
+	// the shared one. Every vertex of the chunk is consumed.
+	template <u32 prim>
+	__noinline GSVector4i RunChunkDense(const Ge1CompactVertex* RESTRICT din, u32 count,
+		GSBackQueue::VertexBuff* RESTRICT vertex_buf, GSBackQueue::IndexBuff* RESTRICT index_buf,
+		u64* RESTRICT side_xyp, u64* RESTRICT side_meta, const Invariants& inv, u32* RESTRICT acc_state_out,
+		GSVector4i* RESTRICT native_acc_out)
+	{
+		static_assert(prim == GS_TRIANGLESTRIP || prim == GS_TRIANGLELIST || prim == GS_SPRITE);
+
+		GSVertex* RESTRICT vbuff = vertex_buf->buff;
+
+		const u32 tail0 = vertex_buf->tail;
+
+		if (inv.clamp_enabled)
+			PassOneDense<true>(din, count, vbuff + tail0, side_xyp, side_meta, inv);
+		else
+			PassOneDense<false>(din, count, vbuff + tail0, side_xyp, side_meta, inv);
+
+		// Same as RunChunk above: the batch tail is a 32-byte copy of the last
+		// parsed vertex from its provisional slot, which pass two has not moved.
+		*inv.last_out = vbuff[tail0 + count - 1];
+
+		return RunChunkPassTwo<prim>(count, vertex_buf, index_buf, side_xyp, side_meta, inv,
+			acc_state_out, native_acc_out);
+	}
+
+	// ------------------------------------------------------------------------
+	// Pass two + exit, shared by the GIF and the compact (NRS1) kernel entries.
+	// Layout-independent: it reads the side table and the provisional buffer
+	// pass one left behind, never the input stream. Split out of RunChunk
+	// without touching a line of it: the GIF wrapper above expands to the same
+	// code (pass one is force-inline, this is force-inline into a __noinline
+	// caller either way).
+	// ------------------------------------------------------------------------
+	template <u32 prim>
+	__forceinline_odr GSVector4i RunChunkPassTwo(u32 count,
+		GSBackQueue::VertexBuff* RESTRICT vertex_buf, GSBackQueue::IndexBuff* RESTRICT index_buf,
+		u64* RESTRICT side_xyp, u64* RESTRICT side_meta, const Invariants& inv, u32* RESTRICT acc_state_out,
+		GSVector4i* RESTRICT native_acc_out)
+	{
 		constexpr u32 n = (prim == GS_SPRITE) ? 2u : 3u;
 		constexpr int primclass = GSUtil::GetPrimClass(prim);
 		constexpr bool strip = (prim == GS_TRIANGLESTRIP);
@@ -480,19 +676,6 @@ namespace GSVertexKickKernel
 
 		const u32 tail0 = vertex_buf->tail;
 		const u32 xy_tail0 = vertex_buf->xy_tail;
-
-		if (inv.clamp_enabled)
-			PassOne<layout, true>(rin, count, vbuff + tail0, side_xyp, side_meta, inv);
-		else
-			PassOne<layout, false>(rin, count, vbuff + tail0, side_xyp, side_meta, inv);
-
-		// m_v carries the last parsed vertex out of the batch. Pass one has just
-		// written it to its provisional slot and pass two has not run yet, so
-		// nothing has moved it: the batch tail is a 32-byte copy from there rather
-		// than a second parse of the last record by the caller (which cost 25
-		// instructions a call). Taken per chunk rather than per call, which is
-		// redundant on a multi-chunk call and free on a single-chunk one.
-		*inv.last_out = vbuff[tail0 + count - 1];
 
 		// ---- pass two -------------------------------------------------------
 		u32 head = vertex_buf->head;

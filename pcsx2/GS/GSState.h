@@ -106,6 +106,11 @@ private:
 	GIFPackedRegHandlerC m_fpGIFPackedRegHandlersC[2] = {};
 	GIFPackedRegHandlerC m_fpGIFPackedRegHandlerSTQRGBAXYZF2[8] = {};
 	GIFPackedRegHandlerC m_fpGIFPackedRegHandlerSTQRGBAXYZ2[8] = {};
+	// NRS1: the compact twin of the STQRGBAXYZF2 table, armed in the same
+	// SetPrimHandlers macro with the same auto_flush expressions, so a prim's
+	// compact instantiation always matches its GIF one.
+	typedef void (GSState::*GIFCompactHandlerC)(const Ge1CompactVertex* RESTRICT d, u32 count);
+	GIFCompactHandlerC m_fpGIFCompactHandler[8] = {};
 
 	void GIFPackedRegHandlerNOP(const GIFPackedReg* RESTRICT r, u32 size);
 
@@ -467,6 +472,19 @@ protected:
 	template<u32 prim, GSVertexKernels::PackedLayout layout> void KickPackedOneStaged(const GIFPackedReg* RESTRICT rv);
 	template<u32 prim, GSVertexKernels::PackedLayout layout> void KickPackedStagedRun(const GIFPackedReg* RESTRICT r, u32 count);
 	template<u32 prim, GSVertexKernels::PackedLayout layout> void KickPackedOneLegacy(const GIFPackedReg* RESTRICT rv, u64 uvfog, GSLimit24BitDepth depth_clamp);
+	// NRS1: the compact twins of the fused STQRGBAXYZF2 handler and its batch
+	// shapes. Same routing, same decisions, same emissions; the input is the
+	// dense 32-byte vertex (GSCompactRecord.h) instead of the 48-byte register
+	// triple, so there is no layout template (compact is always the XYZF2
+	// triple shape) and the kernel entry runs PassOneDense + the shared
+	// RunChunkPassTwo. Driven differentially against the GIF arms by the
+	// adapter's ge1_compact_test.
+	template<u32 prim, bool auto_flush> void GIFCompactHandlerSTQRGBAXYZF2(const Ge1CompactVertex* RESTRICT d, u32 count);
+	template<u32 prim, bool auto_flush> void KickCompactBatchKernel(const Ge1CompactVertex* RESTRICT d, u32 count);
+	template<u32 prim> void KickCompactBatchLegacy(const Ge1CompactVertex* RESTRICT d, u32 count);
+	template<u32 prim> void KickCompactOneStaged(const Ge1CompactVertex* RESTRICT dv);
+	template<u32 prim> void KickCompactStagedRun(const Ge1CompactVertex* RESTRICT d, u32 count);
+	template<u32 prim> void KickCompactOneLegacy(const Ge1CompactVertex* RESTRICT dv, u32 uv, GSLimit24BitDepth depth_clamp);
 	template<u32 prim> bool KickKernelApplies();
 	// GKV1 census (lane branch only): per-batch two-pass vs legacy + fallback
 	// reason. No-op unless GE1_GKV1_STATS=1. paths: 0 kernel, 1 legacy,
@@ -1037,6 +1055,9 @@ public:
 	void SyncAsyncReadbackMemory();
 
 	template<int index> void Transfer(const u8* mem, u32 size);
+	// NRS1: one compact native record (PATH1). False (no state changed) on a
+	// malformed record; the caller falls back to GIF packets.
+	bool TransferCompact(const u8* bytes, u32 size);
 	int Freeze(freezeData* fd, bool sizeonly);
 	int Defrost(const freezeData* fd);
 
