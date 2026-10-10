@@ -134,6 +134,10 @@ namespace GSStatic
 		o.rect = GSVector4i::zero();
 		o.nrect = GSVector4i::zero();
 		u32 head = 0, tail = 0, next = 0;
+		// The kernel's fused-FMM watermark, relative: each referenced vertex is
+		// folded in once (min/max are idempotent; GSVertexKick.h), vertices a
+		// compaction moves below it again.
+		u32 wm = 0;
 		for (u32 i = 0; i < count; i++)
 		{
 			o.src[tail] = static_cast<u8>(i);
@@ -183,6 +187,7 @@ namespace GSStatic
 					o.src[next + 2] = o.src[head + 2];
 					dst = next;
 					o.wm_min = std::min(o.wm_min, next);
+					wm = std::min(wm, next);
 				}
 			}
 			if (!shift0)
@@ -192,11 +197,10 @@ namespace GSStatic
 			s3[0] = static_cast<u8>(dst);
 			s3[1] = static_cast<u8>(dst + 1);
 			s3[2] = static_cast<u8>(dst + 2);
-			for (u32 j = 0; j < 3; j++)
-			{
-				const u32 v = o.src[dst + j];
-				GSVertexKernels::FmmAccumVertex(o.acc, m0[v], m1[v], tme, fst, iip || j == 2);
-			}
+			for (u32 j = std::max(wm, dst); j < dst + 2; j++)
+				GSVertexKernels::FmmAccumVertex(o.acc, m0[o.src[j]], m1[o.src[j]], tme, fst, iip);
+			GSVertexKernels::FmmAccumVertex(o.acc, m0[o.src[dst + 2]], m1[o.src[dst + 2]], tme, fst, true);
+			wm = dst + 3;
 			const GSVector4i r = GSVertexKernels::PrimDrawRect(bbox);
 			const GSVector4i nr = GSVertexKernels::PrimNativeDrawRectOrNone<GS_TRIANGLE_CLASS>(bbox);
 			o.rect = o.ntri ? o.rect.runion(r) : r;

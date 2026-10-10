@@ -6223,14 +6223,6 @@ void GSStaticRecordBegin(const u8* block, u32 size)
 			if (h->count > kStaticMaxVerts || h->tail > h->count || h->ntri > h->count || off + GSStaticPrepWireSize(*h) > hdr[2] ||
 				h->nring > 4 || h->nring > h->count || h->head > h->tail || h->nslot > h->tail)
 				return;
-			const u8* sl = reinterpret_cast<const u8*>(h + 1);
-			for (u32 k = 0; k < 3 * h->ntri; k++)
-				if (sl[k] >= h->nslot)
-					return;
-			const u8* sr = sl + 3 * h->ntri;
-			for (u32 k = 0; k < h->tail; k++)
-				if (sr[k] >= h->count)
-					return;
 		}
 	}
 	GSState::s_static_rec = block;
@@ -6281,8 +6273,10 @@ int GSState::StaticFastOk(u32 count)
 	return 0;
 }
 
+// Returns false, with nothing committed, when a record-provided outcome
+// references a slot or vertex it cannot (the caller prepares locally instead).
 template <u32 prim>
-void GSState::StaticApply(const Ge1CompactVertex* RESTRICT d, const GSStaticPrepHdr& p, const u8* RESTRICT pslot,
+bool GSState::StaticApply(const Ge1CompactVertex* RESTRICT d, const GSStaticPrepHdr& p, const u8* RESTRICT pslot,
 	const u8* RESTRICT psrc, const GSStaticCullState& cs)
 {
 	const u32 uv = m_v.UV;
@@ -6290,6 +6284,38 @@ void GSState::StaticApply(const Ge1CompactVertex* RESTRICT d, const GSStaticPrep
 	const u32 base = vb->tail; // == head == next after ApplyPRIM
 	const u32 itail0 = m_index->tail;
 	const u32 count = p.count;
+
+	while ((base + count + 3) > vb->maxcount)
+		GrowVertexBuffer();
+
+	const bool clamp = static_cast<GSLimit24BitDepth>(cs.clamp) != GSLimit24BitDepth::Disabled;
+	GSVector4i keep = GSVector4i::xffffffff(), shifted = GSVector4i::zero();
+	if (clamp)
+		GSVertexKickKernel::MakeDepthClampMasks(static_cast<GSLimit24BitDepth>(cs.clamp), keep, shifted);
+
+	// Stores below land at or past the live tail and the index tail, so they
+	// commit only with the cursor updates further down.
+	u32 bad = 0;
+	GSVertex* RESTRICT vbuff = vb->buff + base;
+	GSVector4i m0, m1;
+	for (u32 s = 0; s < p.tail; s++)
+	{
+		const u32 v = psrc[s];
+		bad |= (v >= count);
+		GSStatic::Parse(d + (v < count ? v : 0u), uv, clamp, keep, shifted, m0, m1);
+		GSVector4i* RESTRICT dst = reinterpret_cast<GSVector4i*>(vbuff + s);
+		dst[0] = m0;
+		dst[1] = m1;
+	}
+	const u32 nidx = 3 * p.ntri;
+	u16* RESTRICT ib = m_index->buff + itail0;
+	for (u32 k = 0; k < nidx; k++)
+	{
+		bad |= (pslot[k] >= p.nslot);
+		ib[k] = static_cast<u16>(base + pslot[k]);
+	}
+	if (bad)
+		return false;
 
 	// VertexKickDirect's draw snapshot: the first filled window of an empty draw
 	// (whether or not its prim is then culled).
@@ -6305,34 +6331,12 @@ void GSState::StaticApply(const Ge1CompactVertex* RESTRICT d, const GSStaticPrep
 		SetDrawBufferEnv();
 	}
 
-	while ((base + count + 3) > vb->maxcount)
-		GrowVertexBuffer();
-
-	const bool clamp = static_cast<GSLimit24BitDepth>(cs.clamp) != GSLimit24BitDepth::Disabled;
-	GSVector4i keep = GSVector4i::xffffffff(), shifted = GSVector4i::zero();
-	if (clamp)
-		GSVertexKickKernel::MakeDepthClampMasks(static_cast<GSLimit24BitDepth>(cs.clamp), keep, shifted);
-
-	GSVertex* RESTRICT vbuff = vb->buff + base;
-	GSVector4i m0, m1;
-	for (u32 s = 0; s < p.tail; s++)
-	{
-		GSStatic::Parse(d + psrc[s], uv, clamp, keep, shifted, m0, m1);
-		GSVector4i* RESTRICT dst = reinterpret_cast<GSVector4i*>(vbuff + s);
-		dst[0] = m0;
-		dst[1] = m1;
-	}
 	// The kick leaves the last parsed vertex in m_v.
 	GSStatic::Parse(d + count - 1, uv, clamp, keep, shifted, m0, m1);
 	m_v.m[0] = m0;
 	m_v.m[1] = m1;
 
-	const u32 nidx = 3 * p.ntri;
-	u16* RESTRICT ib = m_index->buff + itail0;
-	for (u32 k = 0; k < nidx; k++)
-		ib[k] = static_cast<u16>(base + pslot[k]);
 	m_index->tail = itail0 + nidx;
-
 	vb->head = base + p.head;
 	vb->tail = base + p.tail;
 	vb->next = p.ntri ? base + p.nslot : base;
@@ -6368,6 +6372,7 @@ void GSState::StaticApply(const Ge1CompactVertex* RESTRICT d, const GSStaticPrep
 			temp_native_draw_rect =
 				((itail0 == 0) ? p.nrect : temp_native_draw_rect.runion(p.nrect)).rintersect(m_context->scissor.in);
 	}
+	return true;
 }
 
 struct GSState::StaticShadow
@@ -6540,7 +6545,8 @@ bool GSState::StaticPacket(const Ge1CompactVertex* d, u32 count, u32 packet)
 			alignas(16) GSStaticCullState want;
 			std::memcpy(&want, s_static_rec + 16, sizeof(want));
 			want.prim = rh->prim;
-			if (rh->count == count && std::memcmp(&want, &cs, sizeof(cs)) == 0)
+			if (rh->count == count && rh->tail <= count && rh->ntri <= count && rh->nslot <= rh->tail && rh->head <= rh->tail &&
+			std::memcmp(&want, &cs, sizeof(cs)) == 0)
 				ph = rh;
 		}
 		s_fp[ph ? 13 : 14].fetch_add(1, std::memory_order_relaxed);
@@ -6580,10 +6586,20 @@ bool GSState::StaticPacket(const Ge1CompactVertex* d, u32 count, u32 packet)
 		StaticShadowCapture(s_kick, base, itail0);
 		StaticShadowRestore(s_pre);
 	}
-	if (prim == GS_TRIANGLESTRIP)
-		StaticApply<GS_TRIANGLESTRIP>(d, prep, pslot, psrc, cs);
-	else
-		StaticApply<GS_TRIANGLELIST>(d, prep, pslot, psrc, cs);
+	bool applied = (prim == GS_TRIANGLESTRIP) ? StaticApply<GS_TRIANGLESTRIP>(d, prep, pslot, psrc, cs) :
+	                                            StaticApply<GS_TRIANGLELIST>(d, prep, pslot, psrc, cs);
+	if (!applied)
+	{
+		// A malformed record outcome (never seen): prepare here instead.
+		s_fp[14].fetch_add(1, std::memory_order_relaxed);
+		if (prim == GS_TRIANGLESTRIP)
+			GSStatic::Prepare<GS_TRIANGLESTRIP>(d, count, cs, local);
+		else
+			GSStatic::Prepare<GS_TRIANGLELIST>(d, count, cs, local);
+		applied = (prim == GS_TRIANGLESTRIP) ? StaticApply<GS_TRIANGLESTRIP>(d, local, local.slot, local.src, cs) :
+		                                       StaticApply<GS_TRIANGLELIST>(d, local, local.slot, local.src, cs);
+		pxAssert(applied);
+	}
 	std::memcpy(&m_q, &d[count - 1].Q, sizeof(m_q)); // the handler's last act
 	s_fp[1].fetch_add(1, std::memory_order_relaxed);
 	s_fp[2].fetch_add(count, std::memory_order_relaxed);

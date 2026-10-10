@@ -496,7 +496,7 @@ protected:
 	void StaticPublish(const GSStaticCullState& live);
 	void StaticCullStateLive(GSStaticCullState& cs);
 	template<u32 prim> int StaticFastOk(u32 count);
-	template<u32 prim> void StaticApply(const Ge1CompactVertex* RESTRICT d, const GSStaticPrepHdr& p, const u8* RESTRICT pslot,
+	template<u32 prim> bool StaticApply(const Ge1CompactVertex* RESTRICT d, const GSStaticPrepHdr& p, const u8* RESTRICT pslot,
 		const u8* RESTRICT psrc, const GSStaticCullState& cs);
 	void StaticSpecNote(const GSStaticCullState& cs);
 	struct StaticShadow;
