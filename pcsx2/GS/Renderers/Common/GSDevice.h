@@ -17,6 +17,7 @@
 #include "GS/GSAlignedClass.h"
 #include "GS/GSExtra.h"
 #include <array>
+#include <mutex>
 #include <span>
 #include <string>
 #include <vector>
@@ -1738,6 +1739,19 @@ protected:
 	u64 m_last_frame_displayed_time = 0;
 
 	GSTexture* m_merge = nullptr;
+	/// OUT1 (a): the merge this vsync borrowed (m_current aliases a cache-owned
+	/// display target) instead of drawing. Null after a real merge or a clear.
+	GSTexture* m_merge_borrowed = nullptr;
+	/// OUT1 (a) thread gate: merges and current-frame exports each record (seq,
+	/// thread). A merge borrows only when the previous merge was exported by
+	/// the same thread (worker-adjacent); a latch export between merges keeps
+	/// the next merge real. Guarded: merges run on the worker, exports on any.
+	std::mutex m_merge_gate_mutex;
+	u64 m_merge_seq = 0;
+	u64 m_export_seq = 0;
+	u64 m_merge_tid = 0;
+	u64 m_export_tid = 0;
+	u64 m_merge_skips = 0;
 	GSTexture* m_weavebob = nullptr;
 	GSTexture* m_blend = nullptr;
 	GSTexture* m_mad = nullptr;
@@ -2252,6 +2266,16 @@ public:
 
 	void ClearCurrent();
 	void Merge(GSTexture* sTex[3], GSVector4* sRect, GSVector4* dRect, const MergeTopBand* top_band, const GSVector2i& fs, const GSRegPMODE& PMODE, const GSRegEXTBUF& EXTBUF, u32 c);
+	/// OUT1 (a): alias tex as the current frame (the merge proved it identical
+	/// to what DoMerge would draw). Flushes deferred draws, records the merge
+	/// in the thread gate, and logs engagement (first + every 600th).
+	void SetCurrentFromMergeSkip(GSTexture* tex);
+	/// OUT1 (a): true when the merge gate allows a borrow on this thread (the
+	/// previous merge was exported by this same thread). Records this merge.
+	bool MergeSkipGateOpen();
+	/// OUT1 (a): record a current-frame export (AHB/IOSurface/snapshot/swapchain
+	/// present) in the thread gate. Called only when the export reads m_current.
+	void NoteCurrentExport();
 	/// `top_pad` is the device rows of the merge target that were not drawn for this field, because
 	/// the merge offset that field's picture down by a native line: they start where the circuit's
 	/// display rect starts, not necessarily at row 0.

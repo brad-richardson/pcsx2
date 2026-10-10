@@ -4862,11 +4862,12 @@ void GSDeviceVK::DoCopyRect(GSTexture* sTex, GSTexture* dTex, const GSVector4i& 
 }
 
 #ifdef __ANDROID__
-bool GSDeviceVK::CopySnapshotToAHB(GSTexture* source, AHardwareBuffer* buffer, u32 width, u32 height, u32 pad_x, u32 pad_y, u64* fence_counter)
+GSDeviceVK::ExportImage* GSDeviceVK::FindOrImportAHBImage(
+	AHardwareBuffer* buffer, u32 width, u32 height)
 {
-	auto fail = [](const char* why) { std::fprintf(stderr, "GE1 AHB export: %s\n", why); return false; };
-	if (!source || !buffer || !fence_counter || !m_device || pad_x + source->GetWidth() > width || pad_y + source->GetHeight() > height)
-		return fail("invalid source, device, or dimensions");
+	auto fail = [](const char* why) { std::fprintf(stderr, "GE1 AHB export: %s\n", why); return nullptr; };
+	if (!buffer || !m_device)
+		return fail("invalid buffer or device");
 	AHardwareBuffer_Desc desc = {};
 	AHardwareBuffer_describe(buffer, &desc);
 	if (desc.width != width || desc.height != height || desc.format != AHARDWAREBUFFER_FORMAT_R8G8B8A8_UNORM)
@@ -4929,12 +4930,23 @@ bool GSDeviceVK::CopySnapshotToAHB(GSTexture* source, AHardwareBuffer* buffer, u
 		}
 		{
 			std::lock_guard<std::mutex> map_lock(m_submit_mutex);
-			found = m_export_images.emplace(buffer, image).first;
+			found = m_export_images.emplace(buffer, std::move(image)).first;
 		}
 	}
 	ExportImage& image = found->second;
 	if (image.width != width || image.height != height)
 		return fail("cached AHB dimensions changed");
+	return &image;
+}
+
+bool GSDeviceVK::CopySnapshotToAHB(GSTexture* source, AHardwareBuffer* buffer, u32 width, u32 height, u32 pad_x, u32 pad_y, u64* fence_counter)
+{
+	auto fail = [](const char* why) { std::fprintf(stderr, "GE1 AHB export: %s\n", why); return false; };
+	if (!source || !buffer || !fence_counter || !m_device || pad_x + source->GetWidth() > width || pad_y + source->GetHeight() > height)
+		return fail("invalid source, device, or dimensions");
+	ExportImage* image = FindOrImportAHBImage(buffer, width, height);
+	if (!image)
+		return false;
 	EndRenderPass();
 	auto* src = static_cast<GSTextureVK*>(source);
 	src->CommitClear();
@@ -4948,14 +4960,14 @@ bool GSDeviceVK::CopySnapshotToAHB(GSTexture* source, AHardwareBuffer* buffer, u
 	acquire.newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
 	acquire.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
 	acquire.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-	acquire.image = image.image;
+	acquire.image = image->image;
 	acquire.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
 	vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
 		0, 0, nullptr, 0, nullptr, 1, &acquire);
 	if (pad_x || pad_y || source->GetWidth() != width || source->GetHeight() != height)
 	{
 		VkClearColorValue black = {{0.f, 0.f, 0.f, 1.f}};
-		vkCmdClearColorImage(cmd, image.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &black, 1, &acquire.subresourceRange);
+		vkCmdClearColorImage(cmd, image->image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &black, 1, &acquire.subresourceRange);
 		VkImageMemoryBarrier ordered = acquire;
 		ordered.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
 		ordered.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
@@ -4967,7 +4979,7 @@ bool GSDeviceVK::CopySnapshotToAHB(GSTexture* source, AHardwareBuffer* buffer, u
 	copy.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
 	copy.dstOffset = {static_cast<s32>(pad_x), static_cast<s32>(pad_y), 0};
 	copy.extent = {static_cast<u32>(source->GetWidth()), static_cast<u32>(source->GetHeight()), 1};
-	vkCmdCopyImage(cmd, src->GetImage(), src->GetVkLayout(), image.image,
+	vkCmdCopyImage(cmd, src->GetImage(), src->GetVkLayout(), image->image,
 		VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &copy);
 	VkImageMemoryBarrier release = acquire;
 	release.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
@@ -4978,6 +4990,112 @@ bool GSDeviceVK::CopySnapshotToAHB(GSTexture* source, AHardwareBuffer* buffer, u
 	release.dstQueueFamilyIndex = VK_QUEUE_FAMILY_FOREIGN_EXT;
 	vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,
 		0, 0, nullptr, 0, nullptr, 1, &release);
+	*fence_counter = GetCurrentFenceCounter();
+	ExecuteCommandBuffer(WaitType::None); // the adapter queues after this fence completes
+	return !m_last_submit_failed || fail("GS Vulkan command submission failed");
+}
+
+bool GSDeviceVK::RenderSnapshotToAHB(GSTexture* current, const GSVector4i& src_rect, const GSVector4& src_uv,
+	u32 draw_w, u32 draw_h, AHardwareBuffer* buffer, u32 width, u32 height, u64* fence_counter)
+{
+	auto fail = [](const char* why) { std::fprintf(stderr, "GE1 AHB export: %s\n", why); return false; };
+	if (!current || !buffer || !fence_counter || !m_device || !draw_w || !draw_h)
+		return fail("invalid source, device, or dimensions");
+	// OUT1 (c): only senses 1/2 exist; anything else is off (fail-closed).
+	const int prerotate = (GSConfig.Prerotate == 1 || GSConfig.Prerotate == 2) ? GSConfig.Prerotate : 0;
+	const u32 dst_w = prerotate ? draw_h : draw_w;
+	const u32 dst_h = prerotate ? draw_w : draw_h;
+	if (dst_w > width || dst_h > height)
+		return fail("draw exceeds AHB dimensions");
+	ExportImage* image = FindOrImportAHBImage(buffer, width, height);
+	if (!image)
+		return false;
+	if (!image->adopted)
+	{
+		image->adopted = GSTextureVK::Adopt(image->image, GSTexture::RenderTarget,
+			GSTexture::Format::Color, width, height, 1, VK_FORMAT_R8G8B8A8_UNORM);
+		if (!image->adopted)
+			return fail("AHB texture adopt failed");
+	}
+	GSTextureVK* const dst = image->adopted.get();
+	EndRenderPass();
+	// The compositor/HUD own the image between exports; it comes back GENERAL
+	// (the copy tail, the HUD tail, and SF all leave it there).
+	dst->OverrideImageLayout(GSTextureVK::Layout::General);
+	// Pad semantics mirror the copy path: black-opaque clear iff padded. The
+	// clear-colour u32 0xFF000000 is float (0,0,0,1), the copy's clear.
+	dst->SetClearColor(0xFF000000u);
+	// CAS at source size, then the optional sharp pre-scale: the same calls
+	// ExportStretch makes (CAS mutates its rect args, hence the copies).
+	GSTexture* src = current;
+	GSVector4i srect = src_rect;
+	GSVector4 suv = src_uv;
+	if (GSConfig.ExportCAS && Features().cas_sharpening)
+		CAS(src, srect, suv, GSVector4(0.0f, 0.0f, static_cast<float>(draw_w), static_cast<float>(draw_h)), true);
+	GSTexture* pre = nullptr;
+	const int sw = srect.width(), sh = srect.height();
+	if (GSConfig.ExportSharpBilinear && sw > 0 && sh > 0 &&
+	    (static_cast<int>(draw_w) > sw || static_cast<int>(draw_h) > sh))
+	{
+		const int k = std::max((static_cast<int>(draw_w) + sw - 1) / sw, (static_cast<int>(draw_h) + sh - 1) / sh);
+		pre = CreateRenderTarget(sw * k, sh * k, GSTexture::Format::Color, false);
+		if (pre)
+		{
+			StretchRect(src, suv, pre, GSVector4(0.0f, 0.0f, static_cast<float>(sw * k),
+				static_cast<float>(sh * k)), ShaderConvert::COPY, Nearest);
+			src = pre;
+			suv = GSVector4(0.0f, 0.0f, 1.0f, 1.0f);
+		}
+	}
+	// Main draw: the TRANSPARENCY_FILTER stretch, as ExportStretch issues it
+	// (TRANSPARENCY_FILTER never takes hardware bilinear), straight into the
+	// AHB. Mirrors DoStretchRect's setup; the dst-rect viewport below keeps the
+	// vertices bit-identical to the render-target path.
+	auto* srcVK = static_cast<GSTextureVK*>(src);
+	if (srcVK->GetLayout() != GSTextureVK::Layout::ShaderReadOnly)
+	{
+		EndRenderPass();
+		srcVK->TransitionToLayout(GSTextureVK::Layout::ShaderReadOnly);
+	}
+	SetUtilityTexture(src, m_linear_sampler);
+	SetPipeline(GetConvertPipeline(ShaderConvert::TRANSPARENCY_FILTER));
+	const u32 pad_x = (width - dst_w) / 2, pad_y = (height - dst_h) / 2;
+	const GSVector4i dst_rc(pad_x, pad_y, pad_x + dst_w, pad_y + dst_h);
+	const GSVector4i full_rc(0, 0, width, height);
+	OMSetRenderTargets(dst, nullptr, dst_rc);
+	if (!InRenderPass())
+		BeginRenderPassForStretchRect(dst, full_rc, dst_rc, true);
+	if (!prerotate)
+	{
+		const VkViewport vp{static_cast<float>(pad_x), static_cast<float>(pad_y),
+			static_cast<float>(draw_w), static_cast<float>(draw_h), 0.0f, 1.0f};
+		SetViewport(vp);
+		DrawStretchRect(suv, GSVector4(0.0f, 0.0f, static_cast<float>(draw_w), static_cast<float>(draw_h)),
+			GSVector2i(draw_w, draw_h));
+	}
+	else
+	{
+		DrawStretchRectRotated(suv, dst_rc, GSVector2i(width, height), draw_w, draw_h, prerotate);
+	}
+	if (pre)
+		Recycle(pre);
+	EndRenderPass();
+	// Release to the compositor/HUD: the copy tail's barrier, sourced from the
+	// render pass instead of the transfer.
+	VkCommandBuffer cmd = GetCurrentCommandBuffer();
+	VkImageMemoryBarrier release = {};
+	release.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+	release.srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+	release.dstAccessMask = 0;
+	release.oldLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+	release.newLayout = VK_IMAGE_LAYOUT_GENERAL;
+	release.srcQueueFamilyIndex = m_graphics_queue_family_index;
+	release.dstQueueFamilyIndex = VK_QUEUE_FAMILY_FOREIGN_EXT;
+	release.image = image->image;
+	release.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+	vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,
+		0, 0, nullptr, 0, nullptr, 1, &release);
+	dst->OverrideImageLayout(GSTextureVK::Layout::General);
 	*fence_counter = GetCurrentFenceCounter();
 	ExecuteCommandBuffer(WaitType::None); // the adapter queues after this fence completes
 	return !m_last_submit_failed || fail("GS Vulkan command submission failed");
@@ -4996,6 +5114,7 @@ void GSDeviceVK::ReleaseExportAHB(AHardwareBuffer* buffer)
 	WaitForGPUIdle();
 	VkImage deadImage = VK_NULL_HANDLE;
 	VkDeviceMemory deadMemory = VK_NULL_HANDLE;
+	std::unique_ptr<GSTextureVK> deadAdopted;
 	{
 		std::lock_guard<std::mutex> map_lock(m_submit_mutex);
 		auto found = m_export_images.find(buffer);
@@ -5003,8 +5122,10 @@ void GSDeviceVK::ReleaseExportAHB(AHardwareBuffer* buffer)
 			return;
 		deadImage = found->second.image;
 		deadMemory = found->second.memory;
+		deadAdopted = std::move(found->second.adopted);
 		m_export_images.erase(found);
 	}
+	deadAdopted.reset(); // OUT1 (b): the adopted view + framebuffers first (GPU is idle)
 	if (deadImage != VK_NULL_HANDLE)
 		vkDestroyImage(m_device, deadImage, nullptr);
 	if (deadMemory != VK_NULL_HANDLE)
@@ -5095,6 +5216,38 @@ layout(std430, set = 0, binding = 3) readonly buffer Scene
 	float quadDim[26];
 };
 
+// OUT1 (c): prerotate addressing. The scene stays in unrotated (landscape)
+// coords and all draw math below is untouched; only the temp reads and the
+// frame write transpose. The temp holds the portrait region (dims swapped),
+// the frame is the portrait AHB. rotTemp maps region-local (x, y) to
+// temp-local; rotFrame maps it to the portrait absolute write position.
+// rotated 0 = off (identity), 1 = 90° CCW, 2 = 90° CW, matching the
+// stretch's DrawStretchRectRotated senses; frameW/H are the unrotated dims.
+layout(push_constant) uniform HudPush
+{
+	int rotated;
+	int frameW;
+	int frameH;
+} hudPush;
+
+ivec2 rotTemp(ivec2 q)
+{
+	if (hudPush.rotated == 1)
+		return ivec2(q.y, regionW - 1 - q.x);
+	if (hudPush.rotated == 2)
+		return ivec2(regionH - 1 - q.y, q.x);
+	return q;
+}
+
+ivec2 rotFrame(ivec2 q)
+{
+	if (hudPush.rotated == 1)
+		return ivec2(regionY + q.y, hudPush.frameW - 1 - (regionX + q.x));
+	if (hudPush.rotated == 2)
+		return ivec2(hudPush.frameH - 1 - (regionY + q.y), regionX + q.x);
+	return ivec2(regionX + q.x, regionY + q.y);
+}
+
 void main()
 {
 	int px = int(gl_GlobalInvocationID.x);
@@ -5103,10 +5256,11 @@ void main()
 		return;
 	// Tile reject: the workgroup's 16x16 footprint is uniform, so an
 	// item disjoint from it fails every thread's clip below; skipping
-	// it is bit-exact (order and math untouched).
+	// it is bit-exact (order and math untouched). Region-coords only;
+	// the temp-read transpose below applies after the clip math.
 	int tx0 = int(gl_WorkGroupID.x) * 16, ty0 = int(gl_WorkGroupID.y) * 16;
 	int tx1 = tx0 + 16, ty1 = ty0 + 16;
-	uvec4 t0 = imageLoad(tempImg, ivec2(px, py));
+	uvec4 t0 = imageLoad(tempImg, rotTemp(ivec2(px, py)));
 	precise vec3 dst = vec3(t0.rgb);
 	precise float dstA = float(t0.a);
 	bool covered = false;
@@ -5127,8 +5281,8 @@ void main()
 		if (px < xa || px >= xb || py < ya || py >= yb)
 			continue;
 		precise float span = float(x1 - x0);
-		uvec4 L = imageLoad(tempImg, ivec2(smearLX[i] - regionX, py));
-		uvec4 R = imageLoad(tempImg, ivec2(smearRX[i] - regionX, py));
+		uvec4 L = imageLoad(tempImg, rotTemp(ivec2(smearLX[i] - regionX, py)));
+		uvec4 R = imageLoad(tempImg, rotTemp(ivec2(smearRX[i] - regionX, py)));
 		precise float lr = float(L.r), lg = float(L.g), lb = float(L.b);
 		precise float rr = float(R.r), rg = float(R.g), rb = float(R.b);
 		precise float fy0 = float(py - y0) / 3.0f;
@@ -5228,7 +5382,7 @@ void main()
 		return;
 	// Exact integers through the UNORM view: N/255 round-trips to N (the
 	// conversion error is < 2^-16 against a 0.5 margin).
-	imageStore(frameImg, ivec2(regionX + px, regionY + py), vec4(dst / 255.0f, dstA / 255.0f));
+	imageStore(frameImg, rotFrame(ivec2(px, py)), vec4(dst / 255.0f, dstA / 255.0f));
 }
 )";
 
@@ -5336,6 +5490,7 @@ bool GSDeviceVK::InitHudResources()
 
 	Vulkan::PipelineLayoutBuilder plb;
 	plb.AddDescriptorSet(m_hud_ds_layout);
+	plb.AddPushConstants(VK_SHADER_STAGE_COMPUTE_BIT, 0, 3 * sizeof(s32)); // OUT1 (c): rotated/frameW/frameH
 	if ((m_hud_pipeline_layout = plb.Create(m_device)) == VK_NULL_HANDLE)
 		return fail("pipeline layout failed");
 	Vulkan::SetObjectName(m_device, m_hud_pipeline_layout, "HUD pipeline layout");
@@ -5459,17 +5614,58 @@ bool GSDeviceVK::CompositeHudAHB(AHardwareBuffer* buffer, const void* scene, u32
 	if (atlasW == 0 || atlasH == 0 || atlasW > 1024 || atlasH > 1024)
 		return fail("atlas dimensions out of range");
 	// HUD4 Part 2: guarded (the worker emplaces other slots' first exports concurrently).
-	ExportImage image;
+	// OUT1 (b): ExportImage is move-only now (the adopted direct-render view);
+	// the composite only needs the image and dims, copied field-wise.
+	VkImage hudImage = VK_NULL_HANDLE;
+	u32 hudImageW = 0, hudImageH = 0;
 	{
 		std::lock_guard<std::mutex> map_lock(m_submit_mutex);
 		auto found = m_export_images.find(buffer);
 		if (found == m_export_images.end())
 			return fail("buffer was never exported");
-		image = found->second;
+		hudImage = found->second.image;
+		hudImageW = found->second.width;
+		hudImageH = found->second.height;
 	}
-	if (sc->regionX < 0 || sc->regionY < 0 || sc->regionX + sc->regionW > static_cast<s32>(image.width) ||
-	    sc->regionY + sc->regionH > static_cast<s32>(image.height))
-		return fail("region outside the export");
+	struct HudExportImage { VkImage image; u32 width; u32 height; };
+	const HudExportImage image{hudImage, hudImageW, hudImageH};
+	// OUT1 (c): the scene stays in unrotated (landscape) coords; the temp
+	// holds the portrait region and the shader transposes its temp reads +
+	// frame writes. frameW/H are the unrotated dims (the AHB's swapped);
+	// copyX/Y is the portrait copy origin, tempW/H the swapped temp dims.
+	const int hudRot = (GSConfig.Prerotate == 1 || GSConfig.Prerotate == 2) ? GSConfig.Prerotate : 0;
+	const s32 frameW = hudRot ? static_cast<s32>(image.height) : static_cast<s32>(image.width);
+	const s32 frameH = hudRot ? static_cast<s32>(image.width) : static_cast<s32>(image.height);
+	s32 copyX = sc->regionX, copyY = sc->regionY;
+	u32 tempW = static_cast<u32>(sc->regionW), tempH = static_cast<u32>(sc->regionH);
+	if (!hudRot)
+	{
+		if (sc->regionX < 0 || sc->regionY < 0 || sc->regionX + sc->regionW > frameW ||
+		    sc->regionY + sc->regionH > frameH)
+			return fail("region outside the export");
+	}
+	else
+	{
+		if (sc->regionX < 0 || sc->regionY < 0 || sc->regionX + sc->regionW > frameW ||
+		    sc->regionY + sc->regionH > frameH)
+			return fail("region outside the export");
+		if (hudRot == 1) // CCW: (x, y, w, h) -> (y, W-(x+w), h, w)
+		{
+			copyX = sc->regionY;
+			copyY = frameW - (sc->regionX + sc->regionW);
+		}
+		else // CW: (x, y, w, h) -> (H-(y+h), x, h, w)
+		{
+			copyX = frameH - (sc->regionY + sc->regionH);
+			copyY = sc->regionX;
+		}
+		if (copyX < 0 || copyY < 0 ||
+		    copyX + static_cast<s32>(tempH) > static_cast<s32>(image.width) ||
+		    copyY + static_cast<s32>(tempW) > static_cast<s32>(image.height))
+			return fail("rotated region outside the export");
+		tempW = static_cast<u32>(sc->regionH);
+		tempH = static_cast<u32>(sc->regionW);
+	}
 	for (int i = 0; i < sc->nsmears; i++)
 	{
 		if (sc->smearX1[i] <= sc->smearX0[i] || sc->smearY1[i] <= sc->smearY0[i])
@@ -5554,8 +5750,7 @@ bool GSDeviceVK::CompositeHudAHB(AHardwareBuffer* buffer, const void* scene, u32
 	// Temp (region-sized UINT copy of the pristine frame). Recreated only on
 	// a region change (fixed per run): idle first so live sets can be
 	// re-pointed and the old objects destroyed directly.
-	if (m_hud_temp_image == VK_NULL_HANDLE || m_hud_temp_w != static_cast<u32>(sc->regionW) ||
-	    m_hud_temp_h != static_cast<u32>(sc->regionH))
+	if (m_hud_temp_image == VK_NULL_HANDLE || m_hud_temp_w != tempW || m_hud_temp_h != tempH)
 	{
 		const bool hadTemp = (m_hud_temp_image != VK_NULL_HANDLE);
 		if (hadTemp)
@@ -5574,7 +5769,7 @@ bool GSDeviceVK::CompositeHudAHB(AHardwareBuffer* buffer, const void* scene, u32
 		VkImageCreateInfo ici = {VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
 		ici.imageType = VK_IMAGE_TYPE_2D;
 		ici.format = VK_FORMAT_R8G8B8A8_UINT;
-		ici.extent = {static_cast<u32>(sc->regionW), static_cast<u32>(sc->regionH), 1};
+		ici.extent = {tempW, tempH, 1};
 		ici.mipLevels = 1;
 		ici.arrayLayers = 1;
 		ici.samples = VK_SAMPLE_COUNT_1_BIT;
@@ -5593,8 +5788,8 @@ bool GSDeviceVK::CompositeHudAHB(AHardwareBuffer* buffer, const void* scene, u32
 		vci.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
 		if (vkCreateImageView(m_device, &vci, nullptr, &m_hud_temp_view) != VK_SUCCESS)
 			return fail("temp view failed");
-		m_hud_temp_w = static_cast<u32>(sc->regionW);
-		m_hud_temp_h = static_cast<u32>(sc->regionH);
+		m_hud_temp_w = tempW;
+		m_hud_temp_h = tempH;
 		m_hud_temp_general = false;
 		// Re-point every live set (a no-op before the first frame exists;
 		// also heals sets left dangling by a failed recreate).
@@ -5789,9 +5984,9 @@ bool GSDeviceVK::CompositeHudAHB(AHardwareBuffer* buffer, const void* scene, u32
 	VkImageCopy copy = {};
 	copy.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
 	copy.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
-	copy.srcOffset = {sc->regionX, sc->regionY, 0};
+	copy.srcOffset = {copyX, copyY, 0};
 	copy.dstOffset = {0, 0, 0};
-	copy.extent = {static_cast<u32>(sc->regionW), static_cast<u32>(sc->regionH), 1};
+	copy.extent = {tempW, tempH, 1};
 	vkCmdCopyImage(cmd, image.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, m_hud_temp_image,
 		VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &copy);
 	// Compute-ready: temp + frame -> GENERAL, scene update -> SHADER_READ.
@@ -5821,6 +6016,9 @@ bool GSDeviceVK::CompositeHudAHB(AHardwareBuffer* buffer, const void* scene, u32
 	vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_hud_pipeline);
 	vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_hud_pipeline_layout, 0, 1,
 		&frameIt->second.set, 0, nullptr);
+	// OUT1 (c): prerotate addressing for the shader (identity when off).
+	const s32 hudPush[3] = {hudRot, frameW, frameH};
+	vkCmdPushConstants(cmd, m_hud_pipeline_layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(hudPush), hudPush);
 	vkCmdDispatch(cmd, (static_cast<u32>(sc->regionW) + 15) / 16,
 		(static_cast<u32>(sc->regionH) + 15) / 16, 1);
 	// Release the AHB to FOREIGN (mirrors the copy's release).
@@ -6154,6 +6352,43 @@ void GSDeviceVK::DrawStretchRect(const GSVector4& sRect, const GSVector4& dRect,
 		};
 		IASetVertexBuffer(vertices, sizeof(vertices[0]), std::size(vertices));
 	}
+
+	if (ApplyUtilityState())
+		DrawPrimitive();
+}
+
+void GSDeviceVK::DrawStretchRectRotated(const GSVector4& sRect, const GSVector4i& dst_rc, const GSVector2i& ds,
+	u32 draw_w, u32 draw_h, int sense)
+{
+	g_perfmon.Put(GSPerfMon::TextureCopies, 1);
+
+	const float inv_x = 2.0f / ds.x;
+	const float inv_y = 2.0f / ds.y;
+	const float px = static_cast<float>(dst_rc.x), py = static_cast<float>(dst_rc.y);
+	const float dw = static_cast<float>(draw_w), dh = static_cast<float>(draw_h);
+	// Unrotated corner (x, y) -> portrait pixel. Small integers: exact in float.
+	float x0, y0, x1, y1, x2, y2, x3, y3;
+	if (sense == 2) // 90° CW: (x, y) -> (dh - y, x)
+	{
+		x0 = px + dh; y0 = py;        // unrot TL -> portrait TR
+		x1 = px + dh; y1 = py + dw;   // unrot TR -> portrait BR
+		x2 = px;      y2 = py;        // unrot BL -> portrait TL
+		x3 = px;      y3 = py + dw;   // unrot BR -> portrait BL
+	}
+	else // sense 1, 90° CCW: (x, y) -> (y, dw - x)
+	{
+		x0 = px;      y0 = py + dw;   // unrot TL -> portrait BL
+		x1 = px;      y1 = py;        // unrot TR -> portrait TL
+		x2 = px + dh; y2 = py + dw;   // unrot BL -> portrait BR
+		x3 = px + dh; y3 = py;        // unrot BR -> portrait TR
+	}
+	const GSVertexPT1 vertices[] = {
+		{GSVector4(x0 * inv_x - 1.0f, 1.0f - y0 * inv_y, 0.5f, 1.0f), GSVector2(sRect.x, sRect.y)},
+		{GSVector4(x1 * inv_x - 1.0f, 1.0f - y1 * inv_y, 0.5f, 1.0f), GSVector2(sRect.z, sRect.y)},
+		{GSVector4(x2 * inv_x - 1.0f, 1.0f - y2 * inv_y, 0.5f, 1.0f), GSVector2(sRect.x, sRect.w)},
+		{GSVector4(x3 * inv_x - 1.0f, 1.0f - y3 * inv_y, 0.5f, 1.0f), GSVector2(sRect.z, sRect.w)},
+	};
+	IASetVertexBuffer(vertices, sizeof(vertices[0]), std::size(vertices));
 
 	if (ApplyUtilityState())
 		DrawPrimitive();

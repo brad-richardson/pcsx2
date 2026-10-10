@@ -27,7 +27,9 @@
 #include <ostream>
 #include <fstream>
 #include <atomic>
+#include <functional>
 #include <mutex>
+#include <thread>
 
 namespace
 {
@@ -1345,6 +1347,14 @@ void GSDevice::ClearCurrent()
 {
 	FlushDeferredDraws();
 	m_current = nullptr;
+	m_merge_borrowed = nullptr;
+	{
+		std::lock_guard<std::mutex> gate(m_merge_gate_mutex);
+		m_merge_seq = 0;
+		m_export_seq = 0;
+		m_merge_tid = 0;
+		m_export_tid = 0;
+	}
 
 	delete m_merge;
 	delete m_weavebob;
@@ -1376,6 +1386,42 @@ void GSDevice::Merge(GSTexture* sTex[3], GSVector4* sRect, GSVector4* dRect, con
 		DoMerge(sTex, sRect, m_merge, dRect, top_band, PMODE, EXTBUF, c, BilnIf(GSConfig.PCRTCOffsets));
 
 	m_current = m_merge;
+	m_merge_borrowed = nullptr;
+	{
+		std::lock_guard<std::mutex> gate(m_merge_gate_mutex);
+		m_merge_seq++;
+		m_merge_tid = std::hash<std::thread::id>{}(std::this_thread::get_id());
+	}
+}
+
+void GSDevice::SetCurrentFromMergeSkip(GSTexture* tex)
+{
+	FlushDeferredDraws();
+	m_current = tex;
+	m_merge_borrowed = tex;
+	{
+		std::lock_guard<std::mutex> gate(m_merge_gate_mutex);
+		m_merge_seq++;
+		m_merge_tid = std::hash<std::thread::id>{}(std::this_thread::get_id());
+		m_merge_skips++;
+		if (m_merge_skips == 1 || (m_merge_skips % 600) == 0)
+			std::fprintf(stderr, "[ge1] OUT1 merge skip engaged (skips=%llu)\n",
+				static_cast<unsigned long long>(m_merge_skips));
+	}
+}
+
+bool GSDevice::MergeSkipGateOpen()
+{
+	std::lock_guard<std::mutex> gate(m_merge_gate_mutex);
+	return GSConfig.MergeSkip && m_export_seq == m_merge_seq && m_export_seq != 0 &&
+	       m_export_tid == m_merge_tid;
+}
+
+void GSDevice::NoteCurrentExport()
+{
+	std::lock_guard<std::mutex> gate(m_merge_gate_mutex);
+	m_export_seq = m_merge_seq;
+	m_export_tid = std::hash<std::thread::id>{}(std::this_thread::get_id());
 }
 
 void GSDevice::Interlace(const GSVector2i& ds, int field, int mode, float yoffset, const GSFieldPadRows& top_pad)

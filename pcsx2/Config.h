@@ -1070,6 +1070,27 @@ struct Pcsx2Config
 		/// Not persisted.
 		bool ExportCAS = false;
 		bool ExportSharpBilinear = false;
+		/// OUT1 (a): skip the display merge when one circuit covers the whole
+		/// target opaquely (MMOD 1, ALP 255) and alias the display target as
+		/// the current frame. Exact: the merge samples texel centres 1:1 and
+		/// forces alpha, which the export's TRANSPARENCY_FILTER discards. The
+		/// borrow is thread-gated in the device (a cross-thread export between
+		/// merges disables the next skip), so latch presents stay on the merge.
+		/// Adapter env GE1_MERGE_SKIP=1, default off. Not persisted.
+		bool MergeSkip = false;
+		/// OUT1 (b): render the export stretch straight into the imported AHB
+		/// image (same vertices through a dst-rect viewport, pad cleared by
+		/// loadOp) instead of a render target plus vkCmdCopyImage.
+		/// Android/Vulkan only. Adapter env GE1_EXPORT_DIRECT=1, default off.
+		/// Not persisted.
+		bool ExportDirect = false;
+		/// OUT1 (c): with ExportDirect, write the stretch pre-rotated into a
+		/// panel-oriented (portrait) AHB. 0 = off; 1/2 = content sense A/B.
+		/// The runtime allocates the portrait pool and passes setGeometry
+		/// ROT_270 (parent ROT_90 + child ROT_270 compose to 0 at the HWC).
+		/// Value meanings are shared with the runtime's prerotateFromEnv.
+		/// Adapter env PS2X_PRESENT_PREROTATE, default off. Not persisted.
+		int Prerotate = 0;
 		// GE7: exact destination reads on Adreno. Copy road (no in-pass reads,
 		// which return garbage on Adreno 830) plus splitting overlapping sw-blend
 		// draws into non-overlapping batches with a fresh RT copy between them

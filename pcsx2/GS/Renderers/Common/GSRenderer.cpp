@@ -120,6 +120,37 @@ void GSRenderer::UpdateRenderFixes()
 {
 }
 
+// OUT1 (a): true when DoMerge would reproduce sTex[0]'s texels, so m_current can
+// alias it. The MMOD1 merge shader outputs sampled RGB with alpha forced to
+// BGColor.a = ALP; under the pipeline's SRC_ALPHA/ONE_MINUS_SRC_ALPHA blend an
+// ALP of 255 is the identity, and at exact 1:1 full-rect coverage both samplers
+// hit texel centres (sub-texel error ~1e-7 cannot cross a texel boundary). The
+// alpha difference (merge forces 1.0) is invisible downstream: CAS reads RGB
+// only and the export's TRANSPARENCY_FILTER forces alpha to 1.0. EN2/SLBG/AMOD
+// need no check: with sTex[1] == sTex[2] == null DoMerge's layer-2, feedback
+// and top-band blocks are unreachable regardless of them. Exact float equality
+// throughout: a fractional upscale whose rects are not exactly full simply
+// keeps the merge.
+static bool MergeSkipApplies(GSTexture* const sTex[3], const GSVector4* sRect, const GSVector4* dRect,
+	const GSDevice::MergeTopBand* top_band, const GSVector2i& fs, const GSRegPMODE& PMODE)
+{
+	if (!sTex[0] || sTex[1] || sTex[2])
+		return false;
+	if (PMODE.MMOD != 1 || PMODE.ALP != 255)
+		return false;
+	if (top_band[0].enabled)
+		return false;
+	if (sTex[0]->GetState() != GSTexture::State::Dirty || sTex[0]->GetFormat() != GSTexture::Format::Color)
+		return false;
+	if (sTex[0]->GetWidth() != fs.x || sTex[0]->GetHeight() != fs.y)
+		return false;
+	const GSVector4& s = sRect[0];
+	const GSVector4& d = dRect[0];
+	return s.x == 0.0f && s.y == 0.0f && s.z == 1.0f && s.w == 1.0f &&
+	       d.x == 0.0f && d.y == 0.0f && d.z == static_cast<float>(fs.x) &&
+	       d.w == static_cast<float>(fs.y);
+}
+
 template <GSRenderer::MergeMode merge_mode>
 bool GSRenderer::Merge(int field)
 {
@@ -395,7 +426,11 @@ bool GSRenderer::Merge(int field)
 	}
 
 	const u32 c = (m_regs->BGCOLOR.U32[0] & 0x00FFFFFFu) | (m_regs->PMODE.ALP << 24);
-	g_gs_device->Merge(tex, src_gs_read, dst, top_band, fs, m_regs->PMODE, m_regs->EXTBUF, c);
+	if (MergeSkipApplies(tex, src_gs_read, dst, top_band, fs, m_regs->PMODE) &&
+	    g_gs_device->MergeSkipGateOpen())
+		g_gs_device->SetCurrentFromMergeSkip(tex[0]);
+	else
+		g_gs_device->Merge(tex, src_gs_read, dst, top_band, fs, m_regs->PMODE, m_regs->EXTBUF, c);
 
 	// Show the detector this field, offset and all. It is told which offset was applied so it can
 	// take it back out and measure what the GAME did between fields. Costs nothing once decided.
@@ -1539,6 +1574,7 @@ void GSRenderer::PresentCurrentFrame()
 		GSTexture* current = g_gs_device->GetCurrent();
 		if (current)
 		{
+			g_gs_device->NoteCurrentExport();
 			const GSVector4i src_rect(CalculateDrawSrcRect(current, m_real_size));
 			const GSVector4 src_uv(GSVector4(src_rect) / GSVector4(current->GetSize()).xyxy());
 			const GSVector2i pres_size = g_gs_device->GetPresentationSize();
@@ -1674,6 +1710,7 @@ bool GSRenderer::SaveSnapshotToMemory(u32 window_width, u32 window_height, bool 
 		pixels->clear();
 		return false;
 	}
+	g_gs_device->NoteCurrentExport();
 
 	const GSVector4i src_rect(CalculateDrawSrcRect(current, m_real_size));
 	const GSVector4 src_uv(GSVector4(src_rect) / GSVector4(current->GetSize()).xyxy());
@@ -1763,15 +1800,29 @@ bool GSRenderer::ExportSnapshotToAHB(AHardwareBuffer* buffer, u32 width, u32 hei
 	GSTexture* const current = g_gs_device->GetCurrent();
 	if (!buffer || !current || !width || !height)
 		return false;
+	g_gs_device->NoteCurrentExport();
+	// OUT1 (c): under prerotate the buffer is panel-oriented (portrait) while
+	// the rect math stays in unrotated (landscape) dims; the device transposes
+	// the draw. Identical numbers to the landscape path for square-pixel dims.
+	const bool prerot = GSConfig.ExportDirect && GSConfig.Prerotate != 0;
+	const u32 rectW = prerot ? height : width;
+	const u32 rectH = prerot ? width : height;
 	const GSVector4i src_rect(CalculateDrawSrcRect(current, m_real_size));
 	const GSVector4 src_uv(GSVector4(src_rect) / GSVector4(current->GetSize()).xyxy());
 	const bool progressive = (GetVideoMode() == GSVideoMode::SDTV_480P);
-	const GSVector4 draw_rect = CalculateDrawDstRect(width, height, src_rect, current->GetSize(),
+	const GSVector4 draw_rect = CalculateDrawDstRect(rectW, rectH, src_rect, current->GetSize(),
 		GSDisplayAlignment::LeftOrTop, false, progressive);
 	const u32 draw_width = static_cast<u32>(draw_rect.z - draw_rect.x);
 	const u32 draw_height = static_cast<u32>(draw_rect.w - draw_rect.y);
-	if (!draw_width || !draw_height || draw_width > width || draw_height > height)
+	if (!draw_width || !draw_height || draw_width > rectW || draw_height > rectH)
 		return false;
+	// OUT1 (b): render the stretch straight into the imported AHB image
+	// instead of a render target plus vkCmdCopyImage.
+	if (GSConfig.ExportDirect)
+	{
+		return static_cast<GSDeviceVK*>(g_gs_device.get())->RenderSnapshotToAHB(current, src_rect,
+			src_uv, draw_width, draw_height, buffer, width, height, fence_counter);
+	}
 	GSTexture* rt = g_gs_device->CreateRenderTarget(draw_width, draw_height, GSTexture::Format::Color, false);
 	if (!rt)
 		return false;
@@ -1798,6 +1849,7 @@ bool GSRenderer::ExportSnapshotToIOSurface(void* iosurface, u32 width, u32 heigh
 	GSTexture* const current = g_gs_device->GetCurrent();
 	if (!iosurface || !current || !width || !height || !done)
 		return false;
+	g_gs_device->NoteCurrentExport();
 	const GSVector4i src_rect(CalculateDrawSrcRect(current, m_real_size));
 	const GSVector4 src_uv(GSVector4(src_rect) / GSVector4(current->GetSize()).xyxy());
 	const bool progressive = (GetVideoMode() == GSVideoMode::SDTV_480P);

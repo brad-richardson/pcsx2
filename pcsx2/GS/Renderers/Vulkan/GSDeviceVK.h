@@ -253,6 +253,10 @@ public:
 	void WaitForGPUIdle();
 #ifdef __ANDROID__
 	bool CopySnapshotToAHB(GSTexture* src, AHardwareBuffer* buffer, u32 width, u32 height, u32 pad_x, u32 pad_y, u64* fence_counter);
+	// OUT1 (b/c): render the export stretch straight into the imported AHB image
+	// (pre-rotated per GSConfig.Prerotate). draw_w/h are the unrotated draw size.
+	bool RenderSnapshotToAHB(GSTexture* current, const GSVector4i& src_rect, const GSVector4& src_uv,
+		u32 draw_w, u32 draw_h, AHardwareBuffer* buffer, u32 width, u32 height, u64* fence_counter);
 	void ReleaseExportAHB(AHardwareBuffer* buffer);
 	// HUD4: one Tricky HUD compute composite onto an exported AHB (see GS.h).
 	bool CompositeHudAHB(AHardwareBuffer* buffer, const void* scene, u32 sceneSize, const u8* atlasPx,
@@ -265,8 +269,18 @@ public:
 
 private:
 #ifdef __ANDROID__
-	struct ExportImage { VkImage image = VK_NULL_HANDLE; VkDeviceMemory memory = VK_NULL_HANDLE; u32 width = 0; u32 height = 0; };
+	// OUT1 (b): adopted holds a GSTextureVK view of image for direct renders
+	// (created on first RenderSnapshotToAHB; the image/memory stay ours).
+	struct ExportImage
+	{
+		VkImage image = VK_NULL_HANDLE;
+		VkDeviceMemory memory = VK_NULL_HANDLE;
+		u32 width = 0;
+		u32 height = 0;
+		std::unique_ptr<GSTextureVK> adopted;
+	};
 	std::unordered_map<AHardwareBuffer*, ExportImage> m_export_images;
+	ExportImage* FindOrImportAHBImage(AHardwareBuffer* buffer, u32 width, u32 height);
 	// HUD4: Tricky HUD composite state (all device-lifetime; the pool holds ≤4 sets).
 	VkPipeline m_hud_pipeline = VK_NULL_HANDLE;
 	VkPipelineLayout m_hud_pipeline_layout = VK_NULL_HANDLE;
@@ -996,6 +1010,12 @@ public:
 	void DoStretchRect(GSTextureVK* sTex, const GSVector4& sRect, GSTextureVK* dTex, const GSVector4& dRect,
 		VkPipeline pipeline, Filter filter, bool allow_discard);
 	void DrawStretchRect(const GSVector4& sRect, const GSVector4& dRect, const GSVector2i& ds);
+	// OUT1 (c): like DrawStretchRect, but the image lands rotated 90° in the
+	// target: unrotated corner (x, y) draws at portrait dst_rc + (y, draw_w -
+	// x) for sense 1 (90° CCW) or (draw_h - y, x) for sense 2 (90° CW). UVs
+	// stay attached to their corners, so the same texels are sampled.
+	void DrawStretchRectRotated(const GSVector4& sRect, const GSVector4i& dst_rc, const GSVector2i& ds,
+		u32 draw_w, u32 draw_h, int sense);
 
 	void BlitRect(GSTexture* sTex, const GSVector4i& sRect, u32 sLevel, GSTexture* dTex, const GSVector4i& dRect,
 		u32 dLevel, Filter filter);
