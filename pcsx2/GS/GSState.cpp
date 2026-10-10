@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: GPL-3.0+
 
 #include "GS/GSState.h"
+#include <atomic>
 #include "GS/GSDump.h"
 #include "GS/Renderers/Common/GSFastStencilShadow.h"
 #include "GS/GSSpriteCover.h"
@@ -6015,6 +6016,259 @@ void GSState::Transfer(const u8* mem, u32 size)
 // refuses the whole call without changing any state, and the caller falls
 // back to GIF packets. No dump-sink feed: GE1 never opens one (the runtime
 // capture is the capture path, and it sees expanded packets at the frontend).
+// ---------------------------------------------------------------- RZV1 S4b
+template <u32 prim>
+void GSState::StaticPrepare(const Ge1CompactVertex* RESTRICT d, u32 count, StaticPrep& o)
+{
+	static_assert(prim == GS_TRIANGLESTRIP || prim == GS_TRIANGLELIST);
+	constexpr bool strip = (prim == GS_TRIANGLESTRIP);
+	const bool tme = PRIM->TME, fst = PRIM->FST, iip = PRIM->IIP;
+	const u32 uv = m_v.UV;
+	const GSLimit24BitDepth depth_clamp = GetDepthClampMode();
+	const bool clamp = depth_clamp != GSLimit24BitDepth::Disabled;
+	GSVector4i keep, shifted;
+	if (clamp)
+		GSVertexKickKernel::MakeDepthClampMasks(depth_clamp, keep, shifted);
+	const GSVertexKernels::CullGrid grid = m_cull_grid;
+	const bool shift0 = GKV1Shift0Kernel() && grid.shift == 0;
+
+	GSVector4i m0[64], m1[64];
+	u64 xyp[64], meta[64];
+	for (u32 i = 0; i < count; i++)
+	{
+		GSVertexKernels::ParseCompactXYZF2(d + i, uv, m0[i], m1[i]);
+		if (clamp)
+			m1[i] = (m1[i] & keep) | (m1[i].srl32<8>() & shifted);
+		const int wx = static_cast<int>(d[i].X & 0xFFFFu) - m_xyof.I32[0];
+		const int wy = static_cast<int>(d[i].Y & 0xFFFFu) - m_xyof.I32[1];
+		const GSVertexKernels::CullMirrorEntry e = MakeKickMirror(GS_TRIANGLE_CLASS, wx, wy);
+		xyp[i] = e.xyp;
+		meta[i] = e.meta | (static_cast<u64>(d[i].W3 & 0x8000u) << 45);
+	}
+
+	GSVertexKernels::FmmAccReset(o.acc, tme, fst);
+	o.ntri = 0;
+	o.rect = GSVector4i::zero();
+	o.nrect = GSVector4i::zero();
+	u32 head = 0, tail = 0, next = 0;
+	for (u32 i = 0; i < count; i++)
+	{
+		o.slotSrc[tail] = static_cast<u8>(i);
+		tail++;
+		if ((tail - head) < 3)
+			continue;
+		const GSVertexKernels::CullMirrorEntry e0{xyp[i], meta[i]};
+		const GSVertexKernels::CullMirrorEntry e1{xyp[i - 1], meta[i - 1]};
+		const GSVertexKernels::CullMirrorEntry e2{xyp[i - 2], meta[i - 2]};
+		u32 skip = static_cast<u32>((meta[i] >> 60) & 1u);
+		GSVector4i bbox = GSVector4i::zero();
+		if (skip == 0)
+		{
+			if (shift0)
+			{
+				const u64 all_out = e0.meta & e1.meta & e2.meta;
+				if ((all_out & GSVertexKernels::kCullMetaOutcodeMask) != 0)
+					skip = 1;
+				else if (e0.xyp == e1.xyp || e1.xyp == e2.xyp || e0.xyp == e2.xyp)
+					skip = 1;
+				if (skip == 0)
+				{
+					bbox = GSVertexKernels::ComputeCullBBox<3, GS_TRIANGLE_CLASS>(GSVertexKickKernel::BroadcastXY(xyp[i]),
+						GSVertexKickKernel::BroadcastXY(xyp[i - 1]), GSVertexKickKernel::BroadcastXY(xyp[i - 2]), grid, false);
+					if (bbox.rempty())
+						skip = 1;
+				}
+			}
+			else
+				skip = GSVertexKernels::CullTestScalar<3, GS_TRIANGLE_CLASS>(e0, e1, e2);
+		}
+		if (skip != 0)
+		{
+			if constexpr (strip)
+				head = head + 1;
+			else
+				tail = head;
+			continue;
+		}
+		u32 dst = head;
+		if constexpr (strip)
+		{
+			if (next < head)
+			{
+				o.slotSrc[next + 0] = o.slotSrc[head + 0];
+				o.slotSrc[next + 1] = o.slotSrc[head + 1];
+				o.slotSrc[next + 2] = o.slotSrc[head + 2];
+				dst = next;
+			}
+		}
+		if (!shift0)
+			bbox = GSVertexKernels::ComputeCullBBox<3, GS_TRIANGLE_CLASS>(GSVertexKickKernel::BroadcastXY(xyp[i]),
+				GSVertexKickKernel::BroadcastXY(xyp[i - 1]), GSVertexKickKernel::BroadcastXY(xyp[i - 2]), grid, false);
+		u8* s3 = o.slot + 3 * o.ntri;
+		s3[0] = static_cast<u8>(dst);
+		s3[1] = static_cast<u8>(dst + 1);
+		s3[2] = static_cast<u8>(dst + 2);
+		for (u32 j = 0; j < 3; j++)
+		{
+			const u32 v = o.slotSrc[dst + j];
+			GSVertexKernels::FmmAccumVertex(o.acc, m0[v], m1[v], tme, fst, iip || j == 2);
+		}
+		const GSVector4i r = GSVertexKernels::PrimDrawRect(bbox);
+		const GSVector4i nr = GSVertexKernels::PrimNativeDrawRectOrNone<GS_TRIANGLE_CLASS>(bbox);
+		o.rect = o.ntri ? o.rect.runion(r) : r;
+		o.nrect = o.ntri ? o.nrect.runion(nr) : nr;
+		o.ntri++;
+		if constexpr (strip)
+		{
+			head = dst + 1;
+			next = tail = dst + 3;
+		}
+		else
+			head = next = tail = dst + 3;
+	}
+	o.nslot = next;
+}
+
+namespace
+{
+std::atomic<u64> s_sc[8]; // 0 compared, 1 matched, 2 mismatched, 3 flush/switch inside, 4 unsupported prim, 5 empty-and-matched
+std::atomic<u64> s_scField[6]; // ntri, index, vertex bytes, next, fmm, rect
+std::atomic<int> s_scDumps{8};
+void FmmMerge(GSVertexKernels::FmmAcc& a, const GSVertexKernels::FmmAcc& b, bool tme, bool fst)
+{
+	a.pmin = a.pmin.min_u32(b.pmin);
+	a.pmax = a.pmax.max_u32(b.pmax);
+	if (tme)
+	{
+		if (fst)
+		{
+			a.tmin = a.tmin.min_u16(b.tmin);
+			a.tmax = a.tmax.max_u16(b.tmax);
+		}
+		else
+		{
+			a.tmin = GSVector4i::cast(GSVector4::cast(a.tmin).min(GSVector4::cast(b.tmin)));
+			a.tmax = GSVector4i::cast(GSVector4::cast(a.tmax).max(GSVector4::cast(b.tmax)));
+			a.tnan |= b.tnan;
+		}
+	}
+	a.cmin = a.cmin.min_u8(b.cmin);
+	a.cmax = a.cmax.max_u8(b.cmax);
+}
+} // namespace
+
+void GSState::StaticCheckPacket(const Ge1CompactVertex* d, u32 count)
+{
+	StaticCheckSnap& s = m_static_check;
+	s.armed = false;
+	s.prim = PRIM->PRIM;
+	if ((s.prim != GS_TRIANGLESTRIP && s.prim != GS_TRIANGLELIST) || count > 64)
+	{
+		s_sc[4].fetch_add(1, std::memory_order_relaxed);
+		return;
+	}
+	// The handler's first act; idempotent, so calling it here first leaves the
+	// kick unchanged and puts any draw boundary before the snapshot.
+	CheckFlushes();
+	s.sn0 = s_n;
+	s.ib0 = m_index;
+	s.vb0 = m_vertex;
+	s.itail0 = m_index->tail;
+	s.base = m_vertex->next;
+	s.acc0 = m_vertex->fmm_acc;
+	s.fmm_valid0 = m_vertex->fmm_valid;
+	s.rect0 = temp_draw_rect;
+	s.nrect0 = temp_native_draw_rect;
+	if (s.prim == GS_TRIANGLESTRIP)
+		StaticPrepare<GS_TRIANGLESTRIP>(d, count, s.prep);
+	else
+		StaticPrepare<GS_TRIANGLELIST>(d, count, s.prep);
+	s.armed = true;
+}
+
+void GSState::StaticCheckAfter(const Ge1CompactVertex* d, u32 count)
+{
+	StaticCheckSnap& s = m_static_check;
+	if (!s.armed)
+		return;
+	s.armed = false;
+	if (s_n != s.sn0 || m_index != s.ib0 || m_vertex != s.vb0 || m_index->tail < s.itail0)
+	{
+		s_sc[3].fetch_add(1, std::memory_order_relaxed);
+		return;
+	}
+	const StaticPrep& p = s.prep;
+	const bool tme = PRIM->TME, fst = PRIM->FST;
+	int bad = -1;
+	const u32 got = (m_index->tail - s.itail0) / 3u;
+	if (got != p.ntri || (m_index->tail - s.itail0) % 3u)
+		bad = 0;
+	const u32 uv = m_v.UV;
+	const GSLimit24BitDepth depth_clamp = GetDepthClampMode();
+	GSVector4i keep, shifted;
+	if (depth_clamp != GSLimit24BitDepth::Disabled)
+		GSVertexKickKernel::MakeDepthClampMasks(depth_clamp, keep, shifted);
+	for (u32 k = 0; bad < 0 && k < 3 * p.ntri; k++)
+	{
+		const u32 idx = m_index->buff[s.itail0 + k];
+		if (idx != s.base + p.slot[k])
+		{
+			bad = 1;
+			break;
+		}
+		GSVector4i m0, m1;
+		GSVertexKernels::ParseCompactXYZF2(d + p.slotSrc[p.slot[k]], uv, m0, m1);
+		if (depth_clamp != GSLimit24BitDepth::Disabled)
+			m1 = (m1 & keep) | (m1.srl32<8>() & shifted);
+		if (std::memcmp(&m_vertex->buff[idx].m[0], &m0, 16) || std::memcmp(&m_vertex->buff[idx].m[1], &m1, 16))
+			bad = 2;
+	}
+	if (bad < 0 && p.ntri && m_vertex->next != s.base + p.nslot)
+		bad = 3;
+	if (bad < 0 && p.ntri)
+	{
+		GSVertexKernels::FmmAcc want = p.acc;
+		if (s.itail0 != 0 && s.fmm_valid0)
+		{
+			want = s.acc0;
+			FmmMerge(want, p.acc, tme, fst);
+		}
+		if (m_vertex->fmm_valid && std::memcmp(&want, &m_vertex->fmm_acc, sizeof(want)))
+			bad = 4;
+	}
+	if (bad < 0 && p.ntri)
+	{
+		const GSVector4i rect = ((s.itail0 == 0) ? p.rect : s.rect0.runion(p.rect)).rintersect(m_context->scissor.in);
+		if (!rect.eq(temp_draw_rect))
+			bad = 5;
+		if (m_track_native_draw_rect)
+		{
+			const GSVector4i nr = ((s.itail0 == 0) ? p.nrect : s.nrect0.runion(p.nrect)).rintersect(m_context->scissor.in);
+			if (!nr.eq(temp_native_draw_rect))
+				bad = 5;
+		}
+	}
+	s_sc[0].fetch_add(1, std::memory_order_relaxed);
+	if (bad < 0)
+		s_sc[p.ntri ? 1 : 5].fetch_add(1, std::memory_order_relaxed);
+	else
+	{
+		s_sc[2].fetch_add(1, std::memory_order_relaxed);
+		s_scField[bad].fetch_add(1, std::memory_order_relaxed);
+		if (s_scDumps.fetch_sub(1, std::memory_order_relaxed) > 0)
+			std::fprintf(stderr, "[ge1] s4b check mismatch field=%d prim=%u count=%u ntri=%u got=%u itail0=%u base=%u next=%u nslot=%u\n",
+				bad, s.prim, count, p.ntri, got, s.itail0, s.base, m_vertex->next, p.nslot);
+	}
+	const u64 n = s_sc[0].load(std::memory_order_relaxed) + s_sc[3].load(std::memory_order_relaxed) + s_sc[4].load(std::memory_order_relaxed);
+	if ((n & 0xffffu) == 0)
+		std::fprintf(stderr, "[ge1] s4b check: compared=%llu matched=%llu empty_matched=%llu mismatched=%llu "
+			"(ntri %llu index %llu vertex %llu next %llu fmm %llu rect %llu) flush_inside=%llu unsupported=%llu\n",
+			(unsigned long long)s_sc[0].load(), (unsigned long long)s_sc[1].load(), (unsigned long long)s_sc[5].load(),
+			(unsigned long long)s_sc[2].load(), (unsigned long long)s_scField[0].load(), (unsigned long long)s_scField[1].load(),
+			(unsigned long long)s_scField[2].load(), (unsigned long long)s_scField[3].load(), (unsigned long long)s_scField[4].load(),
+			(unsigned long long)s_scField[5].load(), (unsigned long long)s_sc[3].load(), (unsigned long long)s_sc[4].load());
+}
+
 bool GSState::TransferCompact(const u8* bytes, u32 size)
 {
 	GIFPath& path = m_path[3]; // PATH1, like GSgifTransfer -> Transfer<3>
@@ -6071,7 +6325,15 @@ bool GSState::TransferCompact(const u8* bytes, u32 size)
 			continue;
 		m_q = 1.0f;
 		ApplyPRIM(path.tag.PRIM);
+		static const bool s_static_check = [] {
+			const char* v = std::getenv("GE1_RESIDENT_CHECK");
+			return v && !std::strcmp(v, "1");
+		}();
+		if (s_static_check)
+			StaticCheckPacket(packets[i].verts, packets[i].nloop);
 		(this->*m_fpGIFCompactHandler[PRIM->PRIM])(packets[i].verts, packets[i].nloop);
+		if (s_static_check)
+			StaticCheckAfter(packets[i].verts, packets[i].nloop);
 		path.nloop = 0;
 	}
 	return true;
