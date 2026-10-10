@@ -4355,6 +4355,13 @@ void GSState::StashHeldTerrainDraw(GSBackQueue::DrawNode::FusePassState& st, con
 	st.vtail = m_vertex->tail;
 	st.vnext = m_vertex->next;
 	st.itail = m_index->tail;
+	st.fmm_acc = m_vertex->fmm_acc;
+	st.fmm_watermark = m_vertex->fmm_watermark;
+	st.fmm_valid = m_vertex->fmm_valid;
+	st.xy_tail = m_vertex->xy_tail;
+	std::memcpy(st.xy, m_vertex->xy, sizeof(st.xy));
+	st.xyhead = m_vertex->xyhead;
+	std::memcpy(st.kick_ring, m_vertex->kick_ring, sizeof(st.kick_ring));
 	st.draw_serial = s_n;
 	st.backed_up_ctx = m_backed_up_ctx;
 	st.dirty_gs_regs = m_dirty_gs_regs;
@@ -4376,6 +4383,13 @@ void GSState::InstallHeldTerrainDraw(const GSBackQueue::DrawNode::FusePassState&
 	m_vertex->tail = st.vtail;
 	m_vertex->next = st.vnext;
 	m_index->tail = st.itail;
+	m_vertex->fmm_acc = st.fmm_acc;
+	m_vertex->fmm_watermark = st.fmm_watermark;
+	m_vertex->fmm_valid = st.fmm_valid;
+	m_vertex->xy_tail = st.xy_tail;
+	std::memcpy(m_vertex->xy, st.xy, sizeof(m_vertex->xy));
+	m_vertex->xyhead = st.xyhead;
+	std::memcpy(m_vertex->kick_ring, st.kick_ring, sizeof(m_vertex->kick_ring));
 	std::memcpy(&m_prev_env, &st.draw_env, sizeof(m_prev_env));
 	std::memcpy(&m_env, &st.next_env, sizeof(m_env));
 	m_v = st.next_v;

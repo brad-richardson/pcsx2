@@ -147,6 +147,21 @@ namespace GSBackQueue
 			std::vector<GSVertex> verts;
 			std::vector<u16> indices;
 			u32 vhead = 0, vtail = 0, vnext = 0, itail = 0;
+			// Fused min/max accumulator (aarch64): Update() consumes it instead
+			// of re-walking the index list, so a held draw must execute with its
+			// own accumulator, not the live draw's.
+			GSVertexKernels::FmmAcc fmm_acc = {};
+			u32 fmm_watermark = 0;
+			bool fmm_valid = false;
+			// Kick-time cull window: the degenerate-triangle cull at index
+			// emission reads xy[]/kick_ring[]/xy_tail/xyhead, so a held draw
+			// must execute with its own window, not the live draw's (else
+			// the fallback's post-state carries T1's window, not T2's, and
+			// later kicks cull differently).
+			u32 xy_tail = 0;
+			GSVector4i xy[4] = {};
+			GSVector4i xyhead = GSVector4i::zero();
+			GSVertexKernels::CullMirrorEntry kick_ring[4] = {};
 			u64 draw_serial = 0;
 			int backed_up_ctx = -1;
 			u32 dirty_gs_regs = 0;
