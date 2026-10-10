@@ -169,6 +169,18 @@ namespace GSBackQueue
 			bool channel_shuffle_finish = false;
 			bool packed_uv_hack_flag = false;
 			DrawPrivRegs priv = {};
+			// Draw-env aim + derived cull-cache (TPF1 seam/break transparency).
+			// Install re-aims the draw pointers; without the aim bit it always
+			// aims at m_prev_env, leaving post-flush kicks aimed stale while live
+			// regs moved on (a mid-draw SCISSOR then re-derives from the wrong
+			// env: ap120 phantom/fullscreen extras + dropped sprites). The cull
+			// cache (src/band/raw) is mutated by UpdateScissor during installs,
+			// so it rides along; restoring it before UpdateContext() makes the
+			// re-derive a no-op by construction (restored cull == restored src).
+			bool draw_env_aimed_at_prev = false;
+			GSVector4i cull_bounds_src = GSVector4i::cxpr(-2, -2, -2, -2);
+			GSVertexKernels::CullBounds cull_bounds_band = {};
+			GSVertexKernels::CullBounds cull_bounds_raw = {};
 		};
 		struct FusePayload
 		{

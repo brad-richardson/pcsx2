@@ -4346,6 +4346,10 @@ void GSState::StashHeldTerrainDraw(GSBackQueue::DrawNode::FusePassState& st, con
 {
 	std::memcpy(&st.draw_env, &m_prev_env, sizeof(st.draw_env));
 	std::memcpy(&st.next_env, &m_env, sizeof(st.next_env));
+	st.draw_env_aimed_at_prev = (m_draw_env == &m_prev_env);
+	st.cull_bounds_src = m_cull_bounds_src;
+	st.cull_bounds_band = m_cull_bounds_band;
+	st.cull_bounds_raw = m_cull_bounds_raw;
 	st.next_v = m_v;
 	st.draw_rect = temp_draw_rect;
 	st.native_draw_rect = temp_native_draw_rect;
@@ -4395,8 +4399,16 @@ void GSState::InstallHeldTerrainDraw(const GSBackQueue::DrawNode::FusePassState&
 	m_v = st.next_v;
 	temp_draw_rect = st.draw_rect;
 	temp_native_draw_rect = st.native_draw_rect;
-	m_draw_env = &m_prev_env;
-	PRIM = &m_prev_env.PRIM;
+	// Restore the stashed aim (not unconditionally prev: a seam/break flush
+	// must leave post-flush kicks aimed live, as they were when stashed).
+	m_draw_env = st.draw_env_aimed_at_prev ? &m_prev_env : &m_env;
+	PRIM = &m_draw_env->PRIM;
+	// Restore the derived cull cache before UpdateContext() so its re-derive
+	// is a no-op by construction (restored cull == restored src): no stale
+	// ring rewrite from an unrelated rect.
+	m_cull_bounds_src = st.cull_bounds_src;
+	m_cull_bounds_band = st.cull_bounds_band;
+	m_cull_bounds_raw = st.cull_bounds_raw;
 	UpdateContext();
 	s_n = st.draw_serial;
 	m_backed_up_ctx = st.backed_up_ctx;
