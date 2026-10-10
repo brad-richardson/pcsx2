@@ -549,8 +549,9 @@ public:
 	// RT-reading roads, no scaling, equal shared state), then submits one fused draw
 	// (PS_FUSE3/VSExpand::Fuse3) that chains the three stock blends in-shader with
 	// an emulated intermediate round. Any surprise aborts to a serial replay that is
-	// stock DrawRecordTail per pass, after restoring the two cache fields a verify
-	// can move non-idempotently (rt/ds m_last_draw, rt m_rt_alpha_scale).
+	// stock DrawRecordTail per pass, after restoring the cache fields a verify
+	// can move non-idempotently (rt/ds m_last_draw, rt/ds m_rt_alpha_scale,
+	// rt m_alpha_min/max/range/known/via_union, ds m_alpha_min/max).
 	bool SupportsTerrainFuse() const override { return true; }
 	void FuseDraw() override;
 
@@ -591,6 +592,10 @@ public:
 	/// stock DrawRecordTail per pass (T3/T2 via InstallHeldTerrainDraw).
 	void FuseSerialFallback(const GSBackQueue::DrawNode::FusePassState& t3, const GSBackQueue::DrawNode::FusePassState& t2);
 
+	/// Stats-gated one-line-per-pass tuple dump (first triple only at each call
+	/// site) for the fused path and the aborted path alike.
+	void FusePrintTripleTuples(const char* tag, const GSHWDrawConfig& c0, const GSHWDrawConfig& c1, const GSHWDrawConfig& c2);
+
 	/// Live-T1 save/restore (entry/exit of every FuseDraw; the fallback restores it
 	/// too). Buffer structs by value (pointers, not bytes: verifies repoint the
 	/// live slots at stashed vectors and never write through), envs/scalars by value.
@@ -621,4 +626,15 @@ public:
 	bool m_fuse_cap_ds_scaled = false;
 	u64 m_fuse_cap_rt_last_draw = 0;
 	u64 m_fuse_cap_ds_last_draw = 0;
+	// TPF1: the target alpha trackers a verify advances non-idempotently.
+	// CalculateAlphaRange seeds the new range from the live trackers and the
+	// draw assigns them back, so three verifies leave post-T2 state behind;
+	// the serial fallback must replay T1 from the pre-triple state instead.
+	int m_fuse_cap_rt_alpha_min = 0;
+	int m_fuse_cap_rt_alpha_max = 0;
+	bool m_fuse_cap_rt_alpha_range = false;
+	GSAlphaKnownBits::Known m_fuse_cap_rt_alpha_known{};
+	bool m_fuse_cap_rt_alpha_via_union = false;
+	int m_fuse_cap_ds_alpha_min = 0;
+	int m_fuse_cap_ds_alpha_max = 0;
 };

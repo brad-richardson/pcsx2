@@ -5753,8 +5753,10 @@ void GSRendererHW::Draw()
 
 	if (!skip_draw)
 	{
-		// TPF1: the first verify pass captures the triple's targets plus the two
-		// cache fields a verify can move non-idempotently (restored on abort).
+		// TPF1: the first verify pass captures the triple's targets plus the
+		// cache fields a verify can move non-idempotently (restored on abort):
+		// the draw stamp, the RTA scale flag, and the alpha trackers
+		// CalculateAlphaRange seeds from and assigns back every draw.
 		if (m_fuse_verify_active && !m_fuse_targets_captured)
 		{
 			m_fuse_targets_captured = true;
@@ -5764,11 +5766,18 @@ void GSRendererHW::Draw()
 			{
 				m_fuse_cap_rt_scaled = rt->m_rt_alpha_scale;
 				m_fuse_cap_rt_last_draw = rt->m_last_draw;
+				m_fuse_cap_rt_alpha_min = rt->m_alpha_min;
+				m_fuse_cap_rt_alpha_max = rt->m_alpha_max;
+				m_fuse_cap_rt_alpha_range = rt->m_alpha_range;
+				m_fuse_cap_rt_alpha_known = rt->m_alpha_known;
+				m_fuse_cap_rt_alpha_via_union = rt->m_alpha_known_via_union;
 			}
 			if (ds)
 			{
 				m_fuse_cap_ds_scaled = ds->m_rt_alpha_scale;
 				m_fuse_cap_ds_last_draw = ds->m_last_draw;
+				m_fuse_cap_ds_alpha_min = ds->m_alpha_min;
+				m_fuse_cap_ds_alpha_max = ds->m_alpha_max;
 			}
 		}
 		DrawPrims(rt, ds, src, tmm);
@@ -13629,6 +13638,33 @@ bool GSRendererHW::FuseSnapshotsCompatible(
 
 #undef FUSE_CHECK
 
+// TPF1: one-line-per-pass blend/sampling tuple dump (stats gate, first triple
+// only at each call site) for the fused path and the aborted path alike.
+void GSRendererHW::FusePrintTripleTuples(
+	const char* tag, const GSHWDrawConfig& c0, const GSHWDrawConfig& c1, const GSHWDrawConfig& c2)
+{
+	std::fprintf(stderr,
+		"TPF1: %s blend tuples:\n"
+		"  T1 abcd=(%u,%u,%u,%u) hw=%u mix=%u nc1=%u dev=(en=%u op=%u src=%u dst=%u) lod=(m=%u a=%u) aniso=%u wms/wmt=(%u,%u) ltf=%u aem_fmt=%u\n"
+		"  T3 abcd=(%u,%u,%u,%u) hw=%u mix=%u nc1=%u afin=%u bfin=%u inv=%u rinv=%u dev=(en=%u op=%u src=%u dst=%u) lod=(m=%u a=%u) aniso=%u wms/wmt=(%u,%u) ltf=%u aem_fmt=%u pal_fmt=%u flags=0x%x blend=0x%x\n"
+		"  T2 abcd=(%u,%u,%u,%u) hw=%u mix=%u nc1=%u afin=%u bfin=%u inv=%u rinv=%u dev=(en=%u op=%u src=%u dst=%u) lod=(m=%u a=%u) aniso=%u wms/wmt=(%u,%u) ltf=%u aem_fmt=%u pal_fmt=%u flags=0x%x blend=0x%x\n",
+		tag, c0.ps.blend_a, c0.ps.blend_b, c0.ps.blend_c, c0.ps.blend_d, static_cast<unsigned>(c0.ps.blend_hw),
+		static_cast<unsigned>(c0.ps.blend_mix), c0.ps.no_color1, c0.blend.enable ? 1u : 0u,
+		static_cast<unsigned>(c0.blend.op), static_cast<unsigned>(c0.blend.src_factor), static_cast<unsigned>(c0.blend.dst_factor),
+		c0.ps.manual_lod, c0.ps.automatic_lod, c0.ps.sw_aniso, c0.ps.wms, c0.ps.wmt, c0.ps.ltf, c0.ps.aem_fmt,
+		c1.ps.blend_a, c1.ps.blend_b, c1.ps.blend_c, c1.ps.blend_d, static_cast<unsigned>(c1.ps.blend_hw),
+		static_cast<unsigned>(c1.ps.blend_mix), c1.ps.no_color1, c1.ps.af_in_src1, c1.ps.blend_factor_in_alpha,
+		c1.ps.inv_src1_rewrite, c1.ps.round_inv, c1.blend.enable ? 1u : 0u, static_cast<unsigned>(c1.blend.op),
+		static_cast<unsigned>(c1.blend.src_factor), static_cast<unsigned>(c1.blend.dst_factor), c1.ps.manual_lod,
+		c1.ps.automatic_lod, c1.ps.sw_aniso, c1.ps.wms, c1.ps.wmt, c1.ps.ltf, c1.ps.aem_fmt, c1.ps.pal_fmt,
+		FusePackFlags(c1.ps), FusePackBlend(c1), c2.ps.blend_a, c2.ps.blend_b, c2.ps.blend_c, c2.ps.blend_d,
+		static_cast<unsigned>(c2.ps.blend_hw), static_cast<unsigned>(c2.ps.blend_mix), c2.ps.no_color1,
+		c2.ps.af_in_src1, c2.ps.blend_factor_in_alpha, c2.ps.inv_src1_rewrite, c2.ps.round_inv,
+		c2.blend.enable ? 1u : 0u, static_cast<unsigned>(c2.blend.op), static_cast<unsigned>(c2.blend.src_factor),
+		static_cast<unsigned>(c2.blend.dst_factor), c2.ps.manual_lod, c2.ps.automatic_lod, c2.ps.sw_aniso, c2.ps.wms,
+		c2.ps.wmt, c2.ps.ltf, c2.ps.aem_fmt, c2.ps.pal_fmt, FusePackFlags(c2.ps), FusePackBlend(c2));
+}
+
 void GSRendererHW::FuseAssembleAndSubmit(const FuseVerifySnapshot& s0, const FuseVerifySnapshot& s1,
 	const FuseVerifySnapshot& s2, const GSVertex* v0, const GSVertex* v1, const GSVertex* v2, u32 nverts,
 	const u16* indices, u32 nindices)
@@ -13739,26 +13775,7 @@ void GSRendererHW::FuseAssembleAndSubmit(const FuseVerifySnapshot& s0, const Fus
 		if (!fuse_tuple_printed)
 		{
 			fuse_tuple_printed = true;
-			std::fprintf(stderr,
-				"TPF1: first fused triple blend tuples:\n"
-				"  T1 abcd=(%u,%u,%u,%u) hw=%u mix=%u nc1=%u dev=(en=%u op=%u src=%u dst=%u) lod=(m=%u a=%u) aniso=%u wms/wmt=(%u,%u) ltf=%u aem_fmt=%u\n"
-				"  T3 abcd=(%u,%u,%u,%u) hw=%u mix=%u nc1=%u afin=%u bfin=%u inv=%u rinv=%u dev=(en=%u op=%u src=%u dst=%u) lod=(m=%u a=%u) aniso=%u wms/wmt=(%u,%u) ltf=%u aem_fmt=%u pal_fmt=%u flags=0x%x blend=0x%x\n"
-				"  T2 abcd=(%u,%u,%u,%u) hw=%u mix=%u nc1=%u afin=%u bfin=%u inv=%u rinv=%u dev=(en=%u op=%u src=%u dst=%u) lod=(m=%u a=%u) aniso=%u wms/wmt=(%u,%u) ltf=%u aem_fmt=%u pal_fmt=%u flags=0x%x blend=0x%x\n",
-				c0.ps.blend_a, c0.ps.blend_b, c0.ps.blend_c, c0.ps.blend_d, static_cast<unsigned>(c0.ps.blend_hw),
-				static_cast<unsigned>(c0.ps.blend_mix), c0.ps.no_color1, c0.blend.enable ? 1u : 0u,
-				static_cast<unsigned>(c0.blend.op), static_cast<unsigned>(c0.blend.src_factor), static_cast<unsigned>(c0.blend.dst_factor),
-				c0.ps.manual_lod, c0.ps.automatic_lod, c0.ps.sw_aniso, c0.ps.wms, c0.ps.wmt, c0.ps.ltf, c0.ps.aem_fmt,
-				c1.ps.blend_a, c1.ps.blend_b, c1.ps.blend_c, c1.ps.blend_d, static_cast<unsigned>(c1.ps.blend_hw),
-				static_cast<unsigned>(c1.ps.blend_mix), c1.ps.no_color1, c1.ps.af_in_src1, c1.ps.blend_factor_in_alpha,
-				c1.ps.inv_src1_rewrite, c1.ps.round_inv, c1.blend.enable ? 1u : 0u, static_cast<unsigned>(c1.blend.op),
-				static_cast<unsigned>(c1.blend.src_factor), static_cast<unsigned>(c1.blend.dst_factor), c1.ps.manual_lod,
-				c1.ps.automatic_lod, c1.ps.sw_aniso, c1.ps.wms, c1.ps.wmt, c1.ps.ltf, c1.ps.aem_fmt, c1.ps.pal_fmt,
-				FusePackFlags(c1.ps), FusePackBlend(c1), c2.ps.blend_a, c2.ps.blend_b, c2.ps.blend_c, c2.ps.blend_d,
-				static_cast<unsigned>(c2.ps.blend_hw), static_cast<unsigned>(c2.ps.blend_mix), c2.ps.no_color1,
-				c2.ps.af_in_src1, c2.ps.blend_factor_in_alpha, c2.ps.inv_src1_rewrite, c2.ps.round_inv,
-				c2.blend.enable ? 1u : 0u, static_cast<unsigned>(c2.blend.op), static_cast<unsigned>(c2.blend.src_factor),
-				static_cast<unsigned>(c2.blend.dst_factor), c2.ps.manual_lod, c2.ps.automatic_lod, c2.ps.sw_aniso, c2.ps.wms,
-				c2.ps.wmt, c2.ps.ltf, c2.ps.aem_fmt, c2.ps.pal_fmt, FusePackFlags(c2.ps), FusePackBlend(c2));
+			FusePrintTripleTuples("first fused triple", c0, c1, c2);
 		}
 	}
 
@@ -13782,11 +13799,18 @@ void GSRendererHW::FuseSerialFallback(
 		{
 			m_fuse_cap_rt->m_rt_alpha_scale = m_fuse_cap_rt_scaled;
 			m_fuse_cap_rt->m_last_draw = m_fuse_cap_rt_last_draw;
+			m_fuse_cap_rt->m_alpha_min = m_fuse_cap_rt_alpha_min;
+			m_fuse_cap_rt->m_alpha_max = m_fuse_cap_rt_alpha_max;
+			m_fuse_cap_rt->m_alpha_range = m_fuse_cap_rt_alpha_range;
+			m_fuse_cap_rt->m_alpha_known = m_fuse_cap_rt_alpha_known;
+			m_fuse_cap_rt->m_alpha_known_via_union = m_fuse_cap_rt_alpha_via_union;
 		}
 		if (m_fuse_cap_ds)
 		{
 			m_fuse_cap_ds->m_rt_alpha_scale = m_fuse_cap_ds_scaled;
 			m_fuse_cap_ds->m_last_draw = m_fuse_cap_ds_last_draw;
+			m_fuse_cap_ds->m_alpha_min = m_fuse_cap_ds_alpha_min;
+			m_fuse_cap_ds->m_alpha_max = m_fuse_cap_ds_alpha_max;
 		}
 		m_fuse_targets_captured = false;
 	}
@@ -13864,7 +13888,18 @@ void GSRendererHW::FuseDraw()
 		if (!FuseVerifyPass(2, t2, s2))
 			break;
 		if (!FuseSnapshotsCompatible(s0, s1, s2))
+		{
+			if (FuseStatsEnabled())
+			{
+				static bool abort_tuple_printed = false;
+				if (!abort_tuple_printed)
+				{
+					abort_tuple_printed = true;
+					FusePrintTripleTuples("first aborted triple", s0.conf, s1.conf, s2.conf);
+				}
+			}
 			break;
+		}
 		// Stream shape: SetupIA draws m_vertex->next verts; the front asserted
 		// vnext/vtail/itail equality, the snapshots asserted nverts/nindices
 		// equality; guard the assembly reads all the same.

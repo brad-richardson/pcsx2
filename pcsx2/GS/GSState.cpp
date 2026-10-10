@@ -4287,8 +4287,9 @@ static bool TerrainFuseKnob()
 static bool TerrainFuseStats()
 {
 	static const bool on = [] {
-		const char* e = std::getenv("GE1_TPF1_STATS");
-		return e && e[0] == '1';
+		const char* a = std::getenv("GE1_TPF1_STATS");
+		const char* b = std::getenv("GE1_TERRAIN_FUSE_STATS");
+		return (a && a[0] == '1') || (b && b[0] == '1');
 	}();
 	return on;
 }
