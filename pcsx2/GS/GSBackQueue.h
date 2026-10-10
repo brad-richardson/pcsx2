@@ -112,6 +112,16 @@ namespace GSBackQueue
 		u32 tail;
 	};
 
+	// The privileged-register fields a draw reads, as they stood when the draw was flushed. The
+	// registers themselves are one block shared with MTGS, which rewrites it at the vsync packet
+	// (and the EE thread in WaitGS) while queued draws have not run yet.
+	struct DrawPrivRegs
+	{
+		u32 dispfb_fbp[2]; // DISP[n].DISPFB.FBP
+		bool display_enabled[2]; // PMODE.EN1 / EN2
+		bool field_render; // SMODE2.FFMD && isReallyInterlaced()
+	};
+
 	// GV7-1c: one pooled vertex+index buffer set. On the record path, FlushPrim
 	// hands the live heap arrays to a node (struct copy + array exchange: the
 	// parse slot takes the node's recycled arrays as its fresh buffers), so the
@@ -260,16 +270,6 @@ namespace GSBackQueue
 		u32 field;
 		bool registers_written;
 		bool idle_frame;
-	};
-
-	// The privileged-register fields a draw reads, as they stood when the draw was flushed. The
-	// registers themselves are one block shared with MTGS, which rewrites it at the vsync packet
-	// (and the EE thread in WaitGS) while queued draws have not run yet.
-	struct DrawPrivRegs
-	{
-		u32 dispfb_fbp[2]; // DISP[n].DISPFB.FBP
-		bool display_enabled[2]; // PMODE.EN1 / EN2
-		bool field_render; // SMODE2.FFMD && isReallyInterlaced()
 	};
 
 	// One flushed draw (today's FlushPrim tail: vertex trace -> texel rounding ->

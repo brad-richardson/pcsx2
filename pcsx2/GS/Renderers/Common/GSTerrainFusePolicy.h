@@ -62,7 +62,8 @@ struct DrawRegs
 	u64 xyoffset;
 	u64 scissor;
 	u64 miptbp2;
-	u64 tex2;
+	// NOTE: no tex2 (a TEX2 write is a masked write into TEX0, which the
+	// classifier and the back-side verify both read from the pass's own env).
 	u64 fogcol;
 	u32 fba;
 	u32 pabe;
@@ -206,8 +207,6 @@ __fi static bool StatesCompatible(const DrawRegs& t1, const DrawRegs& t3, const 
 	if (t1.scissor != t3.scissor || t1.scissor != t2.scissor)
 		return false;
 	if (t1.miptbp2 != t3.miptbp2 || t1.miptbp2 != t2.miptbp2)
-		return false;
-	if (t1.tex2 != t3.tex2 || t1.tex2 != t2.tex2)
 		return false;
 	if (t1.fogcol != t3.fogcol || t1.fogcol != t2.fogcol)
 		return false;

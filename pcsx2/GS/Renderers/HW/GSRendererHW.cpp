@@ -13288,8 +13288,8 @@ static u32 FusePackBlend(const GSHWDrawConfig& c)
 	v |= (ps.round_inv & 1u) << 17;
 	v |= (c.blend.enable ? 1u : 0u) << 18;
 	v |= (static_cast<u32>(c.blend.op) & 3u) << 19;
-	v |= (static_cast<u32>(c.blend.src) & 15u) << 21;
-	v |= (static_cast<u32>(c.blend.dst) & 15u) << 25;
+	v |= (static_cast<u32>(c.blend.src_factor) & 15u) << 21;
+	v |= (static_cast<u32>(c.blend.dst_factor) & 15u) << 25;
 	return v;
 }
 
@@ -13449,12 +13449,12 @@ bool GSRendererHW::FuseSnapshotsCompatible(
 	FUSE_CHECK(!c1.ps.af_in_src1 && !c1.ps.blend_factor_in_alpha && !c1.ps.round_inv, BlendConst);
 	FUSE_CHECK(!c2.ps.af_in_src1 && !c2.ps.blend_factor_in_alpha && !c2.ps.round_inv, BlendConst);
 	FUSE_CHECK(!c0.ps.inv_src1_rewrite && !c1.ps.inv_src1_rewrite && !c2.ps.inv_src1_rewrite, BlendConst);
-	FUSE_CHECK(c0.blend.src != GSDevice::CONST_COLOR && c0.blend.src != GSDevice::INV_CONST_COLOR, BlendConst);
-	FUSE_CHECK(c0.blend.dst != GSDevice::CONST_COLOR && c0.blend.dst != GSDevice::INV_CONST_COLOR, BlendConst);
-	FUSE_CHECK(c1.blend.src != GSDevice::CONST_COLOR && c1.blend.src != GSDevice::INV_CONST_COLOR, BlendConst);
-	FUSE_CHECK(c1.blend.dst != GSDevice::CONST_COLOR && c1.blend.dst != GSDevice::INV_CONST_COLOR, BlendConst);
-	FUSE_CHECK(c2.blend.src != GSDevice::CONST_COLOR && c2.blend.src != GSDevice::INV_CONST_COLOR, BlendConst);
-	FUSE_CHECK(c2.blend.dst != GSDevice::CONST_COLOR && c2.blend.dst != GSDevice::INV_CONST_COLOR, BlendConst);
+	FUSE_CHECK(c0.blend.src_factor != GSDevice::CONST_COLOR && c0.blend.src_factor != GSDevice::INV_CONST_COLOR, BlendConst);
+	FUSE_CHECK(c0.blend.dst_factor != GSDevice::CONST_COLOR && c0.blend.dst_factor != GSDevice::INV_CONST_COLOR, BlendConst);
+	FUSE_CHECK(c1.blend.src_factor != GSDevice::CONST_COLOR && c1.blend.src_factor != GSDevice::INV_CONST_COLOR, BlendConst);
+	FUSE_CHECK(c1.blend.dst_factor != GSDevice::CONST_COLOR && c1.blend.dst_factor != GSDevice::INV_CONST_COLOR, BlendConst);
+	FUSE_CHECK(c2.blend.src_factor != GSDevice::CONST_COLOR && c2.blend.src_factor != GSDevice::INV_CONST_COLOR, BlendConst);
+	FUSE_CHECK(c2.blend.dst_factor != GSDevice::CONST_COLOR && c2.blend.dst_factor != GSDevice::INV_CONST_COLOR, BlendConst);
 	// B6 absolute per pass: write masks (T1 full, T3/T2 alpha-held) + no logic op.
 	FUSE_CHECK(c0.colormask.wrgba == 0xF && c0.colormask.logic_op == 0, BlendPattern);
 	FUSE_CHECK(c1.colormask.wrgba == 0x7 && c1.colormask.logic_op == 0, BlendPattern);
@@ -13531,7 +13531,7 @@ bool GSRendererHW::FuseSnapshotsCompatible(
 	FUSE_CHECK(c0.ps.ztst == ZTST_ALWAYS && c1.ps.ztst == ZTST_ALWAYS && c2.ps.ztst == ZTST_ALWAYS, FixedFunction);
 	// B6 absolute per pass: no alpha test (a per-pass discard would break the
 	// chain; TEST.ATST=ALWAYS maps to PS_ATST::NONE).
-	FUSE_CHECK(c0.ps.atst == 0 && c1.ps.atst == 0 && c2.ps.atst == 0, FixedFunction);
+	FUSE_CHECK(c0.ps.atst == PS_ATST::NONE && c1.ps.atst == PS_ATST::NONE && c2.ps.atst == PS_ATST::NONE, FixedFunction);
 	// B6: T1 is a pure REPLACE (no shader blend assist, single output).
 	FUSE_CHECK(c0.ps.blend_hw == 0 && c0.ps.blend_mix == 0 && c0.ps.no_color1 == 1, BlendPattern);
 	// B6: T3/T2 are pure software blends (the chain evaluates the pinned formulas
@@ -13746,18 +13746,18 @@ void GSRendererHW::FuseAssembleAndSubmit(const FuseVerifySnapshot& s0, const Fus
 				"  T2 abcd=(%u,%u,%u,%u) hw=%u mix=%u nc1=%u afin=%u bfin=%u inv=%u rinv=%u dev=(en=%u op=%u src=%u dst=%u) lod=(m=%u a=%u) aniso=%u wms/wmt=(%u,%u) ltf=%u aem_fmt=%u pal_fmt=%u flags=0x%x blend=0x%x\n",
 				c0.ps.blend_a, c0.ps.blend_b, c0.ps.blend_c, c0.ps.blend_d, static_cast<unsigned>(c0.ps.blend_hw),
 				static_cast<unsigned>(c0.ps.blend_mix), c0.ps.no_color1, c0.blend.enable ? 1u : 0u,
-				static_cast<unsigned>(c0.blend.op), static_cast<unsigned>(c0.blend.src), static_cast<unsigned>(c0.blend.dst),
+				static_cast<unsigned>(c0.blend.op), static_cast<unsigned>(c0.blend.src_factor), static_cast<unsigned>(c0.blend.dst_factor),
 				c0.ps.manual_lod, c0.ps.automatic_lod, c0.ps.sw_aniso, c0.ps.wms, c0.ps.wmt, c0.ps.ltf, c0.ps.aem_fmt,
 				c1.ps.blend_a, c1.ps.blend_b, c1.ps.blend_c, c1.ps.blend_d, static_cast<unsigned>(c1.ps.blend_hw),
 				static_cast<unsigned>(c1.ps.blend_mix), c1.ps.no_color1, c1.ps.af_in_src1, c1.ps.blend_factor_in_alpha,
 				c1.ps.inv_src1_rewrite, c1.ps.round_inv, c1.blend.enable ? 1u : 0u, static_cast<unsigned>(c1.blend.op),
-				static_cast<unsigned>(c1.blend.src), static_cast<unsigned>(c1.blend.dst), c1.ps.manual_lod,
+				static_cast<unsigned>(c1.blend.src_factor), static_cast<unsigned>(c1.blend.dst_factor), c1.ps.manual_lod,
 				c1.ps.automatic_lod, c1.ps.sw_aniso, c1.ps.wms, c1.ps.wmt, c1.ps.ltf, c1.ps.aem_fmt, c1.ps.pal_fmt,
 				FusePackFlags(c1.ps), FusePackBlend(c1), c2.ps.blend_a, c2.ps.blend_b, c2.ps.blend_c, c2.ps.blend_d,
 				static_cast<unsigned>(c2.ps.blend_hw), static_cast<unsigned>(c2.ps.blend_mix), c2.ps.no_color1,
 				c2.ps.af_in_src1, c2.ps.blend_factor_in_alpha, c2.ps.inv_src1_rewrite, c2.ps.round_inv,
-				c2.blend.enable ? 1u : 0u, static_cast<unsigned>(c2.blend.op), static_cast<unsigned>(c2.blend.src),
-				static_cast<unsigned>(c2.blend.dst), c2.ps.manual_lod, c2.ps.automatic_lod, c2.ps.sw_aniso, c2.ps.wms,
+				c2.blend.enable ? 1u : 0u, static_cast<unsigned>(c2.blend.op), static_cast<unsigned>(c2.blend.src_factor),
+				static_cast<unsigned>(c2.blend.dst_factor), c2.ps.manual_lod, c2.ps.automatic_lod, c2.ps.sw_aniso, c2.ps.wms,
 				c2.ps.wmt, c2.ps.ltf, c2.ps.aem_fmt, c2.ps.pal_fmt, FusePackFlags(c2.ps), FusePackBlend(c2));
 		}
 	}

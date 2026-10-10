@@ -4329,7 +4329,6 @@ static GSTerrainFusePolicy::DrawRegs FillFuseRegs(const GSDrawingEnvironment& en
 	r.xyoffset = ctx.XYOFFSET.U64;
 	r.scissor = ctx.SCISSOR.U64;
 	r.miptbp2 = ctx.MIPTBP2.U64;
-	r.tex2 = ctx.TEX2.U64;
 	r.fogcol = env.FOGCOL.U64;
 	r.fba = ctx.FBA.FBA;
 	r.pabe = env.PABE.PABE;

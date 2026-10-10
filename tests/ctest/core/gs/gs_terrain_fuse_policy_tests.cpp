@@ -42,7 +42,6 @@ DrawRegs CensusedT1()
 	r.xyoffset = 0x720000007000ULL;
 	r.scissor = 0x1bf000001ff0000ULL;
 	r.miptbp2 = 0x0;
-	r.tex2 = 0x0;
 	r.fogcol = 0x0;
 	r.fba = 0;
 	r.pabe = 0;
