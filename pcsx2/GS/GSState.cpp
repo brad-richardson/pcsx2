@@ -6034,11 +6034,24 @@ bool GSState::TransferCompact(const u8* bytes, u32 size)
 			if (npackets >= 64)
 				return false;
 			const u32 nv = (n - 16u) / 32u;
-			GIFPath probe{};
-			probe.SetTag(pkt);
-			if (!probe.tag.PRE || probe.tag.FLG != GIF_FLG_PACKED || probe.nreg != 3 ||
-				probe.type != GIFPath::TYPE_STQRGBAXYZF2 || probe.nloop != nv)
-				return false;
+			// NLOOP 0 outputs nothing (eeuser 7.2.2): SetTag returns before
+			// classifying, and Transfer skips the tag. Same here: no shape
+			// check, just the empty body.
+			u32 w0 = 0;
+			std::memcpy(&w0, pkt, 4);
+			if ((w0 & 0x7fffu) == 0)
+			{
+				if (nv != 0)
+					return false;
+			}
+			else
+			{
+				GIFPath probe{};
+				probe.SetTag(pkt);
+				if (!probe.tag.PRE || probe.tag.FLG != GIF_FLG_PACKED || probe.nreg != 3 ||
+					probe.type != GIFPath::TYPE_STQRGBAXYZF2 || probe.nloop != nv)
+					return false;
+			}
 			Packet p;
 			p.tag = pkt;
 			p.verts = reinterpret_cast<const Ge1CompactVertex*>(pkt + 16);
