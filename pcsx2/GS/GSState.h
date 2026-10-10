@@ -492,10 +492,12 @@ protected:
 	// where StaticFastOk holds; GE1_RESIDENT_CHECK=2 runs the kick too, on the
 	// same state, and compares everything it leaves behind; GE1_RESIDENT_SPEC=1
 	// counts how often the cull state repeats (the MTVU speculation question).
-	bool StaticPacket(const Ge1CompactVertex* d, u32 count);
+	bool StaticPacket(const Ge1CompactVertex* d, u32 count, u32 packet);
+	void StaticPublish(const GSStaticCullState& live);
 	void StaticCullStateLive(GSStaticCullState& cs);
 	template<u32 prim> int StaticFastOk(u32 count);
-	template<u32 prim> void StaticApply(const Ge1CompactVertex* RESTRICT d, const GSStaticPrep& p, const GSStaticCullState& cs);
+	template<u32 prim> void StaticApply(const Ge1CompactVertex* RESTRICT d, const GSStaticPrepHdr& p, const u8* RESTRICT pslot,
+		const u8* RESTRICT psrc, const GSStaticCullState& cs);
 	void StaticSpecNote(const GSStaticCullState& cs);
 	struct StaticShadow;
 	void StaticShadowCapture(StaticShadow& s, u32 base, u32 itail0);
@@ -1097,6 +1099,8 @@ public:
 	bool TransferCompact(const u8* bytes, u32 size);
 	static inline void (*s_compact_packet_hook)(u32 packet, u32 uv, int depth_clamp_mode) = nullptr; // RZV1 S4b
 	void StaticSpecVsync(); // RZV1 S4c: GE1_RESIDENT_SPEC rotation (GSvsync)
+	static const u8* s_static_rec; // RZV1 S4c: the ingesting record's S4C1 block (GSStaticRecordBegin), GsWorker
+	static u32 s_static_rec_npk;
 	int Freeze(freezeData* fd, bool sizeonly);
 	int Defrost(const freezeData* fd);
 

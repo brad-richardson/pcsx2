@@ -95,6 +95,17 @@ bool GSgifTransferCompact(const u8* bytes, u32 size);
 // clamp mode as GSLimit24BitDepth); null = off.
 using GSCompactPacketHook = void (*)(u32 packet, u32 uv, int depth_clamp_mode);
 void GSSetCompactPacketHook(GSCompactPacketHook hook);
+// RZV1 S4c: the static-world packets of a compact record prepared on the
+// caller's thread (the MTVU) against the cull state GsWorker last published:
+// writes an S4C1 block (GSStaticPrep.h) to out and returns its size, 0 when
+// nothing is published yet or cap is too small. Needs IEEE round-to-nearest,
+// no flush-to-zero (the trace's S/Q divides). Thread-safe.
+u32 GSStaticPrepareRecord(const u8* compact, u32 size, u8* out, u32 cap);
+// GsWorker: the next GSgifTransferCompact's packets use this block's prepared
+// outcomes where their cull state is the live one (validated; ignored if
+// malformed). End clears it.
+void GSStaticRecordBegin(const u8* block, u32 size);
+void GSStaticRecordEnd();
 void GSgifTransfer1(u8* mem, u32 addr);
 void GSgifTransfer2(u8* mem, u32 size);
 void GSgifTransfer3(u8* mem, u32 size);

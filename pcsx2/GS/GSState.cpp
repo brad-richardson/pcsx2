@@ -6024,7 +6024,8 @@ std::atomic<u64> s_scField[6]; // ntri, index, vertex bytes, next, fmm, rect
 std::atomic<int> s_scDumps{8};
 // S4c fast path: 0 packets seen, 1 fast, 2 fast vertices, 3 unsupported (prim/count),
 // 4..9 StaticFastOk reasons 1..6, 10 shadow compared, 11 shadow mismatched,
-// 12 shadow flush/switch inside the kick
+// 12 shadow flush/switch inside the kick, 13 record prep used, 14 record prep stale/absent
+// for the packet, 15 no record block
 std::atomic<u64> s_fp[16];
 std::atomic<u64> s_fpField[16];
 std::atomic<int> s_fpDumps{8};
@@ -6073,12 +6074,13 @@ void PrintFast()
 {
 	std::fprintf(stderr,
 		"[ge1] s4c fast: packets=%llu fast=%llu verts=%llu unsupported=%llu fallback(autoflush=%llu kernel=%llu "
-		"scissor=%llu overlap=%llu vertexcount=%llu shift0=%llu) shadow compared=%llu mismatched=%llu flush_inside=%llu "
+		"scissor=%llu overlap=%llu vertexcount=%llu shift0=%llu) record(hit=%llu miss=%llu absent=%llu) shadow compared=%llu mismatched=%llu flush_inside=%llu "
 		"fields(itail %llu index %llu vertex %llu head/tail/next %llu ring %llu fmm %llu wm %llu rect %llu m_v %llu env %llu)\n",
 		(unsigned long long)s_fp[0].load(), (unsigned long long)s_fp[1].load(), (unsigned long long)s_fp[2].load(),
 		(unsigned long long)s_fp[3].load(), (unsigned long long)s_fp[4].load(), (unsigned long long)s_fp[5].load(),
 		(unsigned long long)s_fp[6].load(), (unsigned long long)s_fp[7].load(), (unsigned long long)s_fp[8].load(),
-		(unsigned long long)s_fp[9].load(), (unsigned long long)s_fp[10].load(), (unsigned long long)s_fp[11].load(),
+		(unsigned long long)s_fp[9].load(), (unsigned long long)s_fp[13].load(), (unsigned long long)s_fp[14].load(),
+		(unsigned long long)s_fp[15].load(), (unsigned long long)s_fp[10].load(), (unsigned long long)s_fp[11].load(),
 		(unsigned long long)s_fp[12].load(), (unsigned long long)s_fpField[0].load(), (unsigned long long)s_fpField[1].load(),
 		(unsigned long long)s_fpField[2].load(), (unsigned long long)s_fpField[3].load(), (unsigned long long)s_fpField[4].load(),
 		(unsigned long long)s_fpField[5].load(), (unsigned long long)s_fpField[6].load(), (unsigned long long)s_fpField[7].load(),
@@ -6099,6 +6101,148 @@ void PrintSpec(u64 vsyncs)
 }
 } // namespace
 
+// RZV1 S4c: the cull state GsWorker last saw (prim = 0), published for the
+// MTVU's GSStaticPrepareRecord (seqlock: odd = being written), and the S4C1
+// block of the record being ingested (GSStaticRecordBegin/End, GsWorker).
+namespace
+{
+struct StaticPub
+{
+	std::atomic<u32> seq{0};
+	GSStaticCullState cs;
+};
+StaticPub s_static_pub;
+GSStaticCullState s_static_pub_local; // GsWorker's copy of what it published
+bool s_static_pub_any = false;
+} // namespace
+const u8* GSState::s_static_rec = nullptr;
+u32 GSState::s_static_rec_npk = 0;
+
+void GSState::StaticPublish(const GSStaticCullState& live)
+{
+	alignas(16) GSStaticCullState cs = live;
+	cs.prim = 0;
+	if (s_static_pub_any && std::memcmp(&cs, &s_static_pub_local, sizeof(cs)) == 0)
+		return;
+	s_static_pub_local = cs;
+	s_static_pub_any = true;
+	const u32 s0 = s_static_pub.seq.load(std::memory_order_relaxed);
+	s_static_pub.seq.store(s0 + 1, std::memory_order_relaxed);
+	std::atomic_thread_fence(std::memory_order_release);
+	std::memcpy(&s_static_pub.cs, &cs, sizeof(cs));
+	s_static_pub.seq.store(s0 + 2, std::memory_order_release);
+}
+
+u32 GSStaticPrepareRecord(const u8* bytes, u32 size, u8* out, u32 cap)
+{
+	alignas(16) GSStaticCullState pub;
+	for (;;)
+	{
+		const u32 s1 = s_static_pub.seq.load(std::memory_order_acquire);
+		if (s1 == 0)
+			return 0; // nothing published yet
+		if (s1 & 1u)
+			continue;
+		std::memcpy(&pub, &s_static_pub.cs, sizeof(pub));
+		std::atomic_thread_fence(std::memory_order_acquire);
+		if (s_static_pub.seq.load(std::memory_order_relaxed) == s1)
+			break;
+	}
+	struct Pk
+	{
+		const u8* tag;
+		u32 nv;
+	};
+	Pk pk[64];
+	u32 npk = 0;
+	if (!ge1_compact_record_for_each(bytes, size, [&](const u8* p, u32 n) {
+			if (npk >= 64)
+				return false;
+			pk[npk++] = {p, (n - 16u) / 32u};
+			return true;
+		}))
+		return 0;
+	const u32 table = (4u * npk + 15u) & ~15u;
+	u32 at = kStaticBlockHdr + table;
+	if (at > cap)
+		return 0;
+	std::memset(out, 0, at);
+	for (u32 i = 0; i < npk; i++)
+	{
+		u64 tag = 0;
+		std::memcpy(&tag, pk[i].tag, 8);
+		const u32 nloop = static_cast<u32>(tag & 0x7fffu);
+		const u32 pr = static_cast<u32>((tag >> 47) & 0x7ffu);
+		const u32 type = pr & 7u;
+		if (nloop == 0 || nloop != pk[i].nv || nloop > kStaticMaxVerts || (type != GS_TRIANGLESTRIP && type != GS_TRIANGLELIST) ||
+			(GSStatic::PrimTME(pr) && GSStatic::PrimFST(pr)))
+			continue;
+		alignas(16) GSStaticCullState cs = pub;
+		cs.prim = pr & 0x398u;
+		alignas(16) GSStaticPrep prep;
+		const Ge1CompactVertex* d = reinterpret_cast<const Ge1CompactVertex*>(pk[i].tag + 16);
+		if (type == GS_TRIANGLESTRIP)
+			GSStatic::Prepare<GS_TRIANGLESTRIP>(d, nloop, cs, prep);
+		else
+			GSStatic::Prepare<GS_TRIANGLELIST>(d, nloop, cs, prep);
+		const u32 w = GSStaticPrepWireSize(prep);
+		if (at + w > cap)
+			return 0;
+		std::memset(out + at, 0, w);
+		std::memcpy(out + at, static_cast<const GSStaticPrepHdr*>(&prep), sizeof(GSStaticPrepHdr));
+		std::memcpy(out + at + sizeof(GSStaticPrepHdr), prep.slot, 3 * prep.ntri);
+		std::memcpy(out + at + sizeof(GSStaticPrepHdr) + 3 * prep.ntri, prep.src, prep.tail);
+		std::memcpy(out + kStaticBlockHdr + 4 * i, &at, 4);
+		at += w;
+	}
+	const u32 hdr[4] = {kStaticBlockMagic, npk, at, 0};
+	std::memcpy(out, hdr, 16);
+	std::memcpy(out + 16, &pub, sizeof(pub));
+	return at;
+}
+
+void GSStaticRecordBegin(const u8* block, u32 size)
+{
+	GSState::s_static_rec = nullptr;
+	GSState::s_static_rec_npk = 0;
+	u32 hdr[4];
+	if (!block || size < kStaticBlockHdr)
+		return;
+	std::memcpy(hdr, block, 16);
+	if (hdr[0] != kStaticBlockMagic || hdr[2] > size || hdr[1] > 64 || kStaticBlockHdr + 4 * hdr[1] > size)
+		return;
+	for (u32 i = 0; i < hdr[1]; i++)
+	{
+		u32 off = 0;
+		std::memcpy(&off, block + kStaticBlockHdr + 4 * i, 4);
+		if (off && (off & 15u || off + sizeof(GSStaticPrepHdr) > hdr[2]))
+			return;
+		if (off)
+		{
+			const GSStaticPrepHdr* h = reinterpret_cast<const GSStaticPrepHdr*>(block + off);
+			if (h->count > kStaticMaxVerts || h->tail > h->count || h->ntri > h->count || off + GSStaticPrepWireSize(*h) > hdr[2] ||
+				h->nring > 4 || h->nring > h->count || h->head > h->tail || h->nslot > h->tail)
+				return;
+			const u8* sl = reinterpret_cast<const u8*>(h + 1);
+			for (u32 k = 0; k < 3 * h->ntri; k++)
+				if (sl[k] >= h->nslot)
+					return;
+			const u8* sr = sl + 3 * h->ntri;
+			for (u32 k = 0; k < h->tail; k++)
+				if (sr[k] >= h->count)
+					return;
+		}
+	}
+	GSState::s_static_rec = block;
+	GSState::s_static_rec_npk = hdr[1];
+}
+
+void GSStaticRecordEnd()
+{
+	GSState::s_static_rec = nullptr;
+	GSState::s_static_rec_npk = 0;
+}
+
 void GSState::StaticCullStateLive(GSStaticCullState& cs)
 {
 	std::memset(&cs, 0, sizeof(cs));
@@ -6106,8 +6250,11 @@ void GSState::StaticCullStateLive(GSStaticCullState& cs)
 	cs.bounds = (m_cull_grid.shift == 4) ? m_cull_bounds_band : m_cull_bounds_raw;
 	cs.xyof_x = m_xyof.I32[0];
 	cs.xyof_y = m_xyof.I32[1];
-	cs.uv = m_v.UV;
 	cs.prim = PRIM->U32[0] & 0x398u; // IIP, TME, AA1, FST, CTXT
+	// The latched UV reaches the outcome only through FST's UV min/max; STQ
+	// packets (the static world) parse it into the stored vertex, which
+	// StaticApply does with the live value.
+	cs.uv = (GSStatic::PrimTME(cs.prim) && GSStatic::PrimFST(cs.prim)) ? m_v.UV : 0u;
 	cs.clamp = static_cast<s32>(GetDepthClampMode());
 	cs.shift0 = (GKV1Shift0Kernel() && m_cull_grid.shift == 0) ? 1 : 0;
 	cs.kernel_ok = KickKernelApplies<GS_TRIANGLESTRIP>() ? 1 : 0;
@@ -6135,8 +6282,10 @@ int GSState::StaticFastOk(u32 count)
 }
 
 template <u32 prim>
-void GSState::StaticApply(const Ge1CompactVertex* RESTRICT d, const GSStaticPrep& p, const GSStaticCullState& cs)
+void GSState::StaticApply(const Ge1CompactVertex* RESTRICT d, const GSStaticPrepHdr& p, const u8* RESTRICT pslot,
+	const u8* RESTRICT psrc, const GSStaticCullState& cs)
 {
+	const u32 uv = m_v.UV;
 	GSVertexBuff* RESTRICT vb = m_vertex;
 	const u32 base = vb->tail; // == head == next after ApplyPRIM
 	const u32 itail0 = m_index->tail;
@@ -6168,20 +6317,20 @@ void GSState::StaticApply(const Ge1CompactVertex* RESTRICT d, const GSStaticPrep
 	GSVector4i m0, m1;
 	for (u32 s = 0; s < p.tail; s++)
 	{
-		GSStatic::Parse(d + p.src[s], cs.uv, clamp, keep, shifted, m0, m1);
+		GSStatic::Parse(d + psrc[s], uv, clamp, keep, shifted, m0, m1);
 		GSVector4i* RESTRICT dst = reinterpret_cast<GSVector4i*>(vbuff + s);
 		dst[0] = m0;
 		dst[1] = m1;
 	}
 	// The kick leaves the last parsed vertex in m_v.
-	GSStatic::Parse(d + count - 1, cs.uv, clamp, keep, shifted, m0, m1);
+	GSStatic::Parse(d + count - 1, uv, clamp, keep, shifted, m0, m1);
 	m_v.m[0] = m0;
 	m_v.m[1] = m1;
 
 	const u32 nidx = 3 * p.ntri;
 	u16* RESTRICT ib = m_index->buff + itail0;
 	for (u32 k = 0; k < nidx; k++)
-		ib[k] = static_cast<u16>(base + p.slot[k]);
+		ib[k] = static_cast<u16>(base + pslot[k]);
 	m_index->tail = itail0 + nidx;
 
 	vb->head = base + p.head;
@@ -6346,7 +6495,7 @@ void GSState::StaticSpecVsync()
 	}
 }
 
-bool GSState::StaticPacket(const Ge1CompactVertex* d, u32 count)
+bool GSState::StaticPacket(const Ge1CompactVertex* d, u32 count, u32 packet)
 {
 	static const bool fast_on = EnvInt("GE1_STATIC_FAST") == 1;
 	static const bool shadow = EnvInt("GE1_RESIDENT_CHECK") == 2;
@@ -6369,17 +6518,51 @@ bool GSState::StaticPacket(const Ge1CompactVertex* d, u32 count)
 		StaticSpecNote(cs);
 	if (!fast_on && !shadow)
 		return false;
+	StaticPublish(cs);
 	const int why = (prim == GS_TRIANGLESTRIP) ? StaticFastOk<GS_TRIANGLESTRIP>(count) : StaticFastOk<GS_TRIANGLELIST>(count);
 	if (why != 0)
 	{
 		s_fp[3 + why].fetch_add(1, std::memory_order_relaxed);
 		return false;
 	}
-	alignas(16) GSStaticPrep prep;
-	if (prim == GS_TRIANGLESTRIP)
-		GSStatic::Prepare<GS_TRIANGLESTRIP>(d, count, cs, prep);
+	// The MTVU's prepared outcome when the record carries one for this packet
+	// and its cull state is the live one; else prepare here.
+	alignas(16) GSStaticPrep local;
+	const GSStaticPrepHdr* ph = nullptr;
+	const u8 *pslot, *psrc;
+	if (s_static_rec && packet < s_static_rec_npk)
+	{
+		u32 off = 0;
+		std::memcpy(&off, s_static_rec + kStaticBlockHdr + 4 * packet, 4);
+		if (off)
+		{
+			const GSStaticPrepHdr* rh = reinterpret_cast<const GSStaticPrepHdr*>(s_static_rec + off);
+			alignas(16) GSStaticCullState want;
+			std::memcpy(&want, s_static_rec + 16, sizeof(want));
+			want.prim = rh->prim;
+			if (rh->count == count && std::memcmp(&want, &cs, sizeof(cs)) == 0)
+				ph = rh;
+		}
+		s_fp[ph ? 13 : 14].fetch_add(1, std::memory_order_relaxed);
+	}
 	else
-		GSStatic::Prepare<GS_TRIANGLELIST>(d, count, cs, prep);
+		s_fp[15].fetch_add(1, std::memory_order_relaxed);
+	if (ph)
+	{
+		pslot = reinterpret_cast<const u8*>(ph + 1);
+		psrc = pslot + 3 * ph->ntri;
+	}
+	else
+	{
+		if (prim == GS_TRIANGLESTRIP)
+			GSStatic::Prepare<GS_TRIANGLESTRIP>(d, count, cs, local);
+		else
+			GSStatic::Prepare<GS_TRIANGLELIST>(d, count, cs, local);
+		ph = &local;
+		pslot = local.slot;
+		psrc = local.src;
+	}
+	const GSStaticPrepHdr& prep = *ph;
 
 	const u32 base = m_vertex->tail;
 	const u32 itail0 = m_index->tail;
@@ -6398,9 +6581,9 @@ bool GSState::StaticPacket(const Ge1CompactVertex* d, u32 count)
 		StaticShadowRestore(s_pre);
 	}
 	if (prim == GS_TRIANGLESTRIP)
-		StaticApply<GS_TRIANGLESTRIP>(d, prep, cs);
+		StaticApply<GS_TRIANGLESTRIP>(d, prep, pslot, psrc, cs);
 	else
-		StaticApply<GS_TRIANGLELIST>(d, prep, cs);
+		StaticApply<GS_TRIANGLELIST>(d, prep, pslot, psrc, cs);
 	std::memcpy(&m_q, &d[count - 1].Q, sizeof(m_q)); // the handler's last act
 	s_fp[1].fetch_add(1, std::memory_order_relaxed);
 	s_fp[2].fetch_add(count, std::memory_order_relaxed);
@@ -6623,7 +6806,7 @@ bool GSState::TransferCompact(const u8* bytes, u32 size)
 		}();
 		if (s_compact_packet_hook)
 			s_compact_packet_hook(i, m_v.UV, static_cast<int>(GetDepthClampMode()));
-		if (StaticPacket(packets[i].verts, packets[i].nloop))
+		if (StaticPacket(packets[i].verts, packets[i].nloop, i))
 		{
 			path.nloop = 0;
 			continue;

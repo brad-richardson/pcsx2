@@ -43,7 +43,9 @@ struct alignas(16) GSStaticCullState
 };
 static_assert(sizeof(GSStaticCullState) == 112);
 
-struct GSStaticPrep
+// The prepared outcome. The header is also the wire form inside an S4C1 block
+// (GSStaticPrepareRecord): header, slot[3 * ntri], src[tail], padded to 16.
+struct alignas(16) GSStaticPrepHdr
 {
 	u32 count;  // packet vertices
 	u32 ntri;   // emitted triangles
@@ -51,13 +53,28 @@ struct GSStaticPrep
 	u32 head, tail; // relative head/tail after the packet
 	u32 wm_min; // the lowest strip-compaction target (relative), ~0u if none
 	u32 nring;  // min(count, 4): the ring entries below, oldest first
-	u32 pad;
+	u32 prim;   // the cull state's prim field this was prepared for
 	u64 ring_xyp[4], ring_meta[4]; // the last nring vertices' mirror entries (meta without ADC)
 	GSVertexKernels::FmmAcc acc;   // fused-FMM union over the emitted triangles (FmmAccReset when none)
 	GSVector4i rect, nrect;        // draw-rect unions over the emitted triangles (pre-scissor)
+};
+static_assert(sizeof(GSStaticPrepHdr) == 240);
+
+struct GSStaticPrep : GSStaticPrepHdr
+{
 	u8 slot[3 * kStaticMaxVerts];  // emitted indices, relative
 	u8 src[kStaticMaxVerts];       // which packet vertex each relative slot in [0, tail) holds
 };
+
+// S4C1 block: {magic, npk, bytes, 0}, the cull state the packets were prepared
+// against (prim = 0; each header carries its own), u32 off[npk] padded to 16
+// (from the block start; 0 = not prepared), then the prepared packets.
+static constexpr u32 kStaticBlockMagic = 0x31433453u; // "S4C1"
+static constexpr u32 kStaticBlockHdr = 16 + sizeof(GSStaticCullState);
+__forceinline_odr u32 GSStaticPrepWireSize(const GSStaticPrepHdr& h)
+{
+	return (sizeof(GSStaticPrepHdr) + 3 * h.ntri + h.tail + 15u) & ~15u;
+}
 
 namespace GSStatic
 {
@@ -110,6 +127,7 @@ namespace GSStatic
 		}
 
 		o.count = count;
+		o.prim = cs.prim;
 		GSVertexKernels::FmmAccReset(o.acc, tme, fst);
 		o.ntri = 0;
 		o.wm_min = ~0u;
