@@ -3,6 +3,7 @@
 
 #pragma once
 
+#include "GS/GSCompactRecord.h"
 #include "GS/GSRegs.h"
 #include "GS/GSVector.h"
 
@@ -43,6 +44,19 @@ namespace GSVertexKernels
 		zf = zf.srl32<4>() & GSVector4i::x00ffffff().upl32(GSVector4i::x000000ff());
 
 		m1 = xy.upl32(zf);
+	}
+
+	// Parse one compact (NRS1) vertex into GSVertex m[0]/m[1]: the same two
+	// vectors ParsePackedSTQRGBAXYZF2 above computes for the register triple
+	// the vertex was stripped from. uv is the latched UV (m_v.UV); the Q fixup
+	// is the same integer-0 compare (-0.0 passes through).
+	__forceinline_odr void ParseCompactXYZF2(const Ge1CompactVertex* RESTRICT dv, u32 uv, GSVector4i& m0, GSVector4i& m1)
+	{
+		m0 = GSVector4i(static_cast<int>(dv->S), static_cast<int>(dv->T), static_cast<int>(dv->RGBA),
+			static_cast<int>(dv->Q == 0u ? 0x00800000u : dv->Q));
+		m1 = GSVector4i(static_cast<int>((dv->X & 0xFFFFu) | (dv->Y << 16)),
+			static_cast<int>((dv->Z >> 4) & 0x00FFFFFFu), static_cast<int>(uv),
+			static_cast<int>((dv->W3 >> 4) & 0xFFu));
 	}
 
 	// Parse one packed {STQ, RGBAQ, XYZ2} record. Z is the full 32 bits; UV and FOG

@@ -821,6 +821,11 @@ void GSgifTransfer(const u8* mem, u32 size)
 	GSParseTarget()->Transfer<3>(mem, size);
 }
 
+bool GSgifTransferCompact(const u8* bytes, u32 size)
+{
+	return GSParseTarget()->TransferCompact(bytes, size);
+}
+
 void GSgifTransfer1(u8* mem, u32 addr)
 {
 	GSParseTarget()->Transfer<0>(const_cast<u8*>(mem) + addr, (0x4000 - addr) / 16);

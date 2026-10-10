@@ -86,6 +86,10 @@ u32 GSProbeTake(u64 ticket, u8* out, u32 bytes);
 void GSProbeStats(u64 out[8]);
 void GSReadLocalMemoryUnsync(u8* mem, u32 qwc, u64 BITBLITBUF, u64 TRXPOS, u64 TRXREG);
 void GSgifTransfer(const u8* mem, u32 size);
+// NRS1: one compact native record (GSCompactRecord.h). PATH1 vertex packets
+// with the GIF register padding stripped. Returns false (no state changed)
+// on a malformed record; the caller then falls back to GIF packets.
+bool GSgifTransferCompact(const u8* bytes, u32 size);
 void GSgifTransfer1(u8* mem, u32 addr);
 void GSgifTransfer2(u8* mem, u32 size);
 void GSgifTransfer3(u8* mem, u32 size);
