@@ -5101,6 +5101,11 @@ void main()
 	int py = int(gl_GlobalInvocationID.y);
 	if (px >= regionW || py >= regionH)
 		return;
+	// Tile reject: the workgroup's 16x16 footprint is uniform, so an
+	// item disjoint from it fails every thread's clip below; skipping
+	// it is bit-exact (order and math untouched).
+	int tx0 = int(gl_WorkGroupID.x) * 16, ty0 = int(gl_WorkGroupID.y) * 16;
+	int tx1 = tx0 + 16, ty1 = ty0 + 16;
 	uvec4 t0 = imageLoad(tempImg, ivec2(px, py));
 	precise vec3 dst = vec3(t0.rgb);
 	precise float dstA = float(t0.a);
@@ -5117,6 +5122,8 @@ void main()
 		int xb = x1 > regionW ? regionW : x1;
 		int ya = y0 < 0 ? 0 : y0;
 		int yb = y1 > regionH ? regionH : y1;
+		if (tx1 <= xa || tx0 >= xb || ty1 <= ya || ty0 >= yb)
+			continue;
 		if (px < xa || px >= xb || py < ya || py >= yb)
 			continue;
 		precise float span = float(x1 - x0);
@@ -5155,6 +5162,8 @@ void main()
 		int xb = dx + dw > regionW ? regionW : dx + dw;
 		int ya = dy < 0 ? 0 : dy;
 		int yb = dy + dh > regionH ? regionH : dy + dh;
+		if (tx1 <= xa || tx0 >= xb || ty1 <= ya || ty0 >= yb)
+			continue;
 		if (px < xa || px >= xb || py < ya || py >= yb)
 			continue;
 		int sx = quadSrcX[q], sy = quadSrcY[q], sw = quadSrcW[q], sh = quadSrcH[q];
