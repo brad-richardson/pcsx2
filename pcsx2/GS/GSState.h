@@ -494,6 +494,8 @@ protected:
 	// counts how often the cull state repeats (the MTVU speculation question).
 	bool StaticPacket(const Ge1CompactVertex* d, u32 count, u32 packet);
 	void StaticPublish(const GSStaticCullState& live);
+	void StaticOverlap(const Ge1CompactVertex* RESTRICT d, const GSStaticCullState& cs);
+	u64 m_static_flushes = 0; // RZV1 S4c: Flush() calls (GE1_RESIDENT_CHECK=2)
 	void StaticCullStateLive(GSStaticCullState& cs);
 	template<u32 prim> int StaticFastOk(u32 count);
 	template<u32 prim> bool StaticApply(const Ge1CompactVertex* RESTRICT d, const GSStaticPrepHdr& p, const u8* RESTRICT pslot,

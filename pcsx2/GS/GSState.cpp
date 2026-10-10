@@ -4267,6 +4267,7 @@ void GSState::GIFRegHandlerHWREG(const GIFReg* RESTRICT r)
 
 void GSState::Flush(GSFlushReason reason)
 {
+	m_static_flushes++; // RZV1 S4c: the shadow check's flush-inside test (a draw-buffer reset emits no draw)
 	SetDrawBuffDirty();
 
 	FlushWrite();
@@ -6074,8 +6075,8 @@ void PrintFast()
 {
 	std::fprintf(stderr,
 		"[ge1] s4c fast: packets=%llu fast=%llu verts=%llu unsupported=%llu fallback(autoflush=%llu aa1=%llu "
-		"scissor=%llu overlap=%llu vertexcount=%llu shift0=%llu) record(hit=%llu miss=%llu absent=%llu) shadow compared=%llu mismatched=%llu flush_inside=%llu "
-		"fields(itail %llu index %llu vertex %llu head/tail/next %llu ring %llu fmm %llu wm %llu rect %llu m_v %llu env %llu)\n",
+		"scissor=%llu overlap_steps=%llu vertexcount=%llu shift0=%llu) record(hit=%llu miss=%llu absent=%llu) shadow compared=%llu mismatched=%llu flush_inside=%llu "
+		"fields(itail %llu index %llu vertex %llu head/tail/next %llu ring %llu fmm %llu wm %llu rect %llu m_v %llu env %llu overlap %llu)\n",
 		(unsigned long long)s_fp[0].load(), (unsigned long long)s_fp[1].load(), (unsigned long long)s_fp[2].load(),
 		(unsigned long long)s_fp[3].load(), (unsigned long long)s_fp[4].load(), (unsigned long long)s_fp[5].load(),
 		(unsigned long long)s_fp[6].load(), (unsigned long long)s_fp[7].load(), (unsigned long long)s_fp[8].load(),
@@ -6084,7 +6085,7 @@ void PrintFast()
 		(unsigned long long)s_fp[12].load(), (unsigned long long)s_fpField[0].load(), (unsigned long long)s_fpField[1].load(),
 		(unsigned long long)s_fpField[2].load(), (unsigned long long)s_fpField[3].load(), (unsigned long long)s_fpField[4].load(),
 		(unsigned long long)s_fpField[5].load(), (unsigned long long)s_fpField[6].load(), (unsigned long long)s_fpField[7].load(),
-		(unsigned long long)s_fpField[8].load(), (unsigned long long)s_fpField[9].load());
+		(unsigned long long)s_fpField[8].load(), (unsigned long long)s_fpField[9].load(), (unsigned long long)s_fpField[10].load());
 }
 
 void PrintSpec(u64 vsyncs)
@@ -6272,8 +6273,6 @@ int GSState::StaticFastOk(u32 count)
 		return 2; // AA1 expansion: the legacy CullTest with the expanded bbox
 	if (m_scissor_invalid)
 		return 3; // the kick skips everything through the legacy path
-	if (m_recent_buffer_switch && GSConfig.UserHacks_DrawBuffering)
-		return 4; // CheckOverlapVertsSlow may flush mid-packet
 	constexpr u32 max_vertices = MaxVerticesForPrim(prim);
 	if (max_vertices != 0 && m_vertex->tail + count >= max_vertices)
 		return 5; // a VERTEXCOUNT flush inside the packet
@@ -6391,12 +6390,13 @@ struct GSState::StaticShadow
 	float q;
 	u32 dirty;
 	int backed_ctx;
-	u64 sn;
+	u64 sn, flushes;
 	const void* vbp;
 	const void* ibp;
 	GSDrawingEnvironment prev_env;
 	GSDrawBufferEnv envbuf;
 	int buf_idx;
+	bool recent_switch;
 	u32 base, nvert;
 	GSVertex verts[kStaticMaxVerts + 4];
 	u16 idx[3 * kStaticMaxVerts];
@@ -6413,10 +6413,12 @@ void GSState::StaticShadowCapture(StaticShadow& s, u32 base, u32 itail0)
 	s.dirty = m_dirty_gs_regs;
 	s.backed_ctx = m_backed_up_ctx;
 	s.sn = s_n;
+	s.flushes = m_static_flushes;
 	s.vbp = m_vertex;
 	s.ibp = m_index;
 	std::memcpy(&s.prev_env, &m_prev_env, sizeof(s.prev_env));
 	s.buf_idx = m_current_buffer_idx;
+	s.recent_switch = m_recent_buffer_switch;
 	std::memcpy(&s.envbuf, &m_env_buffers[m_current_buffer_idx], sizeof(s.envbuf));
 	s.base = base;
 	s.nvert = 0;
@@ -6447,6 +6449,7 @@ void GSState::StaticShadowRestore(const StaticShadow& s)
 	m_backed_up_ctx = s.backed_ctx;
 	std::memcpy(&m_prev_env, &s.prev_env, sizeof(s.prev_env));
 	std::memcpy(&m_env_buffers[s.buf_idx], &s.envbuf, sizeof(s.envbuf));
+	m_recent_buffer_switch = s.recent_switch;
 }
 
 void GSState::StaticSpecNote(const GSStaticCullState& cs)
@@ -6507,6 +6510,40 @@ void GSState::StaticSpecVsync()
 	}
 }
 
+// Draw buffering right after a buffer switch: the kick runs
+// CheckOverlapVertsSlow at the packet's first filled window (its third vertex:
+// the queue starts empty at ApplyPRIM) and may flush there. Do what the kick
+// does at that point -- vertices 0 and 1 queued, vertex 2 in m_v -- then leave
+// the queue empty at the (possibly new) base: a flush carries exactly vertices
+// 0 and 1, which the apply rewrites in place.
+void GSState::StaticOverlap(const Ge1CompactVertex* RESTRICT d, const GSStaticCullState& cs)
+{
+	GSVertexBuff* vb = m_vertex;
+	const u32 base = vb->tail;
+	while ((base + 3) > vb->maxcount)
+		GrowVertexBuffer();
+	const bool clamp = static_cast<GSLimit24BitDepth>(cs.clamp) != GSLimit24BitDepth::Disabled;
+	GSVector4i keep = GSVector4i::xffffffff(), shifted = GSVector4i::zero();
+	if (clamp)
+		GSVertexKickKernel::MakeDepthClampMasks(static_cast<GSLimit24BitDepth>(cs.clamp), keep, shifted);
+	const u32 uv = m_v.UV;
+	GSVector4i m0, m1;
+	for (u32 i = 0; i < 2; i++)
+	{
+		GSStatic::Parse(d + i, uv, clamp, keep, shifted, m0, m1);
+		GSVector4i* RESTRICT dst = reinterpret_cast<GSVector4i*>(vb->buff + base + i);
+		dst[0] = m0;
+		dst[1] = m1;
+	}
+	vb->tail = base + 2;
+	GSStatic::Parse(d + 2, uv, clamp, keep, shifted, m0, m1);
+	m_v.m[0] = m0;
+	m_v.m[1] = m1;
+	if (CheckOverlapVertsSlow(3))
+		Flush(CONTEXTCHANGE);
+	m_vertex->tail = m_vertex->head; // == next: the packet starts over here
+}
+
 bool GSState::StaticPacket(const Ge1CompactVertex* d, u32 count, u32 packet)
 {
 	static const bool fast_on = EnvInt("GE1_STATIC_FAST") == 1;
@@ -6537,6 +6574,35 @@ bool GSState::StaticPacket(const Ge1CompactVertex* d, u32 count, u32 packet)
 		s_fp[3 + why].fetch_add(1, std::memory_order_relaxed);
 		return false;
 	}
+	const bool overlap = m_recent_buffer_switch && GSConfig.UserHacks_DrawBuffering && count >= 3;
+
+	// GE1_RESIDENT_CHECK=2: the reference is the kick itself, from the same
+	// packet-start state (it runs its own overlap check). A kick that flushes
+	// inside the packet keeps its outcome.
+	static StaticShadow s_pre, s_kick, s_apply; // GsWorker only
+	if (shadow)
+	{
+		StaticShadowCapture(s_pre, m_vertex->tail, m_index->tail);
+		(this->*m_fpGIFCompactHandler[prim])(d, count);
+		if (s_n != s_pre.sn || m_static_flushes != s_pre.flushes || static_cast<const void*>(m_vertex) != s_pre.vbp ||
+			static_cast<const void*>(m_index) != s_pre.ibp || m_index->tail < s_pre.itail)
+		{
+			s_fp[12].fetch_add(1, std::memory_order_relaxed);
+			return true; // the kick already set m_q
+		}
+		StaticShadowCapture(s_kick, s_pre.base, s_pre.itail);
+		StaticShadowRestore(s_pre);
+	}
+
+	if (overlap)
+	{
+		s_fp[7].fetch_add(1, std::memory_order_relaxed); // overlap steps taken
+		StaticOverlap(d, cs);
+		StaticCullStateLive(cs); // a flush can refresh the derived scissor
+	}
+	const u32 base = m_vertex->tail;
+	const u32 itail0 = m_index->tail;
+
 	// The MTVU's prepared outcome when the record carries one for this packet
 	// and its cull state is the live one; else prepare here.
 	alignas(16) GSStaticPrep local;
@@ -6553,7 +6619,7 @@ bool GSState::StaticPacket(const Ge1CompactVertex* d, u32 count, u32 packet)
 			std::memcpy(&want, s_static_rec + 16, sizeof(want));
 			want.prim = rh->prim;
 			if (rh->count == count && rh->tail <= count && rh->ntri <= count && rh->nslot <= rh->tail && rh->head <= rh->tail &&
-			std::memcmp(&want, &cs, sizeof(cs)) == 0)
+				std::memcmp(&want, &cs, sizeof(cs)) == 0)
 				ph = rh;
 		}
 		s_fp[ph ? 13 : 14].fetch_add(1, std::memory_order_relaxed);
@@ -6577,22 +6643,6 @@ bool GSState::StaticPacket(const Ge1CompactVertex* d, u32 count, u32 packet)
 	}
 	const GSStaticPrepHdr& prep = *ph;
 
-	const u32 base = m_vertex->tail;
-	const u32 itail0 = m_index->tail;
-	static StaticShadow s_pre, s_kick, s_apply; // GsWorker only
-	if (shadow)
-	{
-		StaticShadowCapture(s_pre, base, itail0);
-		(this->*m_fpGIFCompactHandler[prim])(d, count);
-		if (s_n != s_pre.sn || static_cast<const void*>(m_vertex) != s_pre.vbp || static_cast<const void*>(m_index) != s_pre.ibp ||
-			m_index->tail < itail0)
-		{
-			s_fp[12].fetch_add(1, std::memory_order_relaxed);
-			return true; // the kick's outcome stands (it already set m_q)
-		}
-		StaticShadowCapture(s_kick, base, itail0);
-		StaticShadowRestore(s_pre);
-	}
 	bool applied = (prim == GS_TRIANGLESTRIP) ? StaticApply<GS_TRIANGLESTRIP>(d, prep, pslot, psrc, cs) :
 	                                            StaticApply<GS_TRIANGLELIST>(d, prep, pslot, psrc, cs);
 	if (!applied)
@@ -6616,7 +6666,9 @@ bool GSState::StaticPacket(const Ge1CompactVertex* d, u32 count, u32 packet)
 		const StaticShadow& k = s_kick;
 		const StaticShadow& a = s_apply;
 		int bad = -1;
-		if (k.itail != a.itail)
+		if (a.sn != k.sn || a.flushes != k.flushes || base != k.base || itail0 != s_pre.itail)
+			bad = 10; // the overlap step flushed where the kick did not
+		else if (k.itail != a.itail)
 			bad = 0;
 		else if (std::memcmp(k.idx, a.idx, sizeof(u16) * (k.itail - itail0)))
 			bad = 1;
@@ -6634,8 +6686,8 @@ bool GSState::StaticPacket(const Ge1CompactVertex* d, u32 count, u32 packet)
 			bad = 7;
 		else if (std::memcmp(&k.v, &a.v, sizeof(GSVertex)) || std::memcmp(&k.q, &a.q, sizeof(float)))
 			bad = 8;
-		else if (k.dirty != a.dirty || k.backed_ctx != a.backed_ctx || std::memcmp(&k.prev_env, &a.prev_env, sizeof(k.prev_env)) ||
-				 std::memcmp(&k.envbuf, &a.envbuf, sizeof(k.envbuf)))
+		else if (k.dirty != a.dirty || k.backed_ctx != a.backed_ctx || k.recent_switch != a.recent_switch ||
+				 std::memcmp(&k.prev_env, &a.prev_env, sizeof(k.prev_env)) || std::memcmp(&k.envbuf, &a.envbuf, sizeof(k.envbuf)))
 			bad = 9;
 		s_fp[10].fetch_add(1, std::memory_order_relaxed);
 		if (bad >= 0)
@@ -6644,10 +6696,12 @@ bool GSState::StaticPacket(const Ge1CompactVertex* d, u32 count, u32 packet)
 			s_fpField[bad].fetch_add(1, std::memory_order_relaxed);
 			if (s_fpDumps.fetch_sub(1, std::memory_order_relaxed) > 0)
 				std::fprintf(stderr,
-					"[ge1] s4c shadow mismatch field=%d prim=%u count=%u ntri=%u base=%u itail0=%u kick(h/t/n=%u/%u/%u itail=%u wm=%u v=%d) "
-					"apply(h/t/n=%u/%u/%u itail=%u wm=%u v=%d)\n",
-					bad, prim, count, prep.ntri, base, itail0, k.vb.head, k.vb.tail, k.vb.next, k.itail, k.vb.fmm_watermark,
-					k.vb.fmm_valid ? 1 : 0, a.vb.head, a.vb.tail, a.vb.next, a.itail, a.vb.fmm_watermark, a.vb.fmm_valid ? 1 : 0);
+					"[ge1] s4c shadow mismatch field=%d prim=%u count=%u ntri=%u base=%u itail0=%u overlap=%d kick(h/t/n=%u/%u/%u itail=%u wm=%u v=%d) "
+					"apply(h/t/n=%u/%u/%u itail=%u wm=%u v=%d) env(dirty %x/%x ctx %d/%d switch %d/%d prev %d envbuf %d)\n",
+					bad, prim, count, prep.ntri, base, itail0, overlap ? 1 : 0, k.vb.head, k.vb.tail, k.vb.next, k.itail, k.vb.fmm_watermark,
+					k.vb.fmm_valid ? 1 : 0, a.vb.head, a.vb.tail, a.vb.next, a.itail, a.vb.fmm_watermark, a.vb.fmm_valid ? 1 : 0,
+					k.dirty, a.dirty, k.backed_ctx, a.backed_ctx, k.recent_switch ? 1 : 0, a.recent_switch ? 1 : 0,
+					std::memcmp(&k.prev_env, &a.prev_env, sizeof(k.prev_env)) ? 1 : 0, std::memcmp(&k.envbuf, &a.envbuf, sizeof(k.envbuf)) ? 1 : 0);
 		}
 	}
 	return true;
