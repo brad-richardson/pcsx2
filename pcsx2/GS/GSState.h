@@ -1091,6 +1091,7 @@ public:
 	// NRS1: one compact native record (PATH1). False (no state changed) on a
 	// malformed record; the caller falls back to GIF packets.
 	bool TransferCompact(const u8* bytes, u32 size);
+	static inline void (*s_compact_packet_hook)(u32 packet, u32 uv, int depth_clamp_mode) = nullptr; // RZV1 S4b
 	int Freeze(freezeData* fd, bool sizeonly);
 	int Defrost(const freezeData* fd);
 

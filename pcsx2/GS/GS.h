@@ -90,6 +90,11 @@ void GSgifTransfer(const u8* mem, u32 size);
 // with the GIF register padding stripped. Returns false (no state changed)
 // on a malformed record; the caller then falls back to GIF packets.
 bool GSgifTransferCompact(const u8* bytes, u32 size);
+// RZV1 S4b: called by TransferCompact for every packet after its PRIM is
+// applied, with the kick's per-packet parse parameters (latched UV, depth
+// clamp mode as GSLimit24BitDepth); null = off.
+using GSCompactPacketHook = void (*)(u32 packet, u32 uv, int depth_clamp_mode);
+void GSSetCompactPacketHook(GSCompactPacketHook hook);
 void GSgifTransfer1(u8* mem, u32 addr);
 void GSgifTransfer2(u8* mem, u32 size);
 void GSgifTransfer3(u8* mem, u32 size);

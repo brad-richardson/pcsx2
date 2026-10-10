@@ -826,6 +826,11 @@ bool GSgifTransferCompact(const u8* bytes, u32 size)
 	return GSParseTarget()->TransferCompact(bytes, size);
 }
 
+void GSSetCompactPacketHook(GSCompactPacketHook hook)
+{
+	GSState::s_compact_packet_hook = hook;
+}
+
 void GSgifTransfer1(u8* mem, u32 addr)
 {
 	GSParseTarget()->Transfer<0>(const_cast<u8*>(mem) + addr, (0x4000 - addr) / 16);

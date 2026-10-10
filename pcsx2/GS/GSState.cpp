@@ -6329,6 +6329,8 @@ bool GSState::TransferCompact(const u8* bytes, u32 size)
 			const char* v = std::getenv("GE1_RESIDENT_CHECK");
 			return v && !std::strcmp(v, "1");
 		}();
+		if (s_compact_packet_hook)
+			s_compact_packet_hook(i, m_v.UV, static_cast<int>(GetDepthClampMode()));
 		if (s_static_check)
 			StaticCheckPacket(packets[i].verts, packets[i].nloop);
 		(this->*m_fpGIFCompactHandler[PRIM->PRIM])(packets[i].verts, packets[i].nloop);
