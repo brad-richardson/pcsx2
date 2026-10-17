@@ -95,6 +95,9 @@ else()
 	add_subdirectory(pcsx2-vurunner EXCLUDE_FROM_ALL)
 endif()
 
+# om1-extract-2: manifest-driven OM1 replay tool (no capture needed).
+add_subdirectory(om1-adapter EXCLUDE_FROM_ALL)
+
 # SDL3 / kmsdrm frontend (handheld target)
 if(UNIX AND NOT APPLE)
 	if(ENABLE_SDL_FRONTEND)

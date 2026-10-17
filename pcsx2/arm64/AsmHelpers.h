@@ -106,6 +106,17 @@ public:
 	// by the out-of-range paths of armEmitJmp/armEmitCall/armMoveAddressToReg.
 	// Recorder uses this to verify the target is run-invariant.
 	virtual void OnAbsoluteTarget(const void* target) = 0;
+	// OM1: out-of-range armEmitJmp/armEmitCall with an OM1 recorder attached
+	// emits canonical movz+movk x3 at `at` (instead of the vixl Mov chain)
+	// and reports the site here. Default no-op (persist recorder ignores it;
+	// OM1 builds gate the canonical path on om1::Active(), so persist runs
+	// keep the vixl form).
+	virtual void OnAbsoluteCallSite(u8* at, const void* target, bool is_call)
+	{
+		(void)at;
+		(void)target;
+		(void)is_call;
+	}
 };
 
 static const u32 SP_SCRATCH_OFFSET = 0;
@@ -156,6 +167,11 @@ void armEmitJmpPtr(void* code_address, const void* target, bool flush_icache = t
 void armEmitCbnz(const vixl::aarch64::Register& reg, const void* ptr);
 void armEmitCondBranch(vixl::aarch64::Condition cond, const void* ptr);
 void armMoveAddressToReg(const vixl::aarch64::Register& reg, const void* addr);
+// OM1: literal-pool load with a capture-mode canonical form. Normal JIT emits
+// Ldr(reg, imm) (pool); with an OM1 recorder attached emits the canonical
+// movz+movk x3 via armMoveAddressToReg (reported to the recorder), so recorded
+// chunks contain no literal pools at all.
+void armLoadImmAddr(const vixl::aarch64::Register& reg, const void* addr);
 void armLoadPtr(const vixl::aarch64::CPURegister& reg, const void* addr);
 void armStorePtr(const vixl::aarch64::CPURegister& reg, const void* addr);
 void armBeginStackFrame(bool save_fpr);
