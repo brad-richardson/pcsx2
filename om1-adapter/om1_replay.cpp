@@ -16,6 +16,7 @@
 #include "VU.h"
 #include "VUmicro.h"
 #include "common/FPControl.h"
+#include "common/SHA256.h"
 #include "om1/om1_hooks.h"
 
 #include <array>
@@ -195,7 +196,8 @@ static bool isHex(const std::string& h)
 // Full manifest walk before Attach/Initialize: every later exit(2) would run
 // while backend threads are up. Checks types, tuple lengths, objIdx/startPC
 // bounds and piece/range bounds (all subtraction-based).
-static void validateManifest(const JVal& mad, long long elfSize)
+static std::array<uint8_t, 16384> buildImage(const JVal& img, const std::vector<uint8_t>& elf);
+static void validateManifest(const JVal& mad, const std::vector<uint8_t>& elf)
 {
     const std::vector<JVal>& images = reqArr(mad, "images", "area").a;
     const std::vector<JVal>& blocks = reqArr(mad, "blocks", "area").a;
@@ -211,7 +213,7 @@ static void validateManifest(const JVal& mad, long long elfSize)
             long long ln = reqNum(reqIdx(pc, 2, "piece"), "ln", "piece");
             if (mo < 0 || ln < 0 || ln > kMicroSize - mo)
                 mfail("piece outside the 16 KiB Micro image");
-            if (so < 0 || ln > elfSize - so)
+            if (so < 0 || ln > (long long)elf.size() - so)
                 mfail("piece outside the ELF");
         }
         for (const JVal& r : reqArr(img, "ranges", "image").a)
@@ -220,6 +222,18 @@ static void validateManifest(const JVal& mad, long long elfSize)
             reqMicroRange(reqNum(reqIdx(r, 0, "range"), "start", "range"),
                           reqNum(reqIdx(r, 1, "range"), "end", "range"), "range");
         }
+    }
+    for (const JVal& img : images)
+    {
+        // Image verification is pure (manifest + ELF bytes) so it runs here,
+        // pre-Attach: a wrong-ELF invocation never spins up the backend.
+        // (The same images are rebuilt below for the actual replay.)
+        const std::string& want = reqStr(reqKey(img, "sha256", "image"), "sha256", "image");
+        if (want.size() != 64 || !isHex(want))
+            mfail("image sha256 is not 64 hex characters");
+        std::array<uint8_t, 16384> probe = buildImage(img, elf);
+        if (SHA256Digest::HashHex(probe.data(), probe.size()) != want)
+            mfail("reconstructed image hash does not match the manifest (wrong ELF revision?)");
     }
     for (const JVal& b : blocks)
     {
@@ -376,12 +390,25 @@ int main(int argc, char** argv)
     const std::vector<JVal>& images = reqArr(mad, "images", "area").a;
     const std::vector<JVal>& blocks = reqArr(mad, "blocks", "area").a;
 
+    // R8: the manifest pins the ELF revision; a same-sized wrong ELF would
+    // otherwise compile unrelated bytes at valid offsets. Reject it here,
+    // before Attach, by size and SHA-256 (image hashes are rechecked in
+    // validateManifest below).
+    const JVal& elfSec = reqKey(man, "elf", "manifest");
+    const std::string& elfSha = reqStr(reqKey(elfSec, "sha256", "elf"), "sha256", "elf");
+    long long elfWantSize = reqNum(reqKey(elfSec, "size", "elf"), "size", "elf");
+    if (elfSha.size() != 64 || !isHex(elfSha) || elfWantSize < 0)
+        mfail("elf pin is not a 64-hex sha256 with a non-negative size");
     std::ifstream ef(elfPath, std::ios::binary);
     if (!ef) { std::fprintf(stderr, "cannot open elf\n"); return 2; }
     std::vector<uint8_t> elf((std::istreambuf_iterator<char>(ef)), std::istreambuf_iterator<char>());
+    if ((long long)elf.size() != elfWantSize)
+        mfail("ELF size does not match the manifest pin");
+    if (SHA256Digest::HashHex(elf.data(), elf.size()) != elfSha)
+        mfail("ELF sha256 does not match the manifest pin (wrong disc revision?)");
     std::fprintf(stderr, "om1_replay: area=%s elf_bytes=%zu images=%zu blocks=%zu\n", area, elf.size(),
                  images.size(), blocks.size());
-    validateManifest(mad, (long long)elf.size());
+    validateManifest(mad, elf);
 
     // Attach before Initialize so Reserve-time emission is captured too.
     om1::Attach(1);
