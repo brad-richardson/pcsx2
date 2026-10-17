@@ -874,6 +874,13 @@ public:
 						prevI->next = linkI->next;
 						linkI->next = fBlockList;
 						fBlockList = linkI;
+						// om1-extract-2: keep the tail pointer exact. Without
+						// this, a hit on the tail followed by an append severs
+						// the list after the moved node (silent variant drops
+						// + order-dependent recompiles). The q-list never moves
+						// (quick path has no relink) so only the f-list needs it.
+						if (fBlockEnd == linkI)
+							fBlockEnd = prevI;
 					}
 					return &linkI->block;
 				}
