@@ -11,6 +11,7 @@
 
 #include "arm64/AsmHelpers.h"
 #include "arm64/microVU-arm64.h"
+#include "arm64/om1_branch_scan.h"
 
 #include <cctype>
 #include <cinttypes>
@@ -668,15 +669,16 @@ bool safetyNets(const Episode& e, const std::set<u32>& recOffs,
                 }
             }
         }
-        // TBZ/TBNZ: bits[30:24] = 110100x (bit31 is b5 of the bit number)
-        else if ((w & 0x7F000000u) == 0x68000000u || (w & 0x7F000000u) == 0x69000000u)
+        // TBZ/TBNZ via the shared classifier (R4: VIXL TestBranchFixed/Mask;
+        // the old 0x68/0x69 masks matched LDR words, never TBZ/TBNZ).
+        else if (classifyBranch(w) == BranchKind::TBZ || classifyBranch(w) == BranchKind::TBNZ)
         {
             s64 imm = signExtend((w >> 5) & 0x3FFFu, 14);
             u64 t = e.base + o + (u64)(imm * 4);
             if (!inChunk(t))
             {
                 if (atEnd(t))
-                    falls[o] = {o, (u8)(((w & 0x7F000000u) == 0x69000000u) ? 6 : 5), w};
+                    falls[o] = {o, (u8)(classifyBranch(w) == BranchKind::TBNZ ? 6 : 5), w};
                 else
                 {
                     noteError("chunk %u+%x: TBZ/TBNZ escapes chunk to %llx", e.id, o,
