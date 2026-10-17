@@ -119,6 +119,124 @@ struct JParse
     }
 };
 
+// ---- manifest validation (R3): typed accessors; malformed input is a clean
+// exit-2 error, never an unchecked index or out-of-bounds memcpy. All range
+// checks are subtraction-based (no mo+ln / so+ln signed overflow). ----
+static constexpr long long kMicroSize = 16384;
+
+[[noreturn]] static void mfail(const std::string& m)
+{
+    std::fprintf(stderr, "manifest: %s\n", m.c_str());
+    std::exit(2);
+}
+
+static const JVal& reqKey(const JVal& v, const char* key, const char* ctx)
+{
+    if (v.t != JVal::T::Obj)
+        mfail(std::string(ctx) + ": not an object");
+    auto it = v.o.find(key);
+    if (it == v.o.end())
+        mfail(std::string(ctx) + ": missing '" + key + "'");
+    return it->second;
+}
+
+static const JVal& reqArr(const JVal& v, const char* key, const char* ctx)
+{
+    const JVal& f = reqKey(v, key, ctx);
+    if (f.t != JVal::T::Arr)
+        mfail(std::string(ctx) + ": '" + key + "' is not an array");
+    return f;
+}
+
+static long long reqNum(const JVal& v, const char* what, const char* ctx)
+{
+    if (v.t != JVal::T::Num)
+        mfail(std::string(ctx) + ": '" + what + "' is not a number");
+    return v.n;
+}
+
+static const std::string& reqStr(const JVal& v, const char* what, const char* ctx)
+{
+    if (v.t != JVal::T::Str)
+        mfail(std::string(ctx) + ": '" + what + "' is not a string");
+    return v.s;
+}
+
+static const JVal& reqIdx(const JVal& a, size_t i, const char* ctx)
+{
+    if (a.t != JVal::T::Arr || i >= a.a.size())
+        mfail(std::string(ctx) + ": tuple index out of range");
+    return a.a[i];
+}
+
+static void reqTupleLen(const JVal& a, size_t want, const char* ctx)
+{
+    if (a.t != JVal::T::Arr || a.a.size() != want)
+        mfail(std::string(ctx) + ": tuple length mismatch");
+}
+
+// 0 <= start <= end <= kMicroSize, subtraction-based (no start+len overflow).
+static void reqMicroRange(long long s, long long e, const char* ctx)
+{
+    if (s < 0 || e < s || e > kMicroSize)
+        mfail(std::string(ctx) + ": range outside the 16 KiB Micro image");
+}
+
+static bool isHex(const std::string& h)
+{
+    for (char c : h)
+    {
+        if (!((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F')))
+            return false;
+    }
+    return true;
+}
+
+// Full manifest walk before Attach/Initialize: every later exit(2) would run
+// while backend threads are up. Checks types, tuple lengths, objIdx/startPC
+// bounds and piece/range bounds (all subtraction-based).
+static void validateManifest(const JVal& mad, long long elfSize)
+{
+    const std::vector<JVal>& images = reqArr(mad, "images", "area").a;
+    const std::vector<JVal>& blocks = reqArr(mad, "blocks", "area").a;
+    for (const JVal& img : images)
+    {
+        if (img.t != JVal::T::Obj)
+            mfail("image is not an object");
+        for (const JVal& pc : reqArr(img, "pieces", "image").a)
+        {
+            reqTupleLen(pc, 3, "piece");
+            long long mo = reqNum(reqIdx(pc, 0, "piece"), "mo", "piece");
+            long long so = reqNum(reqIdx(pc, 1, "piece"), "so", "piece");
+            long long ln = reqNum(reqIdx(pc, 2, "piece"), "ln", "piece");
+            if (mo < 0 || ln < 0 || ln > kMicroSize - mo)
+                mfail("piece outside the 16 KiB Micro image");
+            if (so < 0 || ln > elfSize - so)
+                mfail("piece outside the ELF");
+        }
+        for (const JVal& r : reqArr(img, "ranges", "image").a)
+        {
+            reqTupleLen(r, 2, "range");
+            reqMicroRange(reqNum(reqIdx(r, 0, "range"), "start", "range"),
+                          reqNum(reqIdx(r, 1, "range"), "end", "range"), "range");
+        }
+    }
+    for (const JVal& b : blocks)
+    {
+        if (b.t != JVal::T::Obj)
+            mfail("block is not an object");
+        long long pc = reqNum(reqKey(b, "startPC", "block"), "startPC", "block");
+        long long obj = reqNum(reqKey(b, "objIdx", "block"), "objIdx", "block");
+        if (pc < 0 || pc >= kMicroSize || (pc & 7) != 0)
+            mfail("block startPC outside the 16 KiB image or misaligned");
+        if (obj < 0 || (size_t)obj >= images.size())
+            mfail("block objIdx outside the area images");
+        const std::string& ps = reqStr(reqKey(b, "pState_hex", "block"), "pState_hex", "block");
+        if (ps.size() != 192 || !isHex(ps))
+            mfail("block pState_hex is not 192 hex characters");
+    }
+}
+
 static unsigned hexNib(char c)
 {
     if (c >= '0' && c <= '9') return (unsigned)(c - '0');
@@ -191,14 +309,17 @@ static std::array<uint8_t, 16384> buildImage(const JVal& img, const std::vector<
 {
     std::array<uint8_t, 16384> out{};
     out.fill(0);
-    for (const JVal& pc : img.o.at("pieces").a)
+    const long long elfSize = (long long)elf.size();
+    for (const JVal& pc : reqArr(img, "pieces", "image").a)
     {
-        long long mo = pc.a[0].n, so = pc.a[1].n, ln = pc.a[2].n;
-        if (mo < 0 || so < 0 || ln < 0 || mo + ln > 16384 || so + ln > (long long)elf.size())
-        {
-            std::fprintf(stderr, "piece out of range\n");
-            std::exit(2);
-        }
+        reqTupleLen(pc, 3, "piece");
+        long long mo = reqNum(reqIdx(pc, 0, "piece"), "mo", "piece");
+        long long so = reqNum(reqIdx(pc, 1, "piece"), "so", "piece");
+        long long ln = reqNum(reqIdx(pc, 2, "piece"), "ln", "piece");
+        if (mo < 0 || ln < 0 || ln > kMicroSize - mo)
+            mfail("piece outside the 16 KiB Micro image");
+        if (so < 0 || ln > elfSize - so)
+            mfail("piece outside the ELF");
         std::memcpy(out.data() + mo, elf.data() + so, (size_t)ln);
     }
     return out;
@@ -215,12 +336,16 @@ extern bool om1ReplaySyncProgRanges_VU1(const uint32_t* starts, const uint32_t* 
 // Inject the manifest ranges in place of mVUcacheProg-observed ones.
 static bool injectRanges(const JVal& img)
 {
-    const std::vector<JVal>& rs = img.o.at("ranges").a;
+    const std::vector<JVal>& rs = reqArr(img, "ranges", "image").a;
     std::vector<uint32_t> starts, ends;
     for (const JVal& r : rs)
     {
-        starts.push_back((uint32_t)r.a[0].n);
-        ends.push_back((uint32_t)r.a[1].n);
+        reqTupleLen(r, 2, "range");
+        long long s = reqNum(reqIdx(r, 0, "range"), "start", "range");
+        long long e = reqNum(reqIdx(r, 1, "range"), "end", "range");
+        reqMicroRange(s, e, "range");
+        starts.push_back((uint32_t)s);
+        ends.push_back((uint32_t)e);
     }
     return om1ReplaySyncProgRanges_VU1(starts.data(), ends.data(), starts.size());
 }
@@ -245,13 +370,18 @@ int main(int argc, char** argv)
     std::string mtext = mss.str();
     JParse jp{mtext.c_str()};
     JVal man = jp.val();
-    const JVal& mad = man.o.at("areas").o.at(area);
+    if (man.t != JVal::T::Obj)
+        mfail("top level is not an object");
+    const JVal& mad = reqKey(reqKey(man, "areas", "manifest"), area, "areas");
+    const std::vector<JVal>& images = reqArr(mad, "images", "area").a;
+    const std::vector<JVal>& blocks = reqArr(mad, "blocks", "area").a;
 
     std::ifstream ef(elfPath, std::ios::binary);
     if (!ef) { std::fprintf(stderr, "cannot open elf\n"); return 2; }
     std::vector<uint8_t> elf((std::istreambuf_iterator<char>(ef)), std::istreambuf_iterator<char>());
     std::fprintf(stderr, "om1_replay: area=%s elf_bytes=%zu images=%zu blocks=%zu\n", area, elf.size(),
-                 mad.o.at("images").a.size(), mad.o.at("blocks").a.size());
+                 images.size(), blocks.size());
+    validateManifest(mad, (long long)elf.size());
 
     // Attach before Initialize so Reserve-time emission is captured too.
     om1::Attach(1);
@@ -276,19 +406,24 @@ int main(int argc, char** argv)
 
     // Pre-build every image from frozen ELF pieces (zero fill outside).
     std::vector<std::array<uint8_t, 16384>> built;
-    for (const JVal& img : mad.o.at("images").a)
+    for (const JVal& img : images)
         built.push_back(buildImage(img, elf));
 
-    const std::vector<JVal>& blocks = mad.o.at("blocks").a;
-    const std::vector<JVal>& images = mad.o.at("images").a;
     alignas(64) uint8_t pstate[96];
     long long cur = -1;
     for (size_t k = 0; k < blocks.size(); ++k)
     {
         const JVal& b = blocks[k];
-        uint32_t startPC = (uint32_t)b.o.at("startPC").n;
-        long long obj = b.o.at("objIdx").n;
-        hexToBytes(b.o.at("pState_hex").s, pstate, 96);
+        if (b.t != JVal::T::Obj)
+            mfail("block is not an object");
+        long long pc = reqNum(reqKey(b, "startPC", "block"), "startPC", "block");
+        long long obj = reqNum(reqKey(b, "objIdx", "block"), "objIdx", "block");
+        if (pc < 0 || pc >= kMicroSize || (pc & 7) != 0)
+            mfail("block startPC outside the 16 KiB image or misaligned");
+        if (obj < 0 || (size_t)obj >= images.size())
+            mfail("block objIdx outside the area images");
+        uint32_t startPC = (uint32_t)pc;
+        hexToBytes(reqStr(reqKey(b, "pState_hex", "block"), "pState_hex", "block"), pstate, 96);
         if (obj != cur)
         {
             std::memcpy(VU1.Micro, built[(size_t)obj].data(), 16384);

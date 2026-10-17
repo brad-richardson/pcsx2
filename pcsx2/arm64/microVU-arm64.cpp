@@ -2561,6 +2561,13 @@ bool om1ReplaySyncProgRanges_VU1(const uint32_t* starts, const uint32_t* ends, s
 	}
 	if (same)
 		return true;
+	// R3: the driver validates ranges, but this TU re-checks before the raw
+	// copy: end < start would wrap the u32 length into a huge memcpy.
+	for (size_t k = 0; k < n; ++k)
+	{
+		if (ends[k] < starts[k] || ends[k] > 16384)
+			return false;
+	}
 	prog->ranges->clear();
 	for (size_t k = 0; k < n; ++k)
 	{
