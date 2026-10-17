@@ -738,6 +738,11 @@ bool Write(const char* dir, const char* tag)
     for (char& c : up)
         c = static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
     const std::string P = "om1" + up;
+    // R5: every required-output stream op is checked. OM1W records any
+    // fprintf failure into wok; every artifact fclose is checked at close.
+    // (stderr lines are diagnostics, not artifacts, and stay unchecked.)
+    bool wok = true;
+#define OM1W(stream, ...) do { if (std::fprintf(stream, __VA_ARGS__) < 0) wok = false; } while (0)
     // End-of-run range refresh: every compile has finished, so every live
     // program's ranges are closed. (BlockCompiled's hook fires at first-pass
     // init, when the current range is still open with end=-1.) Programs
@@ -1046,7 +1051,7 @@ bool Write(const char* dir, const char* tag)
         noteError("cannot open %s", spath);
         return false;
     }
-    std::fprintf(s, "// OM1 offline microVU %s: %u chunks, %u blocks, %u programs.\n"
+    OM1W(s, "// OM1 offline microVU %s: %u chunks, %u blocks, %u programs.\n"
                     "// Layout-preserving: every chunk keeps its word count; intra-chunk\n"
                     "// PC-relative code is byte-valid. Pools live in __DATA (PIE-safe).\n",
                  tag, (unsigned)g_episodes.size(), (unsigned)g_blocks.size(),
@@ -1089,15 +1094,15 @@ bool Write(const char* dir, const char* tag)
             siteQuad[{e.id, kv.first}] = lb;
         }
 
-    std::fprintf(s, "\t.text\n\t.align 4\n");
+    OM1W(s, "\t.text\n\t.align 4\n");
     std::set<u32> poolCovered; // per-chunk word offsets covered by pool slots
     for (const Episode& e : g_episodes)
     {
-        std::fprintf(s, "\n// chunk %u: gen %u vu %d base %llx size %u fixups %u blocks %u\n",
+        OM1W(s, "\n// chunk %u: gen %u vu %d base %llx size %u fixups %u blocks %u\n",
                      e.id, e.gen, e.vu, (unsigned long long)e.base,
                      (unsigned)e.bytes.size(), (unsigned)e.fixups.size(),
                      (unsigned)e.blockIds.size());
-        std::fprintf(s, "_%sc_%u:\n", P.c_str(), e.id);
+        OM1W(s, "_%sc_%u:\n", P.c_str(), e.id);
         // Labels at block entries + stubs inside this chunk.
         std::map<u32, std::vector<std::string>> labels;
         for (u32 id : e.blockIds)
@@ -1125,7 +1130,7 @@ bool Write(const char* dir, const char* tag)
             auto li = labels.find(o);
             if (li != labels.end())
                 for (const auto& lb : li->second)
-                    std::fprintf(s, "%s:\n", lb.c_str());
+                    OM1W(s, "%s:\n", lb.c_str());
             auto fli = fallMap[e.id].find(o);
             if (fli != fallMap[e.id].end())
             {
@@ -1148,14 +1153,14 @@ bool Write(const char* dir, const char* tag)
                 bool is64 = (ft.w >> 31) & 1;
                 switch (ft.kind)
                 {
-                    case 0: std::fprintf(s, "\tb %s // was %08x (fall-through)\n", nxt, ft.w); break;
-                    case 1: std::fprintf(s, "\tbl %s // was %08x (fall-through!)\n", nxt, ft.w); break;
-                    case 2: std::fprintf(s, "\tb.%s %s // was %08x (fall-through)\n",
+                    case 0: OM1W(s, "\tb %s // was %08x (fall-through)\n", nxt, ft.w); break;
+                    case 1: OM1W(s, "\tbl %s // was %08x (fall-through!)\n", nxt, ft.w); break;
+                    case 2: OM1W(s, "\tb.%s %s // was %08x (fall-through)\n",
                                         condName(ft.w & 15), nxt, ft.w);
                         break;
                     case 3:
                     case 4:
-                        std::fprintf(s, "\t%s %s%u, %s // was %08x (fall-through)\n",
+                        OM1W(s, "\t%s %s%u, %s // was %08x (fall-through)\n",
                                      ft.kind == 3 ? "cbz" : "cbnz", is64 ? "x" : "w", rt,
                                      nxt, ft.w);
                         break;
@@ -1163,13 +1168,13 @@ bool Write(const char* dir, const char* tag)
                     case 6:
                     {
                         u32 bit = ((ft.w >> 31) << 5) | ((ft.w >> 19) & 31);
-                        std::fprintf(s, "\t%s %s%u, #%u, %s // was %08x (fall-through)\n",
+                        OM1W(s, "\t%s %s%u, #%u, %s // was %08x (fall-through)\n",
                                      ft.kind == 5 ? "tbz" : "tbnz", is64 ? "x" : "w", rt,
                                      bit, nxt, ft.w);
                         break;
                     }
                     case 7:
-                        std::fprintf(s, "\tadr x%u, %s // was %08x (fall-through)\n", rt,
+                        OM1W(s, "\tadr x%u, %s // was %08x (fall-through)\n", rt,
                                      nxt, ft.w);
                         break;
                 }
@@ -1181,13 +1186,13 @@ bool Write(const char* dir, const char* tag)
                 const OutFix* of = fi->second;
                 if (of->kind == FK_Branch26)
                 {
-                    std::fprintf(s, "\t%s %s // was %08x\n", of->isCall ? "bl" : "b",
+                    OM1W(s, "\t%s %s // was %08x\n", of->isCall ? "bl" : "b",
                                  of->sym.c_str(), wordAt(e, o));
                 }
                 else if (of->kind == FK_Adrp)
                 {
                     const std::string& q = siteQuad[{e.id, o}];
-                    std::fprintf(s, "\tadrp x%u, %s@PAGE\n\tldr x%u, [x%u, %s@PAGEOFF]\n",
+                    OM1W(s, "\tadrp x%u, %s@PAGE\n\tldr x%u, [x%u, %s@PAGEOFF]\n",
                                  of->reg, q.c_str(), of->reg, of->reg, q.c_str());
                     o += 4; // consumes the Add/Orr word too
                 }
@@ -1198,14 +1203,14 @@ bool Write(const char* dir, const char* tag)
                         q = initQuad[of->sym];
                     else
                         q = siteQuad[{e.id, o}];
-                    std::fprintf(s, "\tadrp x%u, %s@PAGE\n\tldr x%u, [x%u, %s@PAGEOFF]\n\tnop\n\tnop\n",
+                    OM1W(s, "\tadrp x%u, %s@PAGE\n\tldr x%u, [x%u, %s@PAGEOFF]\n\tnop\n\tnop\n",
                                  of->reg, q.c_str(), of->reg, of->reg, q.c_str());
                     o += 12; // consumes 4 words
                     if (of->kind == FK_AbsCall)
                     {
                         u32 w = wordAt(e, o + 4);
                         bool isBlr = (w == 0xD63F0200u);
-                        std::fprintf(s, "\t%s x16\n", isBlr ? "blr" : "br");
+                        OM1W(s, "\t%s x16\n", isBlr ? "blr" : "br");
                         o += 4;
                     }
                 }
@@ -1218,7 +1223,7 @@ bool Write(const char* dir, const char* tag)
                 while (o + run < e.bytes.size() && poolCovered.count(o + run) &&
                        !labels.count(o + run) && !fixAt.count({e.id, o + run}))
                     run += 4;
-                std::fprintf(s, "\t.space %u // pooled data (now in __DATA)\n", run);
+                OM1W(s, "\t.space %u // pooled data (now in __DATA)\n", run);
                 o += run - 4;
                 continue;
             }
@@ -1241,7 +1246,7 @@ bool Write(const char* dir, const char* tag)
                         bool isSimd = (top == 0x1C || top == 0x5C || top == 0x9C);
                         const std::string& q = siteQuad[{e.id, toff}];
                         if (!isSimd)
-                            std::fprintf(s, "\tldr %s%u, %s // was %08x\n",
+                            OM1W(s, "\tldr %s%u, %s // was %08x\n",
                                          is64 ? "x" : "w", rt, q.c_str(), w);
                         else
                         {
@@ -1253,20 +1258,20 @@ bool Write(const char* dir, const char* tag)
                 }
             }
             if (!rewrote)
-                std::fprintf(s, "\t.word 0x%08x\n", w);
+                OM1W(s, "\t.word 0x%08x\n", w);
         }
     }
     // __DATA: pool quads + init slots.
-    std::fprintf(s, "\n\t.data\n\t.align 3\n");
+    OM1W(s, "\n\t.data\n\t.align 3\n");
     for (const Quad& q : quads)
-        std::fprintf(s, "%s:\n\t.quad %s\n", q.label.c_str(), q.sym.c_str());
+        OM1W(s, "%s:\n\t.quad %s\n", q.label.c_str(), q.sym.c_str());
     for (const auto& kv : initQuad)
-        std::fprintf(s, "\t.globl %s\n%s: // (consumer-filled)\n\t.quad 0\n",
+        OM1W(s, "\t.globl %s\n%s: // (consumer-filled)\n\t.quad 0\n",
                      kv.second.c_str(), kv.second.c_str());
     for (const Episode& e : g_episodes)
-        std::fprintf(s, "\t.globl _%sc_%u\n", P.c_str(), e.id);
+        OM1W(s, "\t.globl _%sc_%u\n", P.c_str(), e.id);
     for (const BlockRec& b : g_blocks)
-        std::fprintf(s, "\t.globl _%sb_%u\n", P.c_str(), b.id);
+        OM1W(s, "\t.globl _%sb_%u\n", P.c_str(), b.id);
     {
         std::set<std::string> done;
         for (const Episode& e : g_episodes)
@@ -1275,15 +1280,16 @@ bool Write(const char* dir, const char* tag)
                 char lb[96];
                 std::snprintf(lb, sizeof(lb), "_%ss_%s_g%u", P.c_str(), st.name.c_str(), e.gen);
                 if (done.insert(lb).second)
-                    std::fprintf(s, "\t.globl %s\n", lb);
+                    OM1W(s, "\t.globl %s\n", lb);
             }
     }
     // Conditional-trap trampoline (see the fall-through emit above):
     // unconditional, so the symbol is always defined even when no trap
     // fall-through was recorded. File-local (L): no namespacing needed.
-    std::fprintf(s, "\t.text\nLom1_trap_tramp:\n\tb _om1_fallthrough_miss\n");
-    std::fclose(s);
-    if (!ok || g_errors)
+    OM1W(s, "\t.text\nLom1_trap_tramp:\n\tb _om1_fallthrough_miss\n");
+    if (std::fclose(s) != 0)
+        wok = false;
+    if (!ok || !wok || g_errors)
         return false;
 
     // ---- tables.c/h ----
@@ -1294,27 +1300,27 @@ bool Write(const char* dir, const char* tag)
         noteError("cannot open tables output");
         return false;
     }
-    std::fprintf(th, "// OM1 %s consumer tables.\n#pragma once\n", tag);
-    std::fprintf(th, "#include <stdint.h>\n#ifdef __cplusplus\nextern \"C\" {\n#endif\n");
-    std::fprintf(th, "typedef struct { uint64_t lo, hi; uint32_t startPC; uint8_t exact;\n"
+    OM1W(th, "// OM1 %s consumer tables.\n#pragma once\n", tag);
+    OM1W(th, "#include <stdint.h>\n#ifdef __cplusplus\nextern \"C\" {\n#endif\n");
+    OM1W(th, "typedef struct { uint64_t lo, hi; uint32_t startPC; uint8_t exact;\n"
                      "  uint8_t pState[96]; uint8_t pStateEnd[96]; uint8_t hasJC;\n"
                      "  void* code; uint32_t objIdx; } %s_block_t;\n",
                  P.c_str());
-    std::fprintf(th, "typedef struct { uint64_t lo, hi; const uint8_t* code;\n"
+    OM1W(th, "typedef struct { uint64_t lo, hi; const uint8_t* code;\n"
                      "  const uint16_t* ranges; uint32_t nranges; } %s_image_t;\n",
                  P.c_str());
-    std::fprintf(th, "typedef struct { const char* name; uint32_t block; uint32_t field; } %s_initslot_t;\n",
+    OM1W(th, "typedef struct { const char* name; uint32_t block; uint32_t field; } %s_initslot_t;\n",
                  P.c_str());
-    std::fprintf(th, "extern const %s_block_t %s_blocks[];\nextern const uint32_t %s_nblocks;\n",
+    OM1W(th, "extern const %s_block_t %s_blocks[];\nextern const uint32_t %s_nblocks;\n",
                  P.c_str(), P.c_str(), P.c_str());
-    std::fprintf(th, "extern const %s_image_t %s_images[];\nextern const uint32_t %s_nimages;\n",
+    OM1W(th, "extern const %s_image_t %s_images[];\nextern const uint32_t %s_nimages;\n",
                  P.c_str(), P.c_str(), P.c_str());
-    std::fprintf(th, "extern const %s_initslot_t %s_initslots[];\nextern const uint32_t %s_ninitslots;\n",
+    OM1W(th, "extern const %s_initslot_t %s_initslots[];\nextern const uint32_t %s_ninitslots;\n",
                  P.c_str(), P.c_str(), P.c_str());
-    std::fprintf(th, "extern void* %s_stub_resume(void);\nextern void* %s_stub_exit(void);\n", P.c_str(),
+    OM1W(th, "extern void* %s_stub_resume(void);\nextern void* %s_stub_exit(void);\n", P.c_str(),
                  P.c_str());
-    std::fprintf(th, "#ifdef __cplusplus\n}\n#endif\n");
-    std::fprintf(tc, "// OM1 %s consumer tables (generated).\n#include \"%s_tables.h\"\n", tag, tag);
+    OM1W(th, "#ifdef __cplusplus\n}\n#endif\n");
+    OM1W(tc, "// OM1 %s consumer tables (generated).\n#include \"%s_tables.h\"\n", tag, tag);
     // Images.
     u32 ii = 0;
     std::map<std::pair<u64, u64>, u32> imgIdx;
@@ -1322,62 +1328,62 @@ bool Write(const char* dir, const char* tag)
     {
         imgIdx[kv.first] = ii;
         const ProgRec& p = kv.second;
-        std::fprintf(tc, "static const uint8_t %s_img%u_code[%u] = {", P.c_str(), ii,
+        OM1W(tc, "static const uint8_t %s_img%u_code[%u] = {", P.c_str(), ii,
                      (unsigned)p.data.size());
         for (size_t k = 0; k < p.data.size(); ++k)
         {
             if (!(k % 16))
-                std::fprintf(tc, "\n ");
-            std::fprintf(tc, " 0x%02x,", p.data[k]);
+                OM1W(tc, "\n ");
+            OM1W(tc, " 0x%02x,", p.data[k]);
         }
-        std::fprintf(tc, "\n};\n");
-        std::fprintf(tc, "static const uint16_t %s_img%u_ranges[%u] = {", P.c_str(), ii,
+        OM1W(tc, "\n};\n");
+        OM1W(tc, "static const uint16_t %s_img%u_ranges[%u] = {", P.c_str(), ii,
                      (unsigned)(p.ranges.size() * 2 + 2));
         for (const auto& r : p.ranges)
-            std::fprintf(tc, "%u,%u,", r.first, r.second);
-        std::fprintf(tc, "0xffff,0xffff};\n");
+            OM1W(tc, "%u,%u,", r.first, r.second);
+        OM1W(tc, "0xffff,0xffff};\n");
         ++ii;
     }
-    std::fprintf(tc, "const %s_image_t %s_images[] = {\n", P.c_str(), P.c_str());
+    OM1W(tc, "const %s_image_t %s_images[] = {\n", P.c_str(), P.c_str());
     for (const auto& kv : g_progs)
     {
         u32 i = imgIdx[kv.first];
-        std::fprintf(tc, " {0x%llxull,0x%llxull,%s_img%u_code,%s_img%u_ranges,%u},\n",
+        OM1W(tc, " {0x%llxull,0x%llxull,%s_img%u_code,%s_img%u_ranges,%u},\n",
                      (unsigned long long)kv.first.first, (unsigned long long)kv.first.second,
                      P.c_str(), i, P.c_str(), i, (unsigned)kv.second.ranges.size());
     }
-    std::fprintf(tc, "};\nconst uint32_t %s_nimages = %u;\n", P.c_str(), (unsigned)g_progs.size());
+    OM1W(tc, "};\nconst uint32_t %s_nimages = %u;\n", P.c_str(), (unsigned)g_progs.size());
     // Blocks (record order = insertion order; consumer adds in this order).
     // Mach-O C linkage: no underscore (extern void om1SP1b_0 = asm _om1SP1b_0).
     for (const BlockRec& b : g_blocks)
-        std::fprintf(tc, "extern void %sb_%u(void);\n", P.c_str(), b.id);
+        OM1W(tc, "extern void %sb_%u(void);\n", P.c_str(), b.id);
     for (const auto& kv : initQuad)
-        std::fprintf(tc, "extern void* %s;\n", kv.second.c_str());
+        OM1W(tc, "extern void* %s;\n", kv.second.c_str());
     for (const Episode& e : g_episodes)
         for (const StubSnap& st : e.stubs)
-            std::fprintf(tc, "extern void %ss_%s_g%u(void);\n", P.c_str(), st.name.c_str(), e.gen);
-    std::fprintf(tc, "const %s_block_t %s_blocks[] = {\n", P.c_str(), P.c_str());
+            OM1W(tc, "extern void %ss_%s_g%u(void);\n", P.c_str(), st.name.c_str(), e.gen);
+    OM1W(tc, "const %s_block_t %s_blocks[] = {\n", P.c_str(), P.c_str());
     for (const BlockRec& b : g_blocks)
     {
         u32 img = imgIdx[{b.hashLo, b.hashHi}];
-        std::fprintf(tc, " {0x%llxull,0x%llxull,0x%x,%u,{", (unsigned long long)b.hashLo,
+        OM1W(tc, " {0x%llxull,0x%llxull,0x%x,%u,{", (unsigned long long)b.hashLo,
                      (unsigned long long)b.hashHi, b.startPC, (unsigned)b.pState[0]);
         for (int k = 0; k < 96; ++k)
-            std::fprintf(tc, "%u,", b.pState[k]);
-        std::fprintf(tc, "},{");
+            OM1W(tc, "%u,", b.pState[k]);
+        OM1W(tc, "},{");
         for (int k = 0; k < 96; ++k)
-            std::fprintf(tc, "%u,", b.pStateEnd[k]);
-        std::fprintf(tc, "},%u,(void*)&%sb_%u,%u},\n", b.hasJC ? 1 : 0, P.c_str(), b.id, img);
+            OM1W(tc, "%u,", b.pStateEnd[k]);
+        OM1W(tc, "},%u,(void*)&%sb_%u,%u},\n", b.hasJC ? 1 : 0, P.c_str(), b.id, img);
     }
-    std::fprintf(tc, "};\nconst uint32_t %s_nblocks = %u;\n", P.c_str(), (unsigned)g_blocks.size());
+    OM1W(tc, "};\nconst uint32_t %s_nblocks = %u;\n", P.c_str(), (unsigned)g_blocks.size());
     // Init slots.
-    std::fprintf(tc, "const %s_initslot_t %s_initslots[] = {\n", P.c_str(), P.c_str());
+    OM1W(tc, "const %s_initslot_t %s_initslots[] = {\n", P.c_str(), P.c_str());
     for (const auto& kv : initQuad)
     {
         auto it = initInfo[kv.first];
-        std::fprintf(tc, " {\"%s\",%u,%u},\n", kv.second.c_str(), it.first, it.second);
+        OM1W(tc, " {\"%s\",%u,%u},\n", kv.second.c_str(), it.first, it.second);
     }
-    std::fprintf(tc, "};\nconst uint32_t %s_ninitslots = %u;\n", P.c_str(), (unsigned)initQuad.size());
+    OM1W(tc, "};\nconst uint32_t %s_ninitslots = %u;\n", P.c_str(), (unsigned)initQuad.size());
     // Stub entry points (last generation wins).
     std::map<std::string, std::string> stubPick;
     for (const Episode& e : g_episodes)
@@ -1389,25 +1395,27 @@ bool Write(const char* dir, const char* tag)
         }
     {
         auto it = stubPick.find("startFunctResume");
-        std::fprintf(tc, "void* %s_stub_resume(void) { return (void*)&%s; }\n", P.c_str(),
+        OM1W(tc, "void* %s_stub_resume(void) { return (void*)&%s; }\n", P.c_str(),
                      it != stubPick.end() ? it->second.c_str() + 1 : "0");
         it = stubPick.find("exitFunct");
-        std::fprintf(tc, "void* %s_stub_exit(void) { return (void*)&%s; }\n", P.c_str(),
+        OM1W(tc, "void* %s_stub_exit(void) { return (void*)&%s; }\n", P.c_str(),
                      it != stubPick.end() ? it->second.c_str() + 1 : "0");
     }
-    std::fclose(tc);
-    std::fclose(th);
+    if (std::fclose(tc) != 0)
+        wok = false;
+    if (std::fclose(th) != 0)
+        wok = false;
 
     // ---- manifest + triples ----
     FILE* m = std::fopen(mpath, "wb");
     FILE* tr = std::fopen(tripath, "wb");
     if (m)
     {
-        std::fprintf(m, "tag=%s episodes=%u blocks=%u programs=%u resets=%u codeBytes=%llu\n",
+        OM1W(m, "tag=%s episodes=%u blocks=%u programs=%u resets=%u codeBytes=%llu\n",
                      tag, EpisodeCount(), BlockCount(), (unsigned)g_progs.size(), g_resets,
                      CodeBytes());
         for (const auto& kv : g_progs)
-            std::fprintf(m, "program %016llx%016llx ranges=%u\n",
+            OM1W(m, "program %016llx%016llx ranges=%u\n",
                          (unsigned long long)kv.first.second, (unsigned long long)kv.first.first,
                          (unsigned)kv.second.ranges.size());
         std::set<std::string> seen;
@@ -1415,7 +1423,7 @@ bool Write(const char* dir, const char* tag)
         {
             u64 q64 = 0;
             std::memcpy(&q64, b.pState, 8);
-            std::fprintf(m, "block id=%u gen=%u chunk=%u pc=%04x exact=%u hasJC=%u hash=%016llx%016llx q=%016llx\n",
+            OM1W(m, "block id=%u gen=%u chunk=%u pc=%04x exact=%u hasJC=%u hash=%016llx%016llx q=%016llx\n",
                          b.id, b.gen, b.chunk, b.startPC, (unsigned)b.pState[0],
                          b.hasJC ? 1 : 0, (unsigned long long)b.hashHi,
                          (unsigned long long)b.hashLo, (unsigned long long)q64);
@@ -1424,17 +1432,24 @@ bool Write(const char* dir, const char* tag)
                           (unsigned long long)b.hashHi, (unsigned long long)b.hashLo, b.startPC,
                           (unsigned long long)q64, (unsigned)b.pState[0]);
             if (tr && seen.insert(tk).second)
-                std::fprintf(tr, "%s\n", tk);
+                OM1W(tr, "%s\n", tk);
         }
-        std::fclose(m);
+        if (std::fclose(m) != 0)
+            wok = false;
     }
     if (tr)
-        std::fclose(tr);
+    {
+        if (std::fclose(tr) != 0)
+            wok = false;
+    }
+    else
+        wok = false;
     std::fprintf(stderr, "[om1] wrote %s.* : %u chunks %u blocks %u programs %u quads %u initslots %u fallthrough %u traps errors=%llu\n",
                  tag, EpisodeCount(), BlockCount(), (unsigned)g_progs.size(), nquad,
                  (unsigned)initQuad.size(), nfalls, ntraps, (unsigned long long)g_errors);
-    return g_errors == 0;
+    return g_errors == 0 && wok;
 }
+#undef OM1W
 
 } // namespace om1
 
